@@ -7,6 +7,7 @@ import { formatTaskStatus, formatContract, formatVerification } from './status.j
 import { TaskStateEngine, AcceptanceContractEngine, EvidenceLedgerEngine, FailureLedgerEngine, DecisionLedgerEngine } from '@forge/state'
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
 import { AgentLoop } from '@forge/agent'
+import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { ForgeConfig, ForgeConfigFile } from '@forge/types'
 import { Dashboard, ConfigWizard, Repl } from '@forge/tui'
 
@@ -42,6 +43,12 @@ async function main() {
     case 'setup':
       await cmdSetup()
       break
+    case 'state':
+      await cmdState(args.slice(1))
+      break
+    case 'doctor':
+      await cmdDoctor(args.slice(1))
+      break
     case 'help':
       showHelp()
       break
@@ -66,6 +73,8 @@ Usage:
   forge evidence <taskId>      Show evidence ledger for a task
   forge dashboard [taskId]     Launch TUI dashboard
   forge setup                  Run setup wizard in TUI
+  forge state migrate          Apply state-store migrations to FORGE_DATABASE_URL
+  forge doctor [--migrate]     Check Forge environment; --migrate also runs migrations
   forge help                   Show this help
 `)
 }
@@ -408,6 +417,121 @@ async function cmdSetup() {
   console.log('Configuration saved to .forge/config.json')
   console.log(`  Provider: ${result.config.provider.name}`)
   console.log(`  Model:    ${result.config.provider.model}`)
+}
+
+/**
+ * `forge state <subcommand>`. Today only `migrate` exists; later tracks
+ * add `inspect`, `reset`, `backup`, etc. Each subcommand is responsible
+ * for its own FORGE_DATABASE_URL discovery and error messages.
+ */
+async function cmdState(args: string[]) {
+  const subcommand = args[0]
+  if (subcommand === 'migrate') {
+    await cmdStateMigrate()
+    return
+  }
+  console.error('Usage: forge state migrate')
+  process.exit(1)
+}
+
+/**
+ * Apply state-store migrations to the database pointed at by
+ * `FORGE_DATABASE_URL`. Idempotent — safe to run on every fresh checkout.
+ *
+ * Exit codes:
+ *   0  success (whether or not any new migrations were applied)
+ *   1  configuration error (FORGE_DATABASE_URL unset)
+ *   2  migration runner error (Postgres unreachable, bad SQL, etc.)
+ */
+async function cmdStateMigrate(): Promise<void> {
+  const connectionString = process.env.FORGE_DATABASE_URL
+  if (!connectionString) {
+    console.error('Error: FORGE_DATABASE_URL is not set.')
+    console.error('Set it in your shell or .env, then retry.')
+    process.exit(1)
+  }
+
+  // We don't need an artifact dir for migrations, but ForgeStateStore's
+  // constructor requires one. Use a throwaway temp dir.
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const rootDir = join(tmpdir(), `forge-migrate-${process.pid}`)
+
+  const store = new ForgeStateStore({
+    config: defaultStateStoreConfig(rootDir, connectionString),
+  })
+
+  try {
+    const applied = await store.runMigrations()
+    if (applied.length === 0) {
+      console.log('No new migrations to apply. Database is up to date.')
+    } else {
+      console.log(`Applied ${applied.length} migration(s): versions ${applied.join(', ')}`)
+    }
+  } catch (err) {
+    console.error('Migration failed:', err instanceof Error ? err.message : String(err))
+    process.exit(2)
+  }
+}
+
+/**
+ * `forge doctor` — quick environment health check.
+ *
+ * Today this only inspects Postgres reachability + migration state.
+ * `--migrate` runs migrations after the check, which makes the command
+ * a one-shot "make my database ready" entry point.
+ */
+async function cmdDoctor(args: string[]) {
+  const migrate = args.includes('--migrate')
+  const connectionString = process.env.FORGE_DATABASE_URL
+
+  if (!connectionString) {
+    console.log('FORGE_DATABASE_URL: not set')
+    process.exit(1)
+  }
+  console.log(`FORGE_DATABASE_URL: set (${redactPassword(connectionString)})`)
+
+  // Probe reachability. We don't need a real query, just a round-trip.
+  const postgresModule = await import('postgres').catch(() => undefined)
+  if (!postgresModule) {
+    console.log('postgres driver: not installed (run `pnpm install`)')
+    process.exit(1)
+  }
+  console.log('postgres driver: installed')
+
+  const postgres =
+    (postgresModule as { default?: unknown }).default ?? postgresModule
+  const sql = (postgres as (cs: string) => {
+    <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
+    end(opts?: { timeout?: number }): Promise<void>
+  })(connectionString)
+
+  try {
+    const result = await sql<[unknown]>`
+      select 1 as ok
+    `
+    const row = result[0] as { ok?: number } | undefined
+    console.log(`Postgres reachable: yes (select 1 → ${row?.ok ?? 'ok'})`)
+  } catch (err) {
+    console.log(
+      `Postgres reachable: no (${err instanceof Error ? err.message : String(err)})`,
+    )
+    process.exit(1)
+  } finally {
+    await sql.end({ timeout: 5 })
+  }
+
+  if (migrate) {
+    console.log('Running migrations...')
+    await cmdStateMigrate()
+  } else {
+    console.log('Run `forge doctor --migrate` to apply pending migrations.')
+  }
+}
+
+/** Mask the password in a postgres:// URL so we don't leak secrets in logs. */
+function redactPassword(url: string): string {
+  return url.replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/, '$1***$2')
 }
 
 async function getConfig(): Promise<ForgeConfig> {

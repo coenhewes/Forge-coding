@@ -23,6 +23,7 @@
     "@forge/types": "workspace:*",
     "@forge/agent": "workspace:*",
     "@forge/state": "workspace:*",
+    "@forge/state-store": "workspace:*",
     "@forge/verification": "workspace:*",
     "@forge/tui": "workspace:*"
   },
