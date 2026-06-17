@@ -131,6 +131,9 @@ importers:
 
   packages/forge-tui:
     dependencies:
+      '@forge/agent':
+        specifier: workspace:*
+        version: link:../forge-agent
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state

@@ -11,6 +11,10 @@ export class ConfigWizard {
   private screen: any
   private result: WizardResult = { config: {} as any, cancelled: false }
 
+  private providerNames: ProviderName[] = ['openrouter', 'ollama', 'openai', 'anthropic', 'ollama-cloud', 'minimax']
+  private selectedProvider!: ProviderName
+  private selectedModel!: string
+
   constructor() {
     this.screen = blessed.screen({
       smartCSR: true,
@@ -24,16 +28,22 @@ export class ConfigWizard {
     })
   }
 
-  private showWelcome(resolve: (r: WizardResult) => void): void {
-    this.screen.destroy()
-
-    const welcomeScreen = blessed.screen({
+  private makeScreen(title: string): any {
+    if (this.screen) {
+      this.screen.destroy()
+    }
+    this.screen = blessed.screen({
       smartCSR: true,
-      title: 'Forge Setup',
+      title,
     })
+    return this.screen
+  }
+
+  private showWelcome(resolve: (r: WizardResult) => void): void {
+    const screen = this.makeScreen('Forge Setup')
 
     blessed.box({
-      parent: welcomeScreen,
+      parent: screen,
       top: 'center',
       left: 'center',
       width: 60,
@@ -55,25 +65,25 @@ export class ConfigWizard {
       align: 'center',
     })
 
-    welcomeScreen.key(['enter', ' '], () => {
-      welcomeScreen.destroy()
+    screen.key(['enter', ' '], () => {
+      screen.destroy()
       this.showProviderSelect(resolve)
     })
 
-    welcomeScreen.key(['q', 'C-c'], () => {
+    screen.key(['q', 'C-c'], () => {
       this.result.cancelled = true
-      welcomeScreen.destroy()
+      screen.destroy()
       resolve(this.result)
     })
 
-    welcomeScreen.render()
+    screen.render()
   }
 
   private showProviderSelect(resolve: (r: WizardResult) => void): void {
-    const providerNames: ProviderName[] = ['openrouter', 'ollama', 'openai', 'anthropic', 'ollama-cloud', 'minimax']
+    const screen = this.makeScreen('Forge Setup — Provider')
 
     const form = blessed.form({
-      parent: this.screen,
+      parent: screen,
       top: 'center',
       left: 'center',
       width: 50,
@@ -92,14 +102,14 @@ export class ConfigWizard {
     })
 
     const radioButtons: any[] = []
-    for (let i = 0; i < providerNames.length; i++) {
+    for (let i = 0; i < this.providerNames.length; i++) {
       const rb = blessed.radiobutton({
         parent: form,
         top: 2 + i,
         left: 2,
         width: 30,
         height: 1,
-        content: providerNames[i]!,
+        content: this.providerNames[i]!,
         checked: i === 0,
         style: { fg: 'white', bg: 'black' },
       })
@@ -139,40 +149,30 @@ export class ConfigWizard {
 
     submitBtn.on('press', () => {
       const selectedIdx = radioButtons.findIndex((rb: any) => rb.checked)
-      const provider = providerNames[selectedIdx >= 0 ? selectedIdx : 0]!
-      const model = nameInput.value || nameInput.content || 'anthropic/claude-sonnet-20241022'
-
-      this.screen.destroy()
-
-      if (provider === 'ollama' || provider === 'ollama-cloud') {
-        this.showApiKeyForm(resolve, provider, model, false)
-      } else {
-        this.showApiKeyForm(resolve, provider, model, true)
-      }
+      this.selectedProvider = this.providerNames[selectedIdx >= 0 ? selectedIdx : 0]!
+      this.selectedModel = nameInput.value || nameInput.content || 'anthropic/claude-sonnet-20241022'
+      screen.destroy()
+      this.showApiKeyForm(resolve)
     })
 
-    this.screen.key(['q', 'C-c'], () => {
+    screen.key(['q', 'C-c'], () => {
       this.result.cancelled = true
-      this.screen.destroy()
+      screen.destroy()
       resolve(this.result)
     })
 
-    this.screen.render()
+    screen.render()
   }
 
-  private showApiKeyForm(
-    resolve: (r: WizardResult) => void,
-    provider: ProviderName,
-    model: string,
-    needsKey: boolean,
-  ): void {
-    this.screen = blessed.screen({
-      smartCSR: true,
-      title: 'Forge Setup — API Key',
-    })
+  private showApiKeyForm(resolve: (r: WizardResult) => void): void {
+    const screen = this.makeScreen('Forge Setup — API Key')
+
+    const provider = this.selectedProvider
+    const model = this.selectedModel
+    const needsKey = provider !== 'ollama' && provider !== 'ollama-cloud'
 
     const form = blessed.form({
-      parent: this.screen,
+      parent: screen,
       top: 'center',
       left: 'center',
       width: 60,
@@ -253,49 +253,66 @@ export class ConfigWizard {
       try {
         await initConfig(fileConfig)
         this.result.config = fileConfig
-
-        blessed.box({
-          parent: this.screen,
-          top: 'center',
-          left: 'center',
-          width: 40,
-          height: 5,
-          content: '\n {green-fg}✓{/green-fg} Configuration saved!\n\n Press any key to continue.',
-          tags: true,
-          style: { fg: 'white', bg: 'black' },
-          border: { type: 'line' },
-          align: 'center',
-        })
-
-        this.screen.render()
-
-        this.screen.once('keypress', () => {
-          this.screen.destroy()
-          resolve(this.result)
-        })
+        screen.destroy()
+        this.showSaved(resolve)
       } catch (err) {
-        blessed.box({
-          parent: this.screen,
-          top: 'center',
-          left: 'center',
-          width: 40,
-          height: 5,
-          content: `\n {red-fg}Error:{/red-fg} ${err}\n\n Press any key.`,
-          tags: true,
-          style: { fg: 'white', bg: 'black' },
-          border: { type: 'line' },
-          align: 'center',
-        })
-        this.screen.render()
+        this.showError(screen, err)
       }
     })
 
-    this.screen.key(['q', 'C-c'], () => {
+    screen.key(['q', 'C-c'], () => {
       this.result.cancelled = true
-      this.screen.destroy()
+      screen.destroy()
       resolve(this.result)
     })
 
-    this.screen.render()
+    screen.render()
+  }
+
+  private showSaved(resolve: (r: WizardResult) => void): void {
+    const screen = this.makeScreen('Forge Setup — Complete')
+
+    blessed.box({
+      parent: screen,
+      top: 'center',
+      left: 'center',
+      width: 40,
+      height: 5,
+      content: '\n {green-fg}✓{/green-fg} Configuration saved!\n\n Press any key to continue.',
+      tags: true,
+      style: { fg: 'white', bg: 'black' },
+      border: { type: 'line' },
+      align: 'center',
+    })
+
+    screen.render()
+
+    screen.once('keypress', () => {
+      screen.destroy()
+      resolve(this.result)
+    })
+  }
+
+  private showError(screen: any, err: unknown): void {
+    screen.destroy()
+    const errorScreen = this.makeScreen('Forge Setup — Error')
+    blessed.box({
+      parent: errorScreen,
+      top: 'center',
+      left: 'center',
+      width: 40,
+      height: 5,
+      content: `\n {red-fg}Error:{/red-fg} ${err}\n\n Press any key.`,
+      tags: true,
+      style: { fg: 'white', bg: 'black' },
+      border: { type: 'line' },
+      align: 'center',
+    })
+    errorScreen.render()
+    errorScreen.once('keypress', () => {
+      errorScreen.destroy()
+      this.result.cancelled = true
+      // resolve is not called here — error is terminal
+    })
   }
 }
