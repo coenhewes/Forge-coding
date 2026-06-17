@@ -1,5 +1,9 @@
 # Forge Final Product Brief
 
+> **Operating notes** (Postgres setup, migrations, test conventions,
+> reference-repo attribution rules) live in `docs/OPERATING_NOTES.md` and
+> `docs/REFERENCE_REPOS.md`. This file is the product brief only.
+
 ## Product Name
 
 **Forge**
