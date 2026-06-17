@@ -30,6 +30,8 @@
     "@forge/trace": "workspace:*",
     "@forge/provider": "workspace:*",
     "@forge/harness": "workspace:*",
+    "@forge/repo-graph": "workspace:*",
+    "@forge/repo-intel": "workspace:*",
     "@forge/context-server": "workspace:*",
     "@forge/state-store": "workspace:*",
     "@forge/integrations": "workspace:*",

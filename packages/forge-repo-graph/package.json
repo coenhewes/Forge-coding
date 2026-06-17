@@ -1,5 +1,5 @@
 {
-  "name": "@forge/harness",
+  "name": "@forge/repo-graph",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -17,9 +17,7 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@forge/types": "workspace:*",
-    "@forge/repo-graph": "workspace:*",
-    "@forge/repo-intel": "workspace:*"
+    "@forge/types": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

@@ -18,8 +18,8 @@ import type {
 } from '@forge/types'
 
 import { createProvider } from '@forge/provider'
-import { scanRepository } from '@forge/harness'
-import { buildGraph } from '@forge/harness'
+import { scanRepository, RepoIntel } from '@forge/repo-intel'
+import { buildGraph, GraphStore, GraphQuery } from '@forge/repo-graph'
 import { getDomainManifests } from '@forge/harness'
 import { routeTask } from '@forge/harness'
 import { buildCapabilityRegistry, CapabilityExecutor, assessTaskRisk } from '@forge/harness'
@@ -181,6 +181,17 @@ export class AgentLoop {
   private domainManifests: DomainManifest[] = []
   private domainSelection?: DomainSelection
 
+  /** Dedicated repo-graph store. The agent loop calls
+   *  `graphStore.set(repoGraph)` once `buildGraph` returns, then
+   *  `graphStore.query()` returns a `GraphQuery` the loop can use
+   *  to answer structural questions ("who calls X?", "what tests
+   *  touch this file?"). Initialized in the constructor after
+   *  `this.config` is set so the instance can carry per-task
+   *  listeners. */
+  private graphStore!: GraphStore
+  /** Dedicated repo-intel accessor. Initialized in the constructor. */
+  private repoIntel!: RepoIntel
+
   private git: GitConfig
   private gitClient: GitClient
   private baseBranch?: string
@@ -238,14 +249,47 @@ export class AgentLoop {
       branchPrefix: 'forge/',
     }
     this.gitClient = new GitClient(config.workDir)
+
+    // Dedicated repo-intelligence packages. We construct them with
+    // the work directory so the agent loop can query ownership,
+    // domain boundaries, and risk areas without re-scanning.
+    this.graphStore = new GraphStore()
+    this.repoIntel = new RepoIntel(config.workDir)
   }
 
   async buildRepoIntelligence(): Promise<void> {
+    // Repo intel (packages, apps, routes, ownership, risk, …)
+    // comes from the dedicated `@forge/repo-intel` package.
     this.repoMap = await scanRepository(this.config.workDir)
+    // Prime the cached `RepoIntel` accessor so capability handlers
+    // can fetch domain boundaries / risk areas on demand.
+    await this.repoIntel.build()
+
+    // The structural software graph (imports, exports, symbols,
+    // call sites, references) is produced by `@forge/repo-graph`
+    // and stored in the in-memory `GraphStore` the loop can query.
     this.repoGraph = this.config.features?.repoGraph !== false && this.repoMap
       ? await buildGraph(this.repoMap, this.config.workDir)
       : undefined
+    if (this.repoGraph) this.graphStore.set(this.repoGraph)
+
     this.domainManifests = getDomainManifests()
+  }
+
+  /**
+   * Convenience accessor for callers (and tests) that need a
+   * read-only `GraphQuery` over the current repo graph. Returns
+   * `null` until `buildRepoIntelligence()` has been awaited.
+   */
+  graphQuery(): GraphQuery | null {
+    return this.graphStore.query()
+  }
+
+  /** Expose the underlying `RepoIntel` so capability handlers can
+   *  answer ownership / domain / risk questions without
+   *  re-scanning. */
+  get intel(): RepoIntel {
+    return this.repoIntel
   }
 
   /**
