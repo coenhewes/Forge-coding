@@ -8,6 +8,7 @@ import { TaskStateEngine, AcceptanceContractEngine, EvidenceLedgerEngine, Failur
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
 import { AgentLoop } from '@forge/agent'
 import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
+import { mcp } from '@forge/integrations'
 import type { ForgeConfig, ForgeConfigFile } from '@forge/types'
 import { Dashboard, ConfigWizard, Repl } from '@forge/tui'
 
@@ -49,6 +50,9 @@ async function main() {
     case 'doctor':
       await cmdDoctor(args.slice(1))
       break
+    case 'mcp':
+      await cmdMcp(args.slice(1))
+      break
     case 'help':
       showHelp()
       break
@@ -75,6 +79,8 @@ Usage:
   forge setup                  Run setup wizard in TUI
   forge state migrate          Apply state-store migrations to FORGE_DATABASE_URL
   forge doctor [--migrate]     Check Forge environment; --migrate also runs migrations
+  forge mcp serve              Run the Forge MCP server on stdio (JSON-RPC 2.0)
+  forge mcp list               Spawn the MCP server and list advertised tools
   forge help                   Show this help
 `)
 }
@@ -532,6 +538,66 @@ async function cmdDoctor(args: string[]) {
 /** Mask the password in a postgres:// URL so we don't leak secrets in logs. */
 function redactPassword(url: string): string {
   return url.replace(/(postgres(?:ql)?:\/\/[^:]+:)[^@]+(@)/, '$1***$2')
+}
+
+/**
+ * `forge mcp <subcommand>`. Subcommands:
+ *
+ *   - `serve` — open the Postgres state store and run the JSON-RPC
+ *     server loop on stdio. Designed to be invoked by an MCP host
+ *     (Claude Desktop, opencode, etc.) as a child process.
+ *   - `list` — spawn a fresh `forge mcp serve` subprocess, query
+ *     `tools/list`, and print the tool descriptors to stdout. Useful
+ *     for human inspection and for smoke-testing the round-trip.
+ */
+async function cmdMcp(args: string[]): Promise<void> {
+  const subcommand = args[0]
+  if (subcommand === 'serve') {
+    const code = await mcp.runMcpServeFromEnv()
+    process.exit(code)
+  }
+  if (subcommand === 'list') {
+    await cmdMcpList()
+    return
+  }
+  console.error('Usage: forge mcp <serve|list>')
+  process.exit(1)
+}
+
+/**
+ * Spawn the MCP server as a child process and dump its advertised
+ * tools. Exits 0 on success, 1 on transport failure, 2 on a
+ * tool-list RPC error.
+ */
+async function cmdMcpList(): Promise<void> {
+  const cliEntry = process.argv[1] ?? 'forge'
+  const client = mcp.spawnStdioMcpClient({
+    command: process.execPath,
+    args: [cliEntry, 'mcp', 'serve'],
+    cwd: process.cwd(),
+    responseTimeoutMs: 15_000,
+  })
+  try {
+    const tools = await client.listTools()
+    console.log(`MCP server exposes ${tools.length} tool(s):`)
+    for (const tool of tools) {
+      console.log(`  - ${tool.name}`)
+      console.log(`      ${tool.description}`)
+      const props = Object.entries(tool.inputSchema.properties)
+      if (props.length > 0) {
+        const required = new Set(tool.inputSchema.required)
+        const sig = props
+          .map(([k, v]) => `${k}${required.has(k) ? '' : '?'}:${v.type}`)
+          .join(', ')
+        console.log(`      args: { ${sig} }`)
+      }
+    }
+  } catch (err) {
+    console.error('forge mcp list failed:', err instanceof Error ? err.message : String(err))
+    process.exit(2)
+  } finally {
+    await client.close()
+  }
 }
 
 async function getConfig(): Promise<ForgeConfig> {
