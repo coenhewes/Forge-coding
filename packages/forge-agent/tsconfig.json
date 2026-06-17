@@ -13,7 +13,10 @@
     { "path": "../forge-provider" },
     { "path": "../forge-harness" },
     { "path": "../forge-state" },
+    { "path": "../forge-state-store" },
     { "path": "../forge-verification" },
+    { "path": "../forge-verification-planner" },
+    { "path": "../forge-belief" },
     { "path": "../forge-pr" }
   ]
 }
