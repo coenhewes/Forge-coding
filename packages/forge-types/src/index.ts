@@ -113,6 +113,57 @@ export type {
 } from './trace.js'
 
 export type {
+  BeliefStatus,
+  BeliefNodeType,
+  BeliefEdgeType,
+  EvidenceRef,
+  AssumptionRef,
+  ProbeRecommendation,
+  Hypothesis,
+  PatchStrategy,
+  Claim,
+  Assumption,
+  Uncertainty,
+  Contradiction,
+  DomainBelief,
+  GraphRegionBelief,
+  VerificationObligation,
+  HumanReviewRequirement,
+  BeliefNode,
+  BeliefEdge,
+  TaskBeliefState,
+  CapabilityObservation,
+} from './belief.js'
+
+export type {
+  VerificationActionType,
+  VerificationActionStatus,
+  VerificationAction,
+  EvidenceValueScore,
+  ClaimVerificationState,
+  ActiveVerificationPlan,
+} from './active-verification.js'
+
+export type {
+  ReviewComment,
+  PullRequestState,
+  IssueTrackerAdapter,
+  PullRequestAdapter,
+  ChatAdapter,
+  CiAdapter,
+} from './integrations.js'
+
+export type {
+  StateStoreActor,
+  StateStoreConfig,
+  StateStoreHealth,
+  ArtifactRecord,
+  DurableWriteReceipt,
+  ContextSlice,
+  HumanApproval,
+} from './state-store.js'
+
+export type {
   ForgeConfig,
   ForgeConfigFile,
   GitConfig,
