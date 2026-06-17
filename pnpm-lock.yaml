@@ -102,6 +102,9 @@ importers:
 
   packages/forge-belief:
     dependencies:
+      '@forge/state-store':
+        specifier: workspace:*
+        version: link:../forge-state-store
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types
@@ -322,6 +325,9 @@ importers:
 
   packages/forge-verification-planner:
     dependencies:
+      '@forge/state-store':
+        specifier: workspace:*
+        version: link:../forge-state-store
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types
