@@ -4,6 +4,7 @@ import type {
   TaskState,
   DomainSelection,
   AcceptanceContract,
+  TaskRiskAssessment,
 } from '@forge/types'
 import type { BoundedContext } from '@forge/harness'
 
@@ -23,6 +24,37 @@ export interface ContextBuilderOptions {
   tools: ToolDefinition[]
   mode?: string
   warnings?: string[]
+  capabilityNames?: string[]
+  riskAssessment?: TaskRiskAssessment
+}
+
+/** Per-mode operating instructions — each Forge mode behaves differently. */
+const MODE_GUIDANCE: Record<string, string[]> = {
+  explore: [
+    'EXPLORE mode: understand the task and repo before any edit.',
+    'Produce a task interpretation, an impact map, open questions, and a plan. Do NOT modify code.',
+    'Call finish_task with your findings when the exploration is complete.',
+  ],
+  implement: [
+    'IMPLEMENT mode: make controlled, minimal code changes to satisfy the acceptance criteria.',
+    'Localize → checkpoint risky changes → edit → verify with tests → record evidence.',
+  ],
+  repair: [
+    'REPAIR mode: fix a failing test/CI/regression or address review comments.',
+    'Discipline: localize the cause (do not broadly rewrite) → form a hypothesis → patch → re-run the failing check → record the failure and lesson if the hypothesis is wrong.',
+  ],
+  review: [
+    'REVIEW mode: review code without changing behavior.',
+    'Emit findings: bugs, missing tests, security concerns, risky changes, and claim/evidence gaps. Record them as evidence and decisions; do not implement fixes unless asked.',
+  ],
+  maintain: [
+    'MAINTAIN mode: routine, low-risk maintenance (deps, lint, docs, small test additions).',
+    'Keep changes small and safe; verify with the existing checks.',
+  ],
+  research: [
+    'RESEARCH mode: investigate options before implementation.',
+    'Compare approaches with tradeoffs and a recommendation, an impact map, and verification implications. Do NOT modify code.',
+  ],
 }
 
 export class AgentContextBuilder {
@@ -37,8 +69,12 @@ export class AgentContextBuilder {
   }
 
   private buildSystemPrompt(options: ContextBuilderOptions): string {
+    const mode = options.mode ?? 'implement'
     const parts: string[] = [
-      `You are Forge, a long-horizon software engineering agent operating in ${options.mode ?? 'implement'} mode.`,
+      `You are Forge, a long-horizon software engineering agent operating in ${mode} mode.`,
+      '',
+      '## Mode',
+      ...(MODE_GUIDANCE[mode] ?? MODE_GUIDANCE.implement!),
       '',
       '## Core Principles',
       '- You own the task from ticket to verified PR.',
@@ -70,6 +106,21 @@ export class AgentContextBuilder {
     if (options.warnings && options.warnings.length > 0) {
       parts.push('', '## Active Warnings')
       for (const w of options.warnings) parts.push(`- ${w}`)
+    }
+
+    if (options.riskAssessment) {
+      const r = options.riskAssessment
+      parts.push('', `## Risk Assessment: ${r.level.toUpperCase()}`)
+      for (const n of r.notes) parts.push(`- ${n}`)
+      const reqs: string[] = []
+      if (r.requiresConservativeEdits) reqs.push('make conservative, minimal edits')
+      if (r.requiresMoreCheckpoints) reqs.push('checkpoint before each risky change')
+      if (r.requiresMoreVerification) reqs.push('run extra verification (tests, typecheck, build)')
+      if (r.requiresMoreEvidence) reqs.push('attach evidence to every completion claim')
+      if (r.requiresExplicitHumanApproval) reqs.push('ask for explicit human approval before irreversible changes')
+      if (reqs.length > 0) {
+        parts.push('Because of this risk level you must: ' + reqs.join('; ') + '.')
+      }
     }
 
     if (options.boundedContext) {
@@ -135,13 +186,24 @@ export class AgentContextBuilder {
       }
     }
 
+    if (options.capabilityNames && options.capabilityNames.length > 0) {
+      parts.push(
+        '',
+        '## Semantic Capabilities',
+        'Prefer these repo-aware capabilities for discovery and localization — they query the',
+        'repository graph and map directly, which is faster and more accurate than grepping blind:',
+      )
+      for (const c of options.capabilityNames) parts.push(`- ${c}`)
+    }
+
     parts.push(
       '',
       '## CRITICAL INSTRUCTION: Tool Usage',
       'You MUST use the available tools to complete this task. You can read files, write code, search code, run commands, and record state.',
       'Do NOT apologize for lacking access or capabilities. You have all the tools you need.',
-      'If you need to understand the codebase, use search_code or glob_files. Then read specific files. Then make changes.',
+      'Localize first: use the semantic capabilities (find_definitions, find_callers, find_related_tests, get_table_schema, …) to understand the code, then read specific files, then make changes.',
       'Always run the relevant build/test/lint commands after making changes to verify they work correctly.',
+      'When the task is complete and verified, call finish_task.',
       '',
       '## Available Tools',
       'Use these tools to explore, edit, verify, and track your work.',

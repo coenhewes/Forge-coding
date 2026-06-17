@@ -7,6 +7,7 @@ import type {
   TaskStatus,
   EvidenceKind,
   ToolCall,
+  ToolDefinition,
   CompletionChunk,
   CompletionResult,
 } from '@forge/types'
@@ -16,7 +17,9 @@ import { scanRepository } from '@forge/harness'
 import { buildGraph } from '@forge/harness'
 import { getDomainManifests } from '@forge/harness'
 import { routeTask } from '@forge/harness'
-import { generateCapabilitiesFromManifests } from '@forge/harness'
+import { buildCapabilityRegistry, CapabilityExecutor, assessTaskRisk } from '@forge/harness'
+import type { TaskRiskAssessment } from '@forge/types'
+import type { CapabilityRegistry, CapabilityContext, CapabilityResult } from '@forge/harness'
 import { ContextBuilder as HarnessContextBuilder } from '@forge/harness'
 import type { BoundedContext } from '@forge/harness'
 
@@ -29,6 +32,11 @@ import { FailureLedgerEngine } from '@forge/state'
 import { DecisionLedgerEngine } from '@forge/state'
 
 import { VerificationMatrixEngine, AffectedTestSelector, CheckpointManager } from '@forge/verification'
+
+import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
+import type { GitConfig } from '@forge/types'
+import { writeFile, mkdir } from 'node:fs/promises'
+import { join, dirname } from 'node:path'
 
 import { AgentContextBuilder } from './context-builder.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
@@ -62,6 +70,7 @@ export interface AgentConfig {
     checkpointSystem?: boolean
     trace?: boolean
   }
+  git?: GitConfig
 }
 
 export interface AgentResult {
@@ -77,6 +86,11 @@ export interface AgentResult {
   verificationPassed: boolean
   acceptancePassed: boolean
   promotedCheckpointId?: string
+  branch?: string
+  commitSha?: string
+  prUrl?: string
+  prPath?: string
+  riskLevel?: string
 }
 
 export class AgentLoop {
@@ -101,6 +115,16 @@ export class AgentLoop {
   private domainManifests: import('@forge/types').DomainManifest[] = []
   private domainSelection?: DomainSelection
 
+  private git: GitConfig
+  private gitClient: GitClient
+  private baseBranch?: string
+  private workingBranch?: string
+
+  private capabilityRegistry?: CapabilityRegistry
+  private capabilityExecutor?: CapabilityExecutor
+  private taskRisk?: TaskRiskAssessment
+  private activeDomains: string[] = []
+
   constructor(config: AgentConfig) {
     this.config = config
     this.provider = createProvider(config.provider)
@@ -113,11 +137,19 @@ export class AgentLoop {
     this.failureEngine = new FailureLedgerEngine({ stateDir })
     this.decisionEngine = new DecisionLedgerEngine({ stateDir })
     this.verificationEngine = new VerificationMatrixEngine({ stateDir })
-    this.checkpointManager = new CheckpointManager({ stateDir })
+    this.checkpointManager = new CheckpointManager({ stateDir, workDir: config.workDir })
     this.toolExecutor = new ToolExecutor()
     this.contextBuilder = new AgentContextBuilder()
     this.traceRecorder = new TraceRecorder({ stateDir })
     this.evidenceMemory = new EvidenceMemory({ stateDir })
+
+    this.git = config.git ?? {
+      autoBranch: true,
+      autoCommit: true,
+      pr: 'file',
+      branchPrefix: 'forge/',
+    }
+    this.gitClient = new GitClient(config.workDir)
   }
 
   async buildRepoIntelligence(): Promise<void> {
@@ -139,14 +171,29 @@ export class AgentLoop {
     // Phase 2: Build repo intelligence
     if (!this.repoMap) await this.buildRepoIntelligence()
 
+    // Phase 2b: Create a working branch for implementation work so changes are
+    // isolated from the user's current branch (best-effort; no-op outside git).
+    this.startGitBranch(taskId)
+
     // Phase 3: Route task to domains
     this.domainSelection = routeTask(task, this.repoMap, this.repoGraph)
     const selectedDomains = this.domainSelection.selectedDomains
 
-    // Phase 4: Generate capabilities for selected domains
-    generateCapabilitiesFromManifests(
-      this.domainManifests.filter((d) => selectedDomains.includes(d.domain)),
-    )
+    // Phase 3b: Assess task risk — drives verification/approval discipline.
+    this.taskRisk = assessTaskRisk({
+      task,
+      selectedDomains,
+      manifests: this.domainManifests,
+      repoMap: this.repoMap,
+    })
+
+    // Phase 4: Build the semantic capability fabric for the selected domains.
+    // This is the discovery surface AGENTS.md calls for — repo/graph-backed
+    // capabilities (find_callers, dependency paths, table schemas, related
+    // tests, …) rather than only flat read/write primitives. The active domain
+    // set can grow mid-run via the cross-domain expansion protocol.
+    this.activeDomains = [...selectedDomains]
+    let capabilityTools: ToolDefinition[] = this.buildFabric()
 
     // Phase 5: Create acceptance contract
     const contract = await this.acceptanceEngine.generateContract(taskId, task, selectedDomains)
@@ -173,11 +220,14 @@ export class AgentLoop {
     // Phase 8: Enter agent loop
     await this.taskEngine.updateStatus(taskId, 'exploring')
 
-    const tools = createToolDefinitions()
+    // The model sees the semantic capabilities (discovery/localization) first,
+    // then the generic primitives (edit/run/verify/track). Rebuilt if scope expands.
+    let tools = [...capabilityTools, ...createToolDefinitions()]
     let messages: Message[] = []
     let iterations = 0
-    let finalStatus = 'completed'
+    let finalStatus = 'in_progress'
     let finalSummary = ''
+    let consecutiveNoTool = 0
 
     const fire = (event: Omit<AgentEvent, 'iteration'>) => {
       this.config.onEvent?.({ ...event, iteration: iterations } as AgentEvent)
@@ -205,6 +255,8 @@ export class AgentLoop {
         tools,
         mode: this.config.mode,
         warnings,
+        capabilityNames: capabilityTools.map((t) => t.name),
+        riskAssessment: this.taskRisk,
       })
 
       fire({ type: 'status', message: `Iteration ${iterations}: generating...`, status: 'thinking' })
@@ -263,6 +315,10 @@ export class AgentLoop {
         }
 
         const changedFiles: string[] = []
+        let terminalSignal: { status: string; summary: string } | undefined
+        let expandedThisTurn: string[] | undefined
+
+        consecutiveNoTool = 0
 
         for (const toolCall of result.toolCalls) {
           fire({
@@ -277,7 +333,19 @@ export class AgentLoop {
             payload: { input: toolCall.input },
           })
 
-          const toolResult = await this.toolExecutor.execute(toolCall, toolContext)
+          // Route semantic-capability calls through the fabric; everything else
+          // (edit/run/verify/track) through the primitive tool executor.
+          let toolResult: { content: string; metadata?: Record<string, unknown> }
+          if (this.capabilityExecutor && this.capabilityRegistry?.get(toolCall.name)) {
+            const capResult = await this.capabilityExecutor.execute(
+              toolCall.name,
+              toolCall.input,
+              { bypassPermissions: true },
+            )
+            toolResult = { content: this.formatCapabilityResult(toolCall.name, capResult) }
+          } else {
+            toolResult = await this.toolExecutor.execute(toolCall, toolContext)
+          }
 
           // Track changed files and record trace events
           const toolInput = toolCall.input as Record<string, unknown> | undefined
@@ -309,15 +377,6 @@ export class AgentLoop {
             )
           }
 
-          if (toolResult.metadata?.type === 'question') {
-            await this.taskEngine.updateStatus(taskId, 'blocked' as TaskStatus)
-            await this.taskEngine.setNextAction(taskId, `Waiting for human input: ${toolResult.metadata?.question}`)
-            finalStatus = 'blocked'
-            finalSummary = toolResult.content
-            messages.push(...toolMessages)
-            break
-          }
-
           const resultPreview = toolResult.content.slice(0, 200)
           fire({
             type: 'tool_result',
@@ -330,9 +389,49 @@ export class AgentLoop {
             content: toolResult.content,
             toolCallId: toolCall.id,
           })
+
+          // Terminal signals: the agent declared the task done, or it is waiting
+          // on a human. Record the signal and stop processing further tool calls
+          // this iteration so we exit the loop cleanly after the messages are saved.
+          if (toolResult.metadata?.type === 'finish') {
+            terminalSignal = {
+              status: (toolResult.metadata.status as string) || 'completed',
+              summary: (toolResult.metadata.summary as string) || toolResult.content,
+            }
+            break
+          }
+          if (toolResult.metadata?.type === 'question') {
+            const question = String(toolResult.metadata?.question ?? 'Needs human input')
+            await this.taskEngine.addQuestion(taskId, {
+              question,
+              options: toolResult.metadata?.options as { label: string; description: string }[] | undefined,
+              resolved: false,
+              timestamp: new Date().toISOString(),
+            })
+            await this.taskEngine.setNextAction(taskId, `Waiting for human input: ${question}`)
+            terminalSignal = { status: 'blocked', summary: toolResult.content }
+            break
+          }
+          if (toolResult.metadata?.type === 'expansion') {
+            const ds = (toolResult.metadata.domains as string[]) ?? []
+            expandedThisTurn = [...(expandedThisTurn ?? []), ...ds]
+          }
         }
 
         messages.push(...toolMessages)
+
+        // Cross-domain expansion: widen the active domain set and rebuild the
+        // capability fabric so the new domains' capabilities become available.
+        if (expandedThisTurn && expandedThisTurn.length > 0) {
+          this.activeDomains = [...new Set([...this.activeDomains, ...expandedThisTurn])]
+          capabilityTools = this.buildFabric()
+          tools = [...capabilityTools, ...createToolDefinitions()]
+          fire({
+            type: 'status',
+            message: `Expanded scope to: ${this.activeDomains.join(', ')}`,
+            status: 'expansion',
+          })
+        }
 
         // Run affected-test selection when files changed
         if (changedFiles.length > 0 && this.testSelector) {
@@ -342,26 +441,48 @@ export class AgentLoop {
           })
         }
 
-    await this.traceRecorder.completeTask(taskId)
-
-    const state = await this.taskEngine.getTask(taskId)
-        if (state?.status === 'completed' || state?.status === 'failed' || state?.status === 'blocked') {
-          finalStatus = state.status
+        if (terminalSignal) {
+          await this.taskEngine.updateStatus(taskId, terminalSignal.status as TaskStatus)
+          finalStatus = terminalSignal.status
+          finalSummary = terminalSignal.summary
           break
         }
-
-        const completed = await this.acceptanceEngine.getCompletionStatus(taskId)
-        if (completed.allVerified) {
-          await this.taskEngine.updateStatus(taskId, 'verifying' as TaskStatus)
-        }
-
       } else {
+        // No tool calls this turn. Nudge once; if the model still produces no
+        // actions, treat its stop as completion rather than spinning to maxIterations.
         messages.push({ role: 'assistant', content: result.content || '' })
-        if (result.finishReason === 'stop') {
-          // Continue — model may not have called tools yet
+        consecutiveNoTool++
+        if (consecutiveNoTool >= 2) {
+          finalStatus = 'completed'
+          finalSummary = result.content || 'Task completed.'
+          break
         }
+        messages.push({
+          role: 'user',
+          content:
+            'You did not call any tool. If the task is complete and verified, call finish_task. ' +
+            'Otherwise continue working: use the available tools to explore, edit, and verify.',
+        })
+      }
+
+      // Once per iteration: honor a terminal status set via update_task_status,
+      // and transition to verifying when all acceptance criteria are verified.
+      const iterState = await this.taskEngine.getTask(taskId)
+      if (
+        iterState?.status === 'completed' ||
+        iterState?.status === 'failed' ||
+        iterState?.status === 'blocked'
+      ) {
+        finalStatus = iterState.status
+        break
+      }
+      const completed = await this.acceptanceEngine.getCompletionStatus(taskId)
+      if (completed.total > 0 && completed.allVerified && iterState?.status !== 'verifying') {
+        await this.taskEngine.updateStatus(taskId, 'verifying' as TaskStatus)
       }
     }
+
+    await this.traceRecorder.completeTask(taskId)
 
     const state = await this.taskEngine.getTask(taskId)
     const evidenceSummary = await this.evidenceEngine.getSummary(taskId)
@@ -372,10 +493,18 @@ export class AgentLoop {
     const acceptanceStatus = await this.acceptanceEngine.getCompletionStatus(taskId)
     const promotedCheckpoints = await this.checkpointManager.getPromotedCheckpoints(taskId)
 
+    // Finalize: commit changes and produce a reviewable PR when the task succeeded.
+    const pr = await this.finalizeGit(taskId, finalStatus, fire)
+
     return {
       taskId,
       status: finalStatus,
-      summary: finalSummary || state?.nextAction || 'Task completed.',
+      summary:
+        finalSummary ||
+        state?.nextAction ||
+        (finalStatus === 'in_progress'
+          ? `Reached iteration limit (${maxIterations}) before finishing.`
+          : `Task ${finalStatus}.`),
       iterations,
       filesTouched: state?.filesTouched ?? [],
       commandsRun: state?.commandsRun ?? [],
@@ -385,7 +514,146 @@ export class AgentLoop {
       verificationPassed: (verification as any).passed > 0 && (verification as any).failed === 0,
       acceptancePassed: acceptanceStatus.allVerified,
       promotedCheckpointId: promotedCheckpoints[0]?.id,
+      branch: this.workingBranch,
+      commitSha: pr.commitSha,
+      prUrl: pr.prUrl,
+      prPath: pr.prPath,
+      riskLevel: this.taskRisk?.level,
     }
+  }
+
+  /**
+   * Create an isolated working branch at task start. Best-effort: skips cleanly
+   * when git is unavailable, when disabled, or outside implement/repair modes
+   * (explore/review/research should not mutate branches).
+   */
+  private startGitBranch(taskId: string): void {
+    if (!this.git.autoBranch) return
+    if (this.config.mode !== 'implement' && this.config.mode !== 'repair') return
+    if (!this.gitClient.isRepo()) return
+
+    this.baseBranch = this.git.base ?? this.gitClient.currentBranch()
+    const name = `${this.git.branchPrefix}${taskId}`
+    if (this.gitClient.createBranch(name)) {
+      this.workingBranch = name
+    }
+  }
+
+  /**
+   * On success, commit the agent's changes and render a PR. The PR body is
+   * always written to .forge as an artifact; a real GitHub PR is opened only
+   * when configured (`git.pr === 'gh'`) and the toolchain supports it.
+   */
+  private async finalizeGit(
+    taskId: string,
+    finalStatus: string,
+    fire: (event: Omit<AgentEvent, 'iteration'>) => void,
+  ): Promise<{ commitSha?: string; prUrl?: string; prPath?: string }> {
+    if (finalStatus !== 'completed') return {}
+    if (!this.gitClient.isRepo()) return {}
+
+    const state = await this.taskEngine.getTask(taskId)
+    if (!state) return {}
+
+    let commitSha: string | undefined
+    if (this.git.autoCommit && this.gitClient.hasChanges()) {
+      this.gitClient.stage(state.filesTouched.length > 0 ? state.filesTouched : undefined)
+      const subject =
+        state.currentInterpretation.slice(0, 72).replace(/\s+\S*$/, '') || `Forge task ${taskId}`
+      commitSha =
+        this.gitClient.commit(`${subject}\n\nForge task ${taskId}`) ?? undefined
+      if (commitSha) fire({ type: 'status', message: `Committed ${commitSha}`, status: 'committed' })
+    }
+
+    if (this.git.pr === 'off') return { commitSha }
+
+    // Build the reviewable PR body from durable state.
+    const contract = await this.acceptanceEngine.getContract(taskId)
+    const verification = await this.verificationEngine.getEntries(taskId)
+    const ledger = await this.evidenceEngine.getLedger(taskId)
+    const evidence = ledger?.entries ?? []
+    const failures = await this.failureEngine.getEntries(taskId)
+    const decisions = await this.decisionEngine.getEntries(taskId)
+    const checkpoints = await this.checkpointManager.getCheckpoints(taskId)
+    const patches = await this.checkpointManager.getPatches(taskId)
+
+    const generator = new PRGenerator({ repoMap: this.repoMap, domainManifests: this.domainManifests })
+    const summary = await generator.generate(
+      state,
+      contract,
+      verification,
+      evidence,
+      failures,
+      decisions,
+      checkpoints,
+      patches,
+    )
+    if (this.workingBranch) summary.branchName = this.workingBranch
+    if (this.taskRisk) {
+      summary.riskAreas.unshift(`Overall task risk: ${this.taskRisk.level}`)
+      if (this.taskRisk.requiresExplicitHumanApproval) {
+        summary.humanReviewItems.unshift('Critical risk: requires explicit human approval before merge')
+      }
+    }
+    const markdown = renderPRSummaryMarkdown(summary)
+
+    // Always persist the PR body as an artifact.
+    const prPath = join(this.config.stateDir, 'tasks', taskId, 'PR.md')
+    await mkdir(dirname(prPath), { recursive: true })
+    await writeFile(prPath, markdown, 'utf-8')
+    fire({ type: 'status', message: `PR body written to ${prPath}`, status: 'pr' })
+
+    let prUrl: string | undefined
+    if (
+      this.git.pr === 'gh' &&
+      this.workingBranch &&
+      this.gitClient.hasRemote() &&
+      ghAvailable(this.config.workDir)
+    ) {
+      if (this.gitClient.push(this.workingBranch)) {
+        prUrl = createGhPr(this.config.workDir, {
+          title: summary.title,
+          body: markdown,
+          base: this.baseBranch,
+        })
+        if (prUrl) fire({ type: 'status', message: `Opened PR: ${prUrl}`, status: 'pr' })
+      }
+    }
+
+    return { commitSha, prPath, prUrl }
+  }
+
+  /**
+   * (Re)build the semantic capability fabric for the current active domain set.
+   * Called once at start and again whenever the cross-domain expansion protocol
+   * widens scope. Returns the capability tool definitions for the model.
+   */
+  private buildFabric(): ToolDefinition[] {
+    if (this.config.features?.domainSystem === false) return []
+    this.capabilityRegistry = buildCapabilityRegistry(this.activeDomains, this.domainManifests, {
+      hasDatabase: !!this.repoMap?.database,
+    })
+    const capContext: CapabilityContext = {
+      repoRoot: this.config.workDir,
+      repoMap: this.repoMap,
+      repoGraph: this.repoGraph,
+      taskState: undefined,
+      evidence: undefined,
+      failureLedger: undefined,
+      decisionLedger: undefined,
+    }
+    this.capabilityExecutor = new CapabilityExecutor(
+      this.capabilityRegistry,
+      this.domainManifests,
+      capContext,
+    )
+    return this.capabilityRegistry.toToolDefinitions()
+  }
+
+  /** Render a capability result as compact text for the model's tool message. */
+  private formatCapabilityResult(name: string, result: CapabilityResult): string {
+    if (!result.success) return `${name} error: ${result.error ?? 'unknown error'}`
+    return `${name} →\n${JSON.stringify(result.data, null, 2)}`
   }
 
   private mergeStreamResult(chunks: CompletionChunk[]): CompletionResult {

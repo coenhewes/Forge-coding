@@ -1,4 +1,6 @@
 import blessed from 'blessed'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { TaskStateEngine, AcceptanceContractEngine, EvidenceLedgerEngine, FailureLedgerEngine, DecisionLedgerEngine } from '@forge/state'
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
 import type { TaskState } from '@forge/types'
@@ -142,7 +144,7 @@ export class Dashboard {
       left: '70%',
       width: '30%',
       height: '35%',
-      label: ' Files / Checkpoints ',
+      label: ' Files / Checkpoints / PR ',
       border: { type: 'line' },
       style: { fg: 'white', bg: 'black', border: { fg: 'cyan' } },
       scrollable: true,
@@ -422,6 +424,24 @@ export class Dashboard {
     lines.push('')
     const promotedPatches = patches.filter((p) => p.promoted)
     lines.push(`{bold}Patches:{/bold} ${patches.length} (${promotedPatches.length} promoted)`)
+
+    // ── PR readiness ──
+    const contract = await this.acceptanceEngine.getContract(this.currentTaskId)
+    const verification = await this.verificationEngine.getEntries(this.currentTaskId)
+    const failedChecks = verification.filter((v) => v.status === 'failed').length
+    const needsReview = verification.filter((v) => v.status === 'needs_human_review').length
+    const verifiedCriteria = contract?.criteria.filter((c) => c.status === 'verified').length ?? 0
+    const totalCriteria = contract?.criteria.length ?? 0
+    const prPath = join(this.stateDir, 'tasks', this.currentTaskId, 'PR.md')
+    const prReady = existsSync(prPath)
+
+    lines.push('')
+    lines.push('{bold}PR Readiness:{/bold}')
+    lines.push(`  ${prReady ? '{green-fg}✓{/green-fg}' : '{white-fg}○{/white-fg}'} PR body ${prReady ? 'generated' : 'not yet'}`)
+    lines.push(`  Acceptance: ${verifiedCriteria}/${totalCriteria} verified`)
+    const blockers = failedChecks + needsReview + task.reviewBlockers.length
+    lines.push(`  ${blockers === 0 ? '{green-fg}' : '{yellow-fg}'}Blockers: ${blockers}{/}`)
+    for (const rb of task.reviewBlockers.slice(0, 3)) lines.push(`    · ${rb.slice(0, 50)}`)
 
     this.filesBox.setContent(lines.join('\n') || '(no files or checkpoints)')
   }

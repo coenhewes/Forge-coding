@@ -1,0 +1,11 @@
+{
+  "name": "sample-saas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A small multi-tenant SaaS app used as a Forge evaluation fixture.",
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  }
+}

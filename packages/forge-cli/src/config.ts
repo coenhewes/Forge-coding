@@ -35,6 +35,12 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     checkpointSystem: true,
     trace: true,
   },
+  git: {
+    autoBranch: true,
+    autoCommit: true,
+    pr: 'file',
+    branchPrefix: 'forge/',
+  },
 }
 
 export function configPath(stateDir?: string): string {
@@ -70,6 +76,10 @@ export function resolveConfig(fileConfig: ForgeConfigFile): ForgeConfig {
     features: {
       ...DEFAULT_CONFIG.features,
       ...fileConfig.features,
+    },
+    git: {
+      ...DEFAULT_CONFIG.git,
+      ...fileConfig.git,
     },
   }
 }

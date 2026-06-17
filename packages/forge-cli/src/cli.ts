@@ -120,6 +120,7 @@ async function cmdRun(args: string[]) {
     mode: config.mode,
     maxIterations: 50,
     features: config.features,
+    git: config.git,
   })
 
   // Build repo intelligence first
@@ -144,11 +145,17 @@ async function cmdRun(args: string[]) {
   console.log(`Decisions: ${result.decisionCount} recorded`)
   console.log(`Verification passed: ${result.verificationPassed}`)
   console.log(`Acceptance passed: ${result.acceptancePassed}`)
+  if (result.riskLevel) console.log(`Risk level: ${result.riskLevel}`)
   console.log(`Summary: ${result.summary}`)
 
   if (result.promotedCheckpointId) {
     console.log(`Promoted checkpoint: ${result.promotedCheckpointId}`)
   }
+
+  if (result.branch) console.log(`Branch: ${result.branch}`)
+  if (result.commitSha) console.log(`Commit: ${result.commitSha}`)
+  if (result.prUrl) console.log(`PR: ${result.prUrl}`)
+  else if (result.prPath) console.log(`PR body: ${result.prPath}`)
 
   if (result.status === 'blocked') {
     console.log('\n⚠ Task is blocked waiting for your input.')
@@ -206,9 +213,12 @@ async function cmdStatus(args: string[]) {
 async function cmdResume(args: string[]) {
   const taskId = args[0]
   if (!taskId) {
-    console.error('Error: task ID required. Usage: forge resume <taskId>')
+    console.error('Error: task ID required. Usage: forge resume <taskId> [your answer]')
     process.exit(1)
   }
+  // Everything after the taskId is treated as the human's answer to the
+  // question that blocked the task.
+  const answer = args.slice(1).join(' ').trim()
 
   const config = await getConfig()
 
@@ -224,12 +234,21 @@ async function cmdResume(args: string[]) {
   console.log(`Resuming task: ${taskId}`)
   console.log(`Previous status: ${task.status}`)
   console.log(`Previous next action: ${task.nextAction}`)
-
   if (task.filesTouched.length > 0) {
     console.log(`Files already touched: ${task.filesTouched.length}`)
   }
 
-  // Run again
+  // Resolve the first open question with the provided answer, if any.
+  const openQuestion = task.openQuestions.find((q) => !q.resolved)
+  if (answer && openQuestion) {
+    await engine.resolveQuestion(taskId, openQuestion.question, answer)
+    console.log(`Recorded answer to: ${openQuestion.question}`)
+  }
+
+  // Re-inject prior progress + the human decision so the continued run picks up
+  // where it left off instead of starting cold.
+  const resumeContext = buildResumeContext(task, answer)
+
   const agent = new AgentLoop({
     provider: config.provider,
     workDir: config.workDir,
@@ -237,15 +256,37 @@ async function cmdResume(args: string[]) {
     mode: config.mode,
     maxIterations: 50,
     features: config.features,
+    git: config.git,
   })
 
   await agent.buildRepoIntelligence()
-  const result = await agent.run(task.originalRequest)
+  const result = await agent.run(resumeContext)
 
   console.log('\n─── Resume Result ───')
   console.log(`Status: ${result.status}`)
   console.log(`Iterations: ${result.iterations}`)
   console.log(`Summary: ${result.summary}`)
+}
+
+/** Compose a continuation prompt from a blocked task's prior state + the human answer. */
+function buildResumeContext(task: import('@forge/types').TaskState, answer: string): string {
+  const parts = [task.originalRequest]
+  if (task.completedWork.length > 0) {
+    parts.push('\nWork already completed in a previous session:')
+    parts.push(...task.completedWork.map((w) => `- ${w}`))
+  }
+  if (task.filesTouched.length > 0) {
+    parts.push(`\nFiles already changed: ${task.filesTouched.join(', ')}`)
+  }
+  const openQuestion = task.openQuestions.find((q) => !q.resolved)
+  if (answer && openQuestion) {
+    parts.push(`\nYou previously asked: "${openQuestion.question}"`)
+    parts.push(`The human answered: "${answer}"`)
+    parts.push('Continue the task using this decision.')
+  } else if (answer) {
+    parts.push(`\nHuman guidance for continuing: "${answer}"`)
+  }
+  return parts.join('\n')
 }
 
 async function cmdTasks() {

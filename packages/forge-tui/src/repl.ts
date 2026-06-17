@@ -437,6 +437,7 @@ export class Repl {
         mode: this.config.mode,
         maxIterations: 50,
         features: this.config.features,
+        git: this.config.git,
       })
 
       await agent.buildRepoIntelligence()
@@ -588,6 +589,7 @@ export class Repl {
         mode: this.config.mode,
         maxIterations: 50,
         features: this.config.features,
+        git: this.config.git,
         onEvent,
       })
 
