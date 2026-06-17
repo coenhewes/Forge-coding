@@ -16,6 +16,12 @@ export interface ComparisonOptions {
   maxIterations?: number
   /** Where to write the JSON report. */
   reportPath?: string
+  /**
+   * Skip all LLM calls and the provider init. Return synthesized ArmResult
+   * objects for both arms so the metrics pipeline and JSON output can be
+   * validated end-to-end without an API key. Defaults to false.
+   */
+  dryRun?: boolean
 }
 
 export interface ArmResult {
@@ -76,6 +82,9 @@ async function runArm(
  * claim measurable: same model, same repo, same task, better harness.
  */
 export async function runComparison(opts: ComparisonOptions): Promise<ComparisonReport> {
+  if (opts.dryRun) {
+    return runComparisonDryRun(opts)
+  }
   const forgeDir = await setupWorkdir(opts.fixtureDir, 'forge')
   const flatDir = await setupWorkdir(opts.fixtureDir, 'flat')
 
@@ -135,4 +144,59 @@ export function formatReport(report: ComparisonReport): string {
   }
   lines.push('')
   return lines.join('\n')
+}
+
+/**
+ * Synthesized comparison used by `runComparison({ dryRun: true })`.
+ * Produces a forge arm that "succeeded" and a flat arm that "failed" so
+ * the metrics pipeline exercises every code path without an LLM call.
+ * No provider is constructed, no API key is required.
+ */
+function runComparisonDryRun(opts: ComparisonOptions): ComparisonReport {
+  const forgeResult: AgentResult = {
+    taskId: 'synthetic-forge',
+    status: 'verified_complete',
+    summary: `Synthetic forge arm (dry-run) for: ${opts.task.slice(0, 60)}`,
+    iterations: 12,
+    filesTouched: [
+      'src/auth/permissions.ts',
+      'src/api/invites.ts',
+      'tests/auth/invite.test.ts',
+    ],
+    commandsRun: ['pnpm typecheck', 'pnpm test', 'pnpm lint'],
+    evidenceCount: 4,
+    failureCount: 1,
+    decisionCount: 2,
+    verificationPassed: true,
+    acceptancePassed: true,
+    riskLevel: 'medium',
+  }
+  const flatResult: AgentResult = {
+    taskId: 'synthetic-flat',
+    status: 'incomplete',
+    summary: `Synthetic flat arm (dry-run) for: ${opts.task.slice(0, 60)}`,
+    iterations: 40,
+    filesTouched: ['README.md'],
+    commandsRun: ['pnpm test'],
+    evidenceCount: 0,
+    failureCount: 12,
+    decisionCount: 0,
+    verificationPassed: false,
+    acceptancePassed: false,
+    riskLevel: 'medium',
+  }
+  const report: ComparisonReport = {
+    task: opts.task,
+    forge: { label: 'forge (full harness, dry-run)', runtimeMs: 4_000, result: forgeResult },
+    flat: { label: 'flat (baseline, dry-run)', runtimeMs: 9_000, result: flatResult },
+    generatedAt: new Date().toISOString(),
+  }
+  const reportPath = opts.reportPath
+  if (reportPath) {
+    // Fire-and-forget — dry-run reports are best-effort.
+    void mkdir(join(reportPath, '..'), { recursive: true })
+      .catch(() => {})
+      .then(() => writeFile(reportPath, JSON.stringify(report, null, 2), 'utf-8'))
+  }
+  return report
 }
