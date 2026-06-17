@@ -8,6 +8,9 @@
     "typecheck": "pnpm -r typecheck",
     "clean": "pnpm -r clean",
     "forge": "node packages/forge-cli/dist/cli.js",
+    "migrate": "node -r dotenv/config packages/forge-cli/dist/cli.js state migrate",
+    "doctor": "node -r dotenv/config packages/forge-cli/dist/cli.js doctor",
+    "doctor:migrate": "node -r dotenv/config packages/forge-cli/dist/cli.js doctor --migrate",
     "pretest": "pnpm build",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -18,6 +21,7 @@
   "devDependencies": {
     "vitest": "^2.1.0",
     "postgres": "^3.4.5",
+    "dotenv": "^16.4.5",
     "@forge/agent": "workspace:*",
     "@forge/cli": "workspace:*",
     "@forge/belief": "workspace:*",

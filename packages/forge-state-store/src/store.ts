@@ -121,20 +121,30 @@ export class ForgeStateStore {
     const sql = (postgresFactory as (cs: string) => Sql)(connectionString)
 
     try {
-      // Bootstrap the migrations tracking table on a fresh database. The
-      // first migration's SQL already does this, but we still need it to
-      // exist before we can query applied versions for the very first run.
-      await sql`
-        create table if not exists schema_migrations (
-          version integer primary key,
-          name text not null,
-          applied_at timestamptz not null default now()
-        )
-      `
-
-      const appliedRows = await sql<[{ version: number }]>`
-        select version from schema_migrations
-      `
+      // All DDL lives in schema.ts migrations — including the initial
+      // create-table for schema_migrations (see MIGRATIONS[0]). The
+      // migration runner is intentionally DDL-free here: it only
+      // executes the SQL it reads from schema.ts, records the applied
+      // version in schema_migrations, and skips versions that are
+      // already recorded. Bootstrap is performed by the migrations
+      // themselves.
+      //
+      // On a fresh database schema_migrations doesn't exist yet, so the
+      // SELECT below would throw "relation does not exist". We treat
+      // that specific error as "no migrations applied yet" and let the
+      // first migration create the table when it runs.
+      let appliedRows: { version: number }[]
+      try {
+        appliedRows = await sql<[{ version: number }]>`
+          select version from schema_migrations
+        `
+      } catch (err) {
+        if (isMissingRelationError(err, 'schema_migrations')) {
+          appliedRows = []
+        } else {
+          throw err
+        }
+      }
       const appliedSet = new Set(appliedRows.map((row) => row.version))
       const appliedNow: number[] = []
 
@@ -293,6 +303,20 @@ export function defaultStateStoreConfig(rootDir: string, connectionString?: stri
     artifactsDir: join(rootDir, '.forge', 'artifacts'),
     localFirst: true,
   }
+}
+
+/**
+ * Returns true when `err` is a Postgres "relation does not exist" error
+ * for the given relation name. We use this to detect the fresh-database
+ * case in `runMigrations` without leaking other unexpected errors.
+ */
+function isMissingRelationError(err: unknown, relation: string): boolean {
+  if (!err || typeof err !== 'object') return false
+  const code = (err as { code?: unknown }).code
+  const message = (err as { message?: unknown }).message
+  if (code !== '42P01') return false // PostgreSQL undefined_table
+  if (typeof message !== 'string') return true
+  return message.includes(`"${relation}"`)
 }
 
 /**

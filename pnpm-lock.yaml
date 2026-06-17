@@ -59,6 +59,9 @@ importers:
       '@forge/vscode':
         specifier: workspace:*
         version: link:packages/forge-vscode
+      dotenv:
+        specifier: ^16.4.5
+        version: 16.6.1
       postgres:
         specifier: ^3.4.5
         version: 3.4.9
@@ -115,6 +118,9 @@ importers:
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state
+      '@forge/state-store':
+        specifier: workspace:*
+        version: link:../forge-state-store
       '@forge/tui':
         specifier: workspace:*
         version: link:../forge-tui
@@ -674,6 +680,10 @@ packages:
     resolution: {integrity: sha512-h5k/5U50IJJFpzfL6nO9jaaumfjO/f2NjK/oYB2Djzm4p9L+3T9qWpZqZ2hAbLPuuYq9wrU08WQyBTL5GbPk5Q==}
     engines: {node: '>=6'}
 
+  dotenv@16.6.1:
+    resolution: {integrity: sha512-uBq4egWHTcTt33a72vpSG0z3HnPuIl6NqYcTrKEg2azoEyl2hpW0zqlxysq2pK9HlDIHyHyakeYaYnSAwd8bow==}
+    engines: {node: '>=12'}
+
   es-module-lexer@1.7.0:
     resolution: {integrity: sha512-jEQoCwk8hyb2AZziIOLhDqpm5+2ww5uIE6lkO/6jcOCusfk6LhMHpXXfBLXTZ7Ydyt0j4VoUQv6uGNYbdW+kBA==}
 
@@ -1055,6 +1065,8 @@ snapshots:
       ms: 2.1.3
 
   deep-eql@5.0.2: {}
+
+  dotenv@16.6.1: {}
 
   es-module-lexer@1.7.0: {}
 
