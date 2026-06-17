@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import type {
   Checkpoint,
@@ -10,6 +11,8 @@ import type {
 
 export interface CheckpointManagerOptions {
   stateDir?: string
+  /** Repo working directory — required for snapshotting/rolling back files. */
+  workDir?: string
 }
 
 let checkpointCounter = 0
@@ -27,11 +30,13 @@ function nextPatchId(): string {
 
 export class CheckpointManager {
   private stateDir: string
+  private workDir?: string
   private checkpointCache = new Map<string, Checkpoint[]>()
   private patchCache = new Map<string, PatchCandidate[]>()
 
   constructor(options?: CheckpointManagerOptions) {
     this.stateDir = options?.stateDir ?? '.forge'
+    this.workDir = options?.workDir
   }
 
   // ── Checkpoints ──────────────────────────────────────
@@ -70,7 +75,67 @@ export class CheckpointManager {
 
     checkpoints.push(checkpoint)
     await this.persistCheckpoints(taskId, checkpoints)
+
+    // Snapshot the current (pre-change) contents of the files this checkpoint
+    // covers, so a failed attempt can be rolled back to this known state.
+    await this.snapshotFiles(taskId, checkpoint.id, filesChanged)
     return checkpoint
+  }
+
+  /**
+   * Restore the working tree to the state captured when the checkpoint was
+   * created: files that existed are rewritten; files that did not exist (created
+   * after the checkpoint) are deleted. Best-effort; requires workDir.
+   */
+  async restoreCheckpoint(taskId: string, checkpointId: string): Promise<{ restored: string[]; deleted: string[] } | undefined> {
+    if (!this.workDir) return undefined
+    const checkpoints = await this.getCheckpoints(taskId)
+    const cp = checkpoints.find((c) => c.id === checkpointId)
+    if (!cp) return undefined
+
+    const restored: string[] = []
+    const deleted: string[] = []
+    const snapDir = this.snapshotDir(taskId, checkpointId)
+
+    for (const relPath of cp.filesChanged) {
+      const snapFile = join(snapDir, this.encodePath(relPath))
+      const target = join(this.workDir, relPath)
+      if (existsSync(snapFile)) {
+        const content = await readFile(snapFile, 'utf-8')
+        await mkdir(dirname(target), { recursive: true })
+        await writeFile(target, content, 'utf-8')
+        restored.push(relPath)
+      } else {
+        // File did not exist at checkpoint time → remove it on rollback.
+        await rm(target, { force: true })
+        deleted.push(relPath)
+      }
+    }
+    return { restored, deleted }
+  }
+
+  private snapshotDir(taskId: string, checkpointId: string): string {
+    return join(this.stateDir, 'checkpoints', 'snapshots', taskId, checkpointId)
+  }
+
+  private encodePath(relPath: string): string {
+    return Buffer.from(relPath).toString('base64url')
+  }
+
+  private async snapshotFiles(taskId: string, checkpointId: string, files: string[]): Promise<void> {
+    if (!this.workDir || files.length === 0) return
+    const snapDir = this.snapshotDir(taskId, checkpointId)
+    await mkdir(snapDir, { recursive: true })
+    for (const relPath of files) {
+      const source = join(this.workDir, relPath)
+      if (!existsSync(source)) continue // absent now → rollback will delete it
+      try {
+        const content = await readFile(source, 'utf-8')
+        await writeFile(join(snapDir, this.encodePath(relPath)), content, 'utf-8')
+      } catch {
+        // unreadable (e.g. binary) — skip; rollback simply won't restore it
+      }
+    }
   }
 
   async promoteCheckpoint(

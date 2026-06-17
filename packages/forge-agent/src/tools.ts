@@ -265,6 +265,49 @@ export function createToolDefinitions(): ToolDefinition[] {
         required: ['check', 'status'],
       },
     },
+    {
+      name: 'request_domain_expansion',
+      description:
+        'Expand the task scope to additional engineering domains when evidence shows the change must cross domain boundaries (e.g. an auth change also needs database work). This unlocks those domains’ semantic capabilities and records the reason.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          domains: { type: 'array', items: { type: 'string' }, description: 'Domains to add (e.g. ["database","frontend"])' },
+          reason: { type: 'string', description: 'Why the scope must expand' },
+        },
+        required: ['domains', 'reason'],
+      },
+    },
+    {
+      name: 'rollback_checkpoint',
+      description:
+        'Roll the working tree back to a checkpoint, discarding changes made after it, and mark that checkpoint rejected. Use this to abandon a failed attempt before trying a different approach.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          checkpoint_id: { type: 'string', description: 'The checkpoint ID to roll back to' },
+          reason: { type: 'string', description: 'Why this attempt is being abandoned' },
+        },
+        required: ['checkpoint_id', 'reason'],
+      },
+    },
+    {
+      name: 'finish_task',
+      description:
+        'Declare the task finished. Call this exactly once when all acceptance criteria are satisfied and verified (status "completed"), when you are permanently blocked on human input (status "blocked"), or when the task cannot be completed (status "failed"). This ends the run, so do not call it prematurely.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            enum: ['completed', 'blocked', 'failed'],
+            description: 'Terminal status for the task. Defaults to "completed".',
+          },
+          summary: { type: 'string', description: 'Concise summary of what was accomplished or why the task ended.' },
+        },
+        required: ['summary'],
+      },
+    },
   ]
 }
 
@@ -300,6 +343,9 @@ export class ToolExecutor {
       add_subtask: this.handleAddSubtask.bind(this),
       complete_subtask: this.handleCompleteSubtask.bind(this),
       verify_check: this.handleVerifyCheck.bind(this),
+      rollback_checkpoint: this.handleRollbackCheckpoint.bind(this),
+      request_domain_expansion: this.handleRequestExpansion.bind(this),
+      finish_task: this.handleFinishTask.bind(this),
     }
     return handlers[name]
   }
@@ -569,5 +615,54 @@ export class ToolExecutor {
       })
     }
     return { content: `Verification check "${check}" → ${status}` }
+  }
+
+  private async handleRollbackCheckpoint(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
+    const checkpointId = input.checkpoint_id as string
+    const reason = input.reason as string
+    const result = await ctx.checkpointManager.restoreCheckpoint(ctx.taskId, checkpointId)
+    if (!result) {
+      return { content: `Could not roll back checkpoint ${checkpointId} (not found or no working dir).` }
+    }
+    await ctx.checkpointManager.rejectCheckpoint(ctx.taskId, checkpointId, reason)
+    const parts = [`Rolled back to checkpoint ${checkpointId} (rejected: ${reason}).`]
+    if (result.restored.length > 0) parts.push(`Restored: ${result.restored.join(', ')}`)
+    if (result.deleted.length > 0) parts.push(`Removed: ${result.deleted.join(', ')}`)
+    return { content: parts.join('\n') }
+  }
+
+  private async handleRequestExpansion(
+    input: Record<string, unknown>,
+    ctx: ToolExecutionContext,
+  ): Promise<{ content: string; metadata?: Record<string, unknown> }> {
+    const domains = (input.domains as string[]) ?? []
+    const reason = (input.reason as string) ?? ''
+    const known = new Set((ctx.domainManifests ?? []).map((m) => m.domain))
+    const valid = domains.filter((d) => known.has(d))
+    const unknown = domains.filter((d) => !known.has(d))
+    await ctx.decisionEngine.addEntry(
+      ctx.taskId,
+      `Expand scope to domain(s): ${valid.join(', ') || '(none valid)'}`,
+      reason,
+      [],
+      { domain: 'cross-domain' },
+    )
+    const parts = [`Scope expansion recorded: ${valid.join(', ') || 'none'}.`]
+    if (unknown.length > 0) parts.push(`Unknown domains ignored: ${unknown.join(', ')}.`)
+    return { content: parts.join(' '), metadata: { type: 'expansion', domains: valid } }
+  }
+
+  private async handleFinishTask(
+    input: Record<string, unknown>,
+    ctx: ToolExecutionContext,
+  ): Promise<{ content: string; metadata?: Record<string, unknown> }> {
+    const status = (input.status as string) || 'completed'
+    const summary = (input.summary as string) ?? ''
+    await ctx.taskEngine.updateStatus(ctx.taskId, status as TaskStatus)
+    if (summary) await ctx.taskEngine.setNextAction(ctx.taskId, summary)
+    return {
+      content: `Task marked "${status}": ${summary}`,
+      metadata: { type: 'finish', status, summary },
+    }
   }
 }

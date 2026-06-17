@@ -115,4 +115,5 @@ export type {
 export type {
   ForgeConfig,
   ForgeConfigFile,
+  GitConfig,
 } from './config.js'

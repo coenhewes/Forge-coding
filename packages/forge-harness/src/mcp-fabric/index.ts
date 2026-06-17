@@ -12,6 +12,8 @@ export type { ExecuteOptions } from './executor.js'
 
 export { generateCapabilitiesFromManifests, generateToolDefinitions } from './generator.js'
 
+export { buildCapabilityRegistry } from './real-capabilities.js'
+
 export { ContextBuilder } from './context.js'
 export type { BoundedContext, RepoFacts, GraphFacts } from './context.js'
 
