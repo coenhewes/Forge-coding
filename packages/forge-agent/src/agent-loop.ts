@@ -29,12 +29,25 @@ import { AgentContextBuilder } from './context-builder.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
 import type { ToolExecutionContext } from './tools.js'
 
+export interface AgentEvent {
+  type: 'thinking' | 'tool_call' | 'tool_result' | 'file_touched' | 'command_run' | 'status' | 'error' | 'model_response'
+  iteration: number
+  message: string
+  detail?: string
+  toolName?: string
+  toolInput?: Record<string, unknown>
+  filePath?: string
+  status?: string
+  error?: string
+}
+
 export interface AgentConfig {
   provider: import('@forge/types').ProviderConfig
   workDir: string
   stateDir: string
   mode: 'explore' | 'implement' | 'repair' | 'review' | 'maintain' | 'research'
   maxIterations?: number
+  onEvent?: (event: AgentEvent) => void
   features?: {
     repoGraph?: boolean
     domainSystem?: boolean
@@ -155,6 +168,10 @@ export class AgentLoop {
     let finalStatus = 'completed'
     let finalSummary = ''
 
+    const fire = (event: Omit<AgentEvent, 'iteration'>) => {
+      this.config.onEvent?.({ ...event, iteration: iterations } as AgentEvent)
+    }
+
     while (iterations < maxIterations) {
       iterations++
 
@@ -174,6 +191,8 @@ export class AgentLoop {
         warnings,
       })
 
+      fire({ type: 'status', message: `Iteration ${iterations}: calling model...`, status: 'thinking' })
+
       const result = await this.provider.completeSync({
         model: this.config.provider.model,
         system: agentContext.systemPrompt,
@@ -181,6 +200,10 @@ export class AgentLoop {
         maxTokens: this.config.provider.maxTokens ?? 4096,
         temperature: this.config.provider.temperature ?? 0.2,
       })
+
+      if (result.content) {
+        fire({ type: 'thinking', message: result.content.slice(0, 2000) })
+      }
 
       if (result.toolCalls && result.toolCalls.length > 0) {
         const toolMessages: Message[] = [
@@ -207,6 +230,14 @@ export class AgentLoop {
         }
 
         for (const toolCall of result.toolCalls) {
+          fire({
+            type: 'tool_call',
+            message: `Tool: ${toolCall.name}`,
+            toolName: toolCall.name,
+            toolInput: toolCall.input as Record<string, unknown> | undefined,
+            detail: JSON.stringify(toolCall.input).slice(0, 500),
+          })
+
           const toolResult = await this.toolExecutor.execute(toolCall, toolContext)
 
           if (toolResult.metadata?.type === 'question') {
@@ -217,6 +248,13 @@ export class AgentLoop {
             messages.push(...toolMessages)
             break
           }
+
+          const resultPreview = toolResult.content.slice(0, 200)
+          fire({
+            type: 'tool_result',
+            message: `Result (${toolResult.content.length} chars)`,
+            detail: resultPreview,
+          })
 
           toolMessages.push({
             role: 'tool',

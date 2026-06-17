@@ -1,5 +1,6 @@
 import blessed from 'blessed'
 import { AgentLoop } from '@forge/agent'
+import type { AgentEvent } from '@forge/agent'
 import { TaskStateEngine, EvidenceLedgerEngine, FailureLedgerEngine, DecisionLedgerEngine } from '@forge/state'
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
 import { ConfigWizard } from './config-wizard.js'
@@ -542,11 +543,44 @@ export class Repl {
     this.screen.render()
 
     const startTime = Date.now()
+    let lastIteration = 0
+
+    const onEvent = (event: AgentEvent) => {
+      if (event.iteration !== lastIteration && event.iteration > 0) {
+        lastIteration = event.iteration
+        this.log('')
+        this.log(`{cyan-fg}── Iteration ${event.iteration} ──{/cyan-fg}`)
+      }
+
+      switch (event.type) {
+        case 'status':
+          break
+        case 'thinking':
+          if (event.message) {
+            const lines = event.message.split('\n')
+            for (const line of lines) {
+              this.log(`  {dim}${line}{/dim}`)
+            }
+          }
+          break
+        case 'tool_call':
+          this.log(`  {yellow-fg}→{/yellow-fg} {bold}${event.toolName}{/bold}`)
+          if (event.detail) {
+            this.log(`    ${event.detail.slice(0, 300)}`)
+          }
+          break
+        case 'tool_result':
+          if (event.detail) {
+            this.log(`  {green-fg}←{/green-fg} ${event.detail}`)
+          }
+          break
+        case 'error':
+          this.log(`  {red-fg}✗ Error:{/red-fg} ${event.error}`)
+          break
+      }
+    }
 
     try {
-      this.log('[1/5] Scanning repository...')
-      this.screen.render()
-
       const agent = new AgentLoop({
         provider: this.config.provider,
         workDir: this.config.workDir,
@@ -554,21 +588,20 @@ export class Repl {
         mode: this.config.mode,
         maxIterations: 50,
         features: this.config.features,
+        onEvent,
       })
 
+      this.log('{cyan-fg}─ Scanning repository...{/cyan-fg}')
       await agent.buildRepoIntelligence()
-      this.log('[1/5] {green-fg}✓{/green-fg} Repository scanned')
-
-      this.log('[2/5] Routing task to domains...')
-      this.log('[3/5] Creating acceptance contract...')
-      this.log('[4/5] Selecting affected tests...')
-      this.log('[5/5] Entering agent loop...')
+      this.log('{cyan-fg}─ Repository scanned.{/cyan-fg}')
       this.log('')
+      this.log('{cyan-fg}─ Agent working...{/cyan-fg}')
 
       const result = await agent.run(task)
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
 
+      this.log('')
       this.log('')
       this.log(`{bold}─── Result (${elapsed}s) ───{/bold}`)
       this.log(`  Status: {bold}${result.status}{/bold}`)
