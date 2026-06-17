@@ -4,23 +4,26 @@ import type {
   CompletionChunk,
   CompletionResult,
   ModelProvider,
+  ToolCall,
 } from '@forge/types'
 
 import {
   buildApiUrl,
   fetchStream,
-  parseSSE,
-  mapMessages,
-  mapTools,
-  parseToolCallsFromChunk,
+  parseAnthropicEventStream,
+  mapAnthropicMessages,
+  mapAnthropicTools,
+  getSystemMessage,
   mergeChunks,
 } from './base.js'
 
-const DEFAULT_BASE_URL = 'https://api.minimax.chat/v1'
+const DEFAULT_BASE_URL = 'https://api.minimax.io/anthropic/v1'
 
 export class MinimaxProvider implements ModelProvider {
   private baseUrl: string
   private apiKey: string
+
+  private pendingToolCalls: Map<string, { name: string; input: string }> = new Map()
 
   constructor(private config: ProviderConfig) {
     this.baseUrl = config.apiUrl ?? DEFAULT_BASE_URL
@@ -31,17 +34,24 @@ export class MinimaxProvider implements ModelProvider {
   }
 
   async *complete(request: CompletionRequest): AsyncIterable<CompletionChunk> {
-    const url = buildApiUrl(this.baseUrl, '/chat/completions')
+    const url = buildApiUrl(this.baseUrl, '/messages')
+    this.pendingToolCalls.clear()
+
+    const system = getSystemMessage(request.messages)
+    const messages = mapAnthropicMessages(request.messages)
 
     const body: Record<string, unknown> = {
       model: request.model || this.config.model,
-      messages: mapMessages(request.messages),
+      messages,
       stream: true,
     }
 
-    if (request.tools) body.tools = mapTools(request.tools)
+    if (system) body.system = system
+    if (request.tools) body.tools = mapAnthropicTools(request.tools)
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
+
+    if (!body.max_tokens) body.max_tokens = 8192
 
     const response = await fetchStream(url, {
       method: 'POST',
@@ -53,21 +63,69 @@ export class MinimaxProvider implements ModelProvider {
       timeoutMs: this.config.timeoutMs,
     })
 
-    for await (const data of parseSSE(response)) {
-      const choices = data.choices as Record<string, unknown>[] | undefined
-      if (!choices || choices.length === 0) continue
-
-      const delta = choices[0]?.delta as Record<string, unknown> | undefined
-      const finishReason = choices[0]?.finish_reason as string | null | undefined
-
+    for await (const { event, data } of parseAnthropicEventStream(response)) {
       const chunk: CompletionChunk = {}
-      if (delta?.content) chunk.content = delta.content as string
-      if (finishReason) chunk.finishReason = finishReason as CompletionChunk['finishReason']
 
-      const toolCalls = parseToolCallsFromChunk(data)
-      if (toolCalls) chunk.toolCalls = toolCalls
+      if (event === 'content_block_delta') {
+        const delta = data.delta as Record<string, unknown> | undefined
+        if (delta?.type === 'text_delta' && delta.text) {
+          chunk.content = delta.text as string
+        }
+      }
+
+      if (event === 'content_block_start') {
+        const contentBlock = data.content_block as Record<string, unknown> | undefined
+        if (contentBlock?.type === 'tool_use') {
+          this.pendingToolCalls.set(contentBlock.id as string, {
+            name: contentBlock.name as string,
+            input: '',
+          })
+        }
+      }
+
+      if (event === 'content_block_delta') {
+        const delta = data.delta as Record<string, unknown> | undefined
+        if (delta?.type === 'input_json_delta' && delta.partial_json) {
+          const toolUseId = data.index !== undefined
+            ? Array.from(this.pendingToolCalls.keys()).at(-1)
+            : undefined
+          if (toolUseId) {
+            const existing = this.pendingToolCalls.get(toolUseId)
+            if (existing) {
+              existing.input += delta.partial_json as string
+            }
+          }
+        }
+      }
+
+      if (event === 'message_stop') {
+        chunk.finishReason = 'stop'
+      }
+
+      if (event === 'message_delta') {
+        const delta = data.delta as Record<string, unknown> | undefined
+        if (delta?.stop_reason === 'end_turn') {
+          chunk.finishReason = 'stop'
+        } else if (delta?.stop_reason === 'max_tokens') {
+          chunk.finishReason = 'length'
+        } else if (delta?.stop_reason === 'tool_use') {
+          chunk.finishReason = 'tool_calls'
+        }
+      }
 
       yield chunk
+    }
+
+    if (this.pendingToolCalls.size > 0) {
+      const toolCalls: ToolCall[] = []
+      for (const [id, tc] of this.pendingToolCalls) {
+        toolCalls.push({
+          id,
+          name: tc.name,
+          input: tc.input ? JSON.parse(tc.input) : {},
+        })
+      }
+      yield { toolCalls, finishReason: 'tool_calls' }
     }
   }
 

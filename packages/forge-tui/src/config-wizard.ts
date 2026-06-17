@@ -101,6 +101,15 @@ export class ConfigWizard {
       height: 1,
     })
 
+    const defaultModels: Record<string, string> = {
+      openrouter: 'anthropic/claude-sonnet-20241022',
+      ollama: 'llama3.2',
+      openai: 'gpt-4o',
+      anthropic: 'claude-sonnet-20241022',
+      'ollama-cloud': 'llama3.2',
+      minimax: 'MiniMax-M3',
+    }
+
     const radioButtons: any[] = []
     for (let i = 0; i < this.providerNames.length; i++) {
       const rb = blessed.radiobutton({
@@ -114,6 +123,12 @@ export class ConfigWizard {
         style: { fg: 'white', bg: 'black' },
       })
       radioButtons.push(rb)
+
+      rb.on('check', () => {
+        const provider = this.providerNames[i]!
+        nameInput.setValue(defaultModels[provider] ?? '')
+        screen.render()
+      })
     }
 
     const nameInput = blessed.textbox({
@@ -124,7 +139,7 @@ export class ConfigWizard {
       height: 1,
       inputOnFocus: true,
       style: { fg: 'white', bg: 'blue' },
-      value: 'anthropic/claude-sonnet-20241022',
+      value: defaultModels[this.providerNames[0]!] ?? '',
     })
 
     blessed.box({
@@ -150,7 +165,9 @@ export class ConfigWizard {
     submitBtn.on('press', () => {
       const selectedIdx = radioButtons.findIndex((rb: any) => rb.checked)
       this.selectedProvider = this.providerNames[selectedIdx >= 0 ? selectedIdx : 0]!
-      this.selectedModel = nameInput.value || nameInput.content || 'anthropic/claude-sonnet-20241022'
+      const provider = this.selectedProvider
+      const defaultModel = defaultModels[provider] ?? 'MiniMax-M3'
+      this.selectedModel = nameInput.value || nameInput.content || defaultModel
       screen.destroy()
       this.showApiKeyForm(resolve)
     })
