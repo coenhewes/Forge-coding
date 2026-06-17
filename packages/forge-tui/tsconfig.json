@@ -11,6 +11,7 @@
   "references": [
     { "path": "../forge-types" },
     { "path": "../forge-state" },
-    { "path": "../forge-verification" }
+    { "path": "../forge-verification" },
+    { "path": "../forge-belief" }
   ]
 }
