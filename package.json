@@ -17,10 +17,22 @@
   },
   "devDependencies": {
     "vitest": "^2.1.0",
+    "postgres": "^3.4.5",
+    "@forge/agent": "workspace:*",
+    "@forge/cli": "workspace:*",
+    "@forge/belief": "workspace:*",
+    "@forge/verification-planner": "workspace:*",
+    "@forge/tui": "workspace:*",
+    "@forge/trace": "workspace:*",
+    "@forge/provider": "workspace:*",
+    "@forge/harness": "workspace:*",
+    "@forge/context-server": "workspace:*",
+    "@forge/state-store": "workspace:*",
+    "@forge/integrations": "workspace:*",
+    "@forge/vscode": "workspace:*",
     "@forge/types": "workspace:*",
     "@forge/state": "workspace:*",
     "@forge/verification": "workspace:*",
-    "@forge/harness": "workspace:*",
     "@forge/pr": "workspace:*",
     "@forge/eval": "workspace:*"
   }
