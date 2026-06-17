@@ -20,7 +20,8 @@
     "@forge/types": "workspace:*",
     "@forge/state": "workspace:*",
     "@forge/verification": "workspace:*",
-    "@forge/harness": "workspace:*"
+    "@forge/harness": "workspace:*",
+    "@forge/belief": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

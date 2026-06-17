@@ -1,550 +1,678 @@
+/**
+ * PR generator — belief + verification-state aware.
+ *
+ * Consumes the full durable-task surface (TaskBeliefState, ClaimEvidenceGraph,
+ * ActiveVerificationPlan, TaskRiskAssessment, ArtifactRef[]) plus the legacy
+ * ledgers (TaskState, AcceptanceContract, VerificationEntry, EvidenceEntry,
+ * FailureEntry, DecisionEntry, Checkpoint, PatchCandidate) and produces a
+ * reviewable PR body in the order prescribed by feature_requests/featurerequest1.md
+ * §"Example final PR section".
+ *
+ * The 11 output sections, in order:
+ *   1.  Title                  (derived from task + first acceptance criterion)
+ *   2.  Summary                (<= 8 lines)
+ *   3.  Acceptance status      (criteria + status + risk)
+ *   4.  Claim-Evidence Summary (verified / disproven / stale / human-review)
+ *   5.  Active Verification Summary (planned, completed, deferred)
+ *   6.  Failed Hypotheses and Recovery
+ *   7.  Decisions Ledger
+ *   8.  Risk Review Guide
+ *   9.  Changed Domains        (from belief)
+ *   10. Human Review Required
+ *   11. Reviewer Guide
+ *   (12. Exact Artifact References — links to .forge/artifacts/...)
+ *
+ * The PR body markdown template lives in ./templates/pr-body.md.ts and is
+ * composed by `renderPRBody`.
+ */
 import type {
-  RepoMap,
-  DomainManifest,
-  TaskState,
   AcceptanceContract,
-  VerificationEntry,
   Checkpoint,
-  PatchCandidate,
-  FailureEntry,
   DecisionEntry,
+  DomainManifest,
   EvidenceEntry,
+  FailureEntry,
+  PatchCandidate,
+  RepoMap,
+  TaskState,
+  VerificationEntry,
 } from '@forge/types'
+import type { ClaimEvidenceGraph } from '@forge/belief'
+import type { ActiveVerificationPlan, VerificationAction } from '@forge/types'
+import type { TaskBeliefState, TaskRiskAssessment } from '@forge/types'
 import { getDomainManifests } from '@forge/harness'
+import { renderPRBody } from './templates/pr-body.js'
 
-export interface PRSummary {
-  title: string
-  summary: string
-  motivation: string
-  implementationNotes: string
-  acceptanceCriteria: { id: string; description: string; status: string; riskArea?: string }[]
-  testPlan: string
-  migrationNotes: string
-  riskAreas: string[]
-  knownLimitations: string[]
-  followUpItems: string[]
-  verificationSummary: string
-  evidenceSummary: string
-  failureRecoverySummary: string
-  humanReviewItems: string[]
-  reviewGuidance: string
-  diffSummaryByDomain: string
-  filesChanged: { path: string; domain?: string; risk?: string }[]
-  domainsTouched: string[]
-  branchName?: string
+// ---------------------------------------------------------------------------
+// Local types (re-exported from ./types.ts so consumers get a single import
+// surface; we also re-export them here for the v1 shim in index.ts).
+// ---------------------------------------------------------------------------
+
+export type { ArtifactRef, PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
+
+import type { ArtifactRef, PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
+
+export interface PRGeneratorInput {
+  task: TaskState
+  contract: AcceptanceContract | undefined
+  verification: VerificationEntry[]
+  evidence: EvidenceEntry[]
+  failures: FailureEntry[]
+  decisions: DecisionEntry[]
+  checkpoints: Checkpoint[]
+  patches: PatchCandidate[]
+
+  /** Live belief state for the task — drives Changed Domains + hypotheses. */
+  belief: TaskBeliefState
+  /** Assurance case from @forge/belief's generateAssuranceCase(). */
+  claimEvidenceGraph: ClaimEvidenceGraph
+  /** Active verification plan from @forge/verification-planner. */
+  activeVerification: ActiveVerificationPlan
+  /** Concrete artifacts to link in the PR body. */
+  artifactRefs: ArtifactRef[]
+  /** Risk model from the harness's assessTaskRisk(). */
+  riskAssessment: TaskRiskAssessment
 }
 
 export interface PRGeneratorOptions {
   repoMap?: RepoMap
   domainManifests?: DomainManifest[]
+  /** Override the clock for deterministic snapshots. */
+  now?: () => Date
 }
 
-export class PRGenerator {
-  private repoMap?: RepoMap
-  private domainManifests: DomainManifest[]
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
 
-  constructor(options?: PRGeneratorOptions) {
-    this.repoMap = options?.repoMap
-    this.domainManifests = options?.domainManifests ?? getDomainManifests()
+/**
+ * Generate a structured PR summary from the full durable task surface.
+ *
+ * Pure / async — does not touch the filesystem, network, or state store. The
+ * caller is responsible for assembling the inputs (typically in FINALIZE)
+ * and for persisting `output.body` to the PR.
+ */
+export async function generatePRSummary(
+  input: PRGeneratorInput,
+  options: PRGeneratorOptions = {},
+): Promise<PRGeneratorOutput> {
+  const ctx = new PRGeneratorContext(input, options)
+  const title = ctx.buildTitle()
+  const summary = ctx.buildSummary()
+  const sections: PRGeneratorSection[] = [
+    ctx.buildAcceptanceSection(),
+    ctx.buildClaimEvidenceSection(),
+    ctx.buildActiveVerificationSection(),
+    ctx.buildFailedHypothesesSection(),
+    ctx.buildDecisionsSection(),
+    ctx.buildRiskReviewGuideSection(),
+    ctx.buildChangedDomainsSection(),
+    ctx.buildHumanReviewSection(),
+    ctx.buildReviewerGuideSection(),
+    ctx.buildArtifactRefsSection(),
+  ]
+  const body = renderPRBody({ title, summary, sections })
+  const meta = ctx.buildMeta(title, summary)
+  const promotedPatch = input.patches.find((p) => p.promoted)
+  return { title, summary, sections, body, promotedPatch, meta }
+}
+
+// ---------------------------------------------------------------------------
+// Context — bundles input + derived helpers so section builders stay small.
+// ---------------------------------------------------------------------------
+
+class PRGeneratorContext {
+  readonly input: PRGeneratorInput
+  readonly domainManifests: DomainManifest[]
+  readonly now: () => Date
+
+  constructor(input: PRGeneratorInput, options: PRGeneratorOptions) {
+    this.input = input
+    this.domainManifests = options.domainManifests ?? getDomainManifests()
+    this.now = options.now ?? (() => new Date())
   }
 
-  async generate(
-    taskState: TaskState,
-    contract: AcceptanceContract | undefined,
-    verification: VerificationEntry[],
-    evidence: EvidenceEntry[],
-    failures: FailureEntry[],
-    decisions: DecisionEntry[],
-    checkpoints: Checkpoint[],
-    patches: PatchCandidate[],
-  ): Promise<PRSummary> {
-    const domainsTouched = this.inferDomains(taskState.filesTouched)
-    const filesWithDomains = this.mapFilesToDomains(taskState.filesTouched)
-    const riskAreas = this.assessRiskAreas(domainsTouched, verification)
-    const reviewSensitivity = this.getReviewSensitivity(domainsTouched)
-    const promotedPatch = patches.find((p) => p.promoted)
+  // -- Title (section 1) ---------------------------------------------------
 
-    const title = this.generateTitle(taskState)
-    const summary = this.generateSummary(taskState, contract, domainsTouched)
-    const motivation = this.generateMotivation(taskState)
-    const implementationNotes = this.generateImplementationNotes(taskState, decisions, promotedPatch)
-    const testPlan = this.generateTestPlan(taskState, verification)
-    const migrationNotes = this.generateMigrationNotes(taskState, contract)
-    const knownLimitations = this.findKnownLimitations(evidence)
-    const followUpItems = this.findFollowUpItems(contract, verification, evidence)
-    const verificationSummaryText = this.formatVerificationSummary(verification)
-    const evidenceSummaryText = this.formatEvidenceSummary(evidence)
-    const failureRecoverySummary = this.formatFailureRecovery(failures, checkpoints)
-    const humanReviewItems = this.findHumanReviewItems(verification, evidence, reviewSensitivity)
-    const reviewGuidance = this.generateReviewGuidance(domainsTouched, reviewSensitivity, filesWithDomains, riskAreas)
-    const diffSummaryByDomain = this.generateDiffSummaryByDomain(filesWithDomains)
-
-    return {
-      title,
-      summary,
-      motivation,
-      implementationNotes,
-      acceptanceCriteria: (contract?.criteria ?? []).map((c) => ({
-        id: c.id,
-        description: c.description,
-        status: c.status,
-        riskArea: c.riskArea,
-      })),
-      testPlan,
-      migrationNotes,
-      riskAreas,
-      knownLimitations,
-      followUpItems,
-      verificationSummary: verificationSummaryText,
-      evidenceSummary: evidenceSummaryText,
-      failureRecoverySummary,
-      humanReviewItems,
-      reviewGuidance,
-      diffSummaryByDomain,
-      filesChanged: filesWithDomains,
-      domainsTouched,
-    }
-  }
-
-  private generateTitle(taskState: TaskState): string {
+  buildTitle(): string {
     const maxLen = 72
-    const raw = taskState.currentInterpretation
+    const firstCriterion = this.input.contract?.criteria[0]?.description
+    const raw = firstCriterion
+      ? `${this.input.task.currentInterpretation} — ${firstCriterion}`
+      : this.input.task.currentInterpretation || this.input.task.originalRequest
     if (raw.length <= maxLen) return raw
     return raw.slice(0, maxLen).replace(/\s+\S*$/, '') + '…'
   }
 
-  private generateSummary(taskState: TaskState, contract?: AcceptanceContract, domains?: string[]): string {
-    const parts: string[] = []
-    parts.push(taskState.currentInterpretation)
-    parts.push('')
+  // -- Summary (section 2) -------------------------------------------------
+
+  buildSummary(): string {
+    const lines: string[] = []
+    const { task, contract, belief, riskAssessment } = this.input
+    lines.push(task.currentInterpretation || task.originalRequest)
+
     if (contract && contract.criteria.length > 0) {
       const verified = contract.criteria.filter((c) => c.status === 'verified').length
-      parts.push(`Acceptance: ${verified}/${contract.criteria.length} criteria verified.`)
+      lines.push(`Acceptance: ${verified}/${contract.criteria.length} criteria verified.`)
     }
-    if (domains && domains.length > 0) {
-      parts.push(`Domains: ${domains.join(', ')}.`)
+
+    const domains = belief.selectedDomains.map((d) => d.domain)
+    if (domains.length > 0) lines.push(`Domains in scope: ${domains.join(', ')}.`)
+
+    const topHypothesis = this.topHypothesis()
+    if (topHypothesis) {
+      lines.push(
+        `Top hypothesis: "${topHypothesis.claim}" (confidence ${(topHypothesis.confidence * 100).toFixed(0)}%).`,
+      )
     }
-    if (taskState.filesTouched.length > 0) {
-      parts.push(`Files changed: ${taskState.filesTouched.length}.`)
+
+    lines.push(`Risk: ${riskAssessment.level} (${this.riskFlagSummary()}).`)
+    if (task.filesTouched.length > 0) lines.push(`Files changed: ${task.filesTouched.length}.`)
+    if (this.input.claimEvidenceGraph.verifiedClaims.length > 0) {
+      lines.push(
+        `Verified claims: ${this.input.claimEvidenceGraph.verifiedClaims.length} · ` +
+          `Stale: ${this.input.claimEvidenceGraph.staleClaims.length} · ` +
+          `Contradicted: ${this.input.claimEvidenceGraph.contradictedClaims.length} · ` +
+          `Needs review: ${this.input.claimEvidenceGraph.needsHumanReview.length}.`,
+      )
     }
-    return parts.join('\n')
+
+    // Trim to <= 8 lines; always keep the first (interpretation).
+    return lines.slice(0, 8).join('\n')
   }
 
-  private generateMotivation(taskState: TaskState): string {
-    return taskState.currentInterpretation || taskState.originalRequest
+  // -- Section 3 — Acceptance status --------------------------------------
+
+  buildAcceptanceSection(): PRGeneratorSection {
+    const { contract } = this.input
+    if (!contract || contract.criteria.length === 0) {
+      return section('acceptance', 'Acceptance status', '_No acceptance contract recorded._')
+    }
+    const out: string[] = []
+    for (const c of contract.criteria) {
+      const icon = statusIcon(c.status)
+      const risk = c.riskArea ? ` _(risk: ${c.riskArea})_` : ''
+      const evidence = c.evidenceRefs.length > 0 ? ` — evidence: ${c.evidenceRefs.join(', ')}` : ''
+      out.push(`- ${icon} **${c.id}** — ${c.description}${risk}${evidence}`)
+      if (c.notes) out.push(`  - ${c.notes}`)
+    }
+    return section('acceptance', 'Acceptance status', out.join('\n'))
   }
 
-  private generateImplementationNotes(
-    taskState: TaskState,
-    decisions: DecisionEntry[],
-    promotedPatch?: PatchCandidate,
-  ): string {
-    const parts: string[] = []
+  // -- Section 4 — Claim-Evidence Summary ---------------------------------
 
-    if (decisions.length > 0) {
-      parts.push('Key decisions:')
-      for (const d of decisions) {
-        parts.push(`- ${d.decision}`)
-        parts.push(`  Rationale: ${d.rationale}`)
-        if (d.alternativesRejected.length > 0) {
-          parts.push(`  Rejected: ${d.alternativesRejected.join(', ')}`)
+  buildClaimEvidenceSection(): PRGeneratorSection {
+    const g = this.input.claimEvidenceGraph
+    const out: string[] = []
+
+    if (g.verifiedClaims.length > 0) {
+      out.push('### Verified')
+      for (const c of g.verifiedClaims) {
+        const conf = (c.confidence * 100).toFixed(0)
+        out.push(`- ${c.claim.text} _(confidence ${conf}%, risk ${c.claim.riskLevel})_`)
+        if (c.supportingEvidence.length > 0) {
+          for (const ev of c.supportingEvidence) {
+            out.push(`  - supports: ${ev.summary ?? ev.id}${ev.artifactRef ? ` [\`${ev.artifactRef}\`]` : ''}`)
+          }
         }
       }
-      parts.push('')
+      out.push('')
     }
 
-    if (promotedPatch) {
-      parts.push(`Patch ${promotedPatch.id} was promoted after verification.`)
-      parts.push(`Files in patch: ${promotedPatch.filesChanged.map((f) => f.path).join(', ')}`)
-    }
-
-    if (taskState.filesTouched.length > 0) {
-      parts.push('')
-      parts.push('Files touched:')
-      for (const f of taskState.filesTouched) {
-        parts.push(`- ${f}`)
+    if (g.contradictedClaims.length > 0) {
+      out.push('### Contradicted')
+      for (const c of g.contradictedClaims) {
+        out.push(`- ❌ ${c.claim.text}`)
+        for (const ev of c.contradictingEvidence) {
+          out.push(`  - contradicts: ${ev.summary ?? ev.id}${ev.artifactRef ? ` [\`${ev.artifactRef}\`]` : ''}`)
+        }
       }
+      out.push('')
     }
 
-    return parts.join('\n') || 'No implementation notes recorded.'
+    if (g.staleClaims.length > 0) {
+      out.push('### Stale (re-verify before merge)')
+      for (const c of g.staleClaims) {
+        const reason = c.claim.staleReason ? ` — _${c.claim.staleReason}_` : ''
+        out.push(`- ⚠️ ${c.claim.text}${reason}`)
+      }
+      out.push('')
+    }
+
+    if (g.needsHumanReview.length > 0) {
+      out.push('### Needs human review')
+      for (const c of g.needsHumanReview) {
+        const guidance = c.claim.reviewerGuidance ? ` — ${c.claim.reviewerGuidance}` : ''
+        out.push(`- 🔶 ${c.claim.text}${guidance}`)
+      }
+      out.push('')
+    }
+
+    if (g.disprovenHypotheses.length > 0) {
+      out.push('### Disproven hypotheses')
+      for (const h of g.disprovenHypotheses) {
+        out.push(`- ~~${h.hypothesis.claim}~~ _(confidence was ${(h.confidence * 100).toFixed(0)}%)_`)
+      }
+      out.push('')
+    }
+
+    if (out.length === 0) {
+      out.push('_No claims recorded in the assurance case yet._')
+    }
+    return section('claim-evidence', 'Claim-Evidence Summary', out.join('\n').trimEnd())
   }
 
-  private generateTestPlan(taskState: TaskState, verification: VerificationEntry[]): string {
-    const parts: string[] = []
-    if (taskState.testsRun.length > 0) {
-      parts.push('Tests run:')
-      for (const t of taskState.testsRun) {
-        parts.push(`- ${t}`)
-      }
-      parts.push('')
-    }
-    const testChecks = verification.filter((v) => v.check.toLowerCase().includes('test'))
-    if (testChecks.length > 0) {
-      parts.push('Test results:')
-      for (const tc of testChecks) {
-        const icon = tc.status === 'passed' ? '✓' : tc.status === 'failed' ? '✗' : '○'
-        parts.push(`- ${icon} ${tc.check}: ${tc.status}`)
-      }
-    }
-    return parts.join('\n') || 'Run the existing test suite to verify no regressions.'
-  }
+  // -- Section 5 — Active Verification Summary ----------------------------
 
-  private generateMigrationNotes(taskState: TaskState, contract?: AcceptanceContract): string {
-    const hasMigration = taskState.filesTouched.some(
-      (f) => f.includes('migration') || f.includes('migrate'),
+  buildActiveVerificationSection(): PRGeneratorSection {
+    const plan = this.input.activeVerification
+    const out: string[] = []
+    const planned = plan.candidateActions.filter(
+      (a) => a.status === 'candidate' || a.status === 'selected' || a.status === 'running',
     )
-    if (!hasMigration) return 'No database migrations in this change.'
-    return 'This change includes database migrations. Ensure they are reviewed carefully for backward compatibility and data integrity.'
-  }
+    const completed = plan.candidateActions.filter(
+      (a) =>
+        a.status === 'passed' || a.status === 'failed' || a.status === 'blocked' || a.status === 'skipped',
+    )
+    const needsReview = plan.candidateActions.filter((a) => a.status === 'needs_human_review')
+    const deferred = plan.candidateActions.filter((a) => a.status === 'stale')
 
-  private formatVerificationSummary(verification: VerificationEntry[]): string {
-    if (verification.length === 0) return 'No verification entries recorded.'
-    const passed = verification.filter((v) => v.status === 'passed').length
-    const failed = verification.filter((v) => v.status === 'failed').length
-    const needsReview = verification.filter((v) => v.status === 'needs_human_review').length
-    const parts: string[] = [
-      `Passed: ${passed}`,
-      `Failed: ${failed}`,
-      `Needs review: ${needsReview}`,
-      '',
-    ]
-    for (const v of verification) {
-      const icon = v.status === 'passed' ? '✓' : v.status === 'failed' ? '✗' : '○'
-      parts.push(`- ${icon} ${v.check}: ${v.status}`)
-      if (v.notes) parts.push(`  ${v.notes.slice(0, 200)}`)
+    if (plan.recommendedAction) {
+      out.push(
+        `**Recommended next action:** \`${plan.recommendedAction.actionType}\` (${plan.recommendedAction.id}) — ${plan.recommendedAction.selectionReason}`,
+      )
+      out.push('')
     }
-    return parts.join('\n')
-  }
 
-  private formatEvidenceSummary(evidence: EvidenceEntry[]): string {
-    if (evidence.length === 0) return 'No evidence recorded.'
-    const parts: string[] = [`${evidence.length} evidence entries.`]
-    for (const e of evidence) {
-      const icon = e.status === 'verified' ? '✓' : e.status === 'needs_review' ? '?' : '○'
-      parts.push(`- ${icon} ${e.claim} (${e.kind})`)
-      if (e.evidence.length > 0) {
-        for (const ev of e.evidence) {
-          parts.push(`  Evidence: ${ev.slice(0, 150)}`)
-        }
-      }
-      if (e.unverified.length > 0) {
-        for (const uv of e.unverified) {
-          parts.push(`  Unverified: ${uv}`)
-        }
+    out.push(`### Planned (${planned.length})`)
+    if (planned.length === 0) out.push('_None — all checks complete or deferred._')
+    for (const a of planned) out.push(this.formatAction(a))
+    out.push('')
+
+    out.push(`### Completed (${completed.length})`)
+    if (completed.length === 0) out.push('_None recorded yet._')
+    for (const a of completed) out.push(this.formatAction(a))
+    out.push('')
+
+    if (needsReview.length > 0) {
+      out.push(`### Needs human review (${needsReview.length})`)
+      for (const a of needsReview) out.push(this.formatAction(a))
+      out.push('')
+    }
+
+    if (deferred.length > 0) {
+      out.push(`### Deferred (${deferred.length})`)
+      for (const a of deferred) out.push(this.formatAction(a))
+      out.push('')
+    }
+
+    if (plan.warnings.length > 0) {
+      out.push('### Warnings')
+      for (const w of plan.warnings) out.push(`- ${w}`)
+      out.push('')
+    }
+
+    if (plan.claimGaps.length > 0) {
+      out.push('### Claim gaps')
+      for (const g of plan.claimGaps) {
+        out.push(`- ${g.text} _(status: ${g.status}, missing: ${g.missingEvidence.join('; ') || '—'})_`)
       }
     }
-    return parts.join('\n')
+
+    return section('active-verification', 'Active Verification Summary', out.join('\n').trimEnd())
   }
 
-  private formatFailureRecovery(failures: FailureEntry[], checkpoints: Checkpoint[]): string {
-    const parts: string[] = []
+  // -- Section 6 — Failed Hypotheses and Recovery -------------------------
+
+  buildFailedHypothesesSection(): PRGeneratorSection {
+    const { failures, checkpoints } = this.input
+    const out: string[] = []
+    if (failures.length === 0 && checkpoints.filter((c) => c.promotionDecision === 'rejected').length === 0) {
+      return section('failures', 'Failed Hypotheses and Recovery', '_No failed hypotheses recorded._')
+    }
     if (failures.length > 0) {
-      parts.push(`Failed attempts: ${failures.length}`)
+      out.push('### Failure ledger')
       for (const f of failures) {
-        parts.push(`- ${f.hypothesis}`)
-        parts.push(`  Action: ${f.action}`)
-        parts.push(`  Lesson: ${f.lesson}`)
-        if (f.nextHypothesis) parts.push(`  Next: ${f.nextHypothesis}`)
+        out.push(`- **${f.hypothesis}**`)
+        out.push(`  - Action: ${f.action}`)
+        out.push(`  - Result: ${f.result}`)
+        out.push(`  - Lesson: ${f.lesson}`)
+        if (f.nextHypothesis) out.push(`  - Next: ${f.nextHypothesis}`)
       }
-      parts.push('')
+      out.push('')
     }
     const rejected = checkpoints.filter((c) => c.promotionDecision === 'rejected')
     if (rejected.length > 0) {
-      parts.push(`Rejected checkpoints: ${rejected.length}`)
+      out.push('### Rejected checkpoints')
       for (const cp of rejected) {
-        parts.push(`- ${cp.hypothesis}: ${cp.failureReason}`)
+        out.push(`- ${cp.hypothesis} _(${cp.id})_ — ${cp.failureReason ?? 'no reason recorded'}`)
       }
-      parts.push('')
+      out.push('')
     }
     const promoted = checkpoints.filter((c) => c.promotionDecision === 'promoted')
     if (promoted.length > 0) {
-      parts.push(`Promoted checkpoints: ${promoted.length}`)
+      out.push('### Promoted checkpoints')
       for (const cp of promoted) {
-        parts.push(`- ${cp.hypothesis} (${cp.id})`)
+        out.push(`- ${cp.hypothesis} _(${cp.id})_`)
       }
     }
-    return parts.join('\n') || 'No failures or recovery events recorded.'
+    return section('failures', 'Failed Hypotheses and Recovery', out.join('\n').trimEnd())
   }
 
-  private findKnownLimitations(evidence: EvidenceEntry[]): string[] {
-    const limitations: string[] = []
-    for (const e of evidence) {
-      if (e.status === 'unverified') {
-        limitations.push(...e.unverified.map((uv) => `${e.claim}: ${uv}`))
-      }
+  // -- Section 7 — Decisions Ledger ---------------------------------------
+
+  buildDecisionsSection(): PRGeneratorSection {
+    const { decisions } = this.input
+    if (decisions.length === 0) {
+      return section('decisions', 'Decisions Ledger', '_No architectural decisions recorded._')
     }
-    return limitations.length > 0 ? limitations : ['None identified.']
+    const out: string[] = []
+    for (const d of decisions) {
+      const tag = d.author === 'human' ? '👤' : '🤖'
+      out.push(`- ${tag} **${d.decision}**`)
+      out.push(`  - Rationale: ${d.rationale}`)
+      if (d.alternativesRejected.length > 0) {
+        out.push(`  - Rejected: ${d.alternativesRejected.join('; ')}`)
+      }
+      if (d.verificationRequired.length > 0) {
+        out.push(`  - Verification required: ${d.verificationRequired.join('; ')}`)
+      }
+      if (d.domain) out.push(`  - Domain: ${d.domain}`)
+    }
+    return section('decisions', 'Decisions Ledger', out.join('\n'))
   }
 
-  private findFollowUpItems(
-    contract?: AcceptanceContract,
-    verification?: VerificationEntry[],
-    evidence?: EvidenceEntry[],
-  ): string[] {
+  // -- Section 8 — Risk Review Guide --------------------------------------
+
+  buildRiskReviewGuideSection(): PRGeneratorSection {
+    const { riskAssessment } = this.input
+    const out: string[] = []
+    out.push(`**Overall risk: \`${riskAssessment.level}\`**`)
+    if (riskAssessment.notes.length > 0) {
+      out.push('')
+      for (const n of riskAssessment.notes) out.push(`- ${n}`)
+    }
+    const flags = this.activeRiskFlags()
+    if (flags.length > 0) {
+      out.push('')
+      out.push('### Required safeguards')
+      for (const f of flags) out.push(`- [ ] ${f}`)
+    }
+    return section('risk-review', 'Risk Review Guide', out.join('\n'))
+  }
+
+  // -- Section 9 — Changed Domains (from belief) --------------------------
+
+  buildChangedDomainsSection(): PRGeneratorSection {
+    const { belief, task } = this.input
+    const touched = new Set(task.filesTouched)
+    const out: string[] = []
+
+    if (belief.selectedDomains.length > 0) {
+      out.push('### Belief-selected domains')
+      for (const d of belief.selectedDomains) {
+        out.push(`- **${d.domain}** _(confidence ${(d.confidence * 100).toFixed(0)}%)_ — ${d.reason}`)
+      }
+      out.push('')
+    }
+
+    if (touched.size > 0) {
+      out.push('### Files by domain')
+      const byDomain = new Map<string, string[]>()
+      for (const f of task.filesTouched) {
+        const domain = this.domainFor(f) ?? 'uncategorized'
+        if (!byDomain.has(domain)) byDomain.set(domain, [])
+        byDomain.get(domain)!.push(f)
+      }
+      for (const [domain, files] of byDomain) {
+        out.push(`- **${domain}** (${files.length} file${files.length === 1 ? '' : 's'})`)
+        for (const f of files) out.push(`  - \`${f}\``)
+      }
+    } else {
+      out.push('_No files touched in this change._')
+    }
+
+    return section('changed-domains', 'Changed Domains', out.join('\n').trimEnd())
+  }
+
+  // -- Section 10 — Human Review Required ---------------------------------
+
+  buildHumanReviewSection(): PRGeneratorSection {
     const items: string[] = []
-
-    if (contract) {
-      const unmet = contract.criteria.filter(
-        (c) => c.status === 'needs_review' || c.status === 'blocked' || c.status === 'failed',
-      )
-      for (const c of unmet) {
-        items.push(`Acceptance criterion needs attention: ${c.description}`)
+    const g = this.input.claimEvidenceGraph
+    for (const c of g.needsHumanReview) {
+      items.push(`Review claim: ${c.claim.text}${c.claim.reviewerGuidance ? ` (${c.claim.reviewerGuidance})` : ''}`)
+    }
+    for (const hrr of this.input.belief.humanReviewRequirements) {
+      if (hrr.status === 'open') {
+        items.push(`[${hrr.riskLevel}] ${hrr.reason}`)
       }
     }
-
-    if (verification) {
-      const failed = verification.filter((v) => v.status === 'failed')
-      for (const v of failed) {
-        items.push(`Verification check failed: ${v.check}`)
-      }
-      const needsReview = verification.filter((v) => v.status === 'needs_human_review')
-      for (const v of needsReview) {
-        items.push(`Verification needs human review: ${v.check}`)
-      }
-    }
-
-    if (evidence) {
-      const needsReview = evidence.filter((e) => e.status === 'needs_review')
-      for (const e of needsReview) {
-        items.push(`Evidence needs review: ${e.claim}`)
-      }
-    }
-
-    return items.length > 0 ? items : ['No follow-up items identified.']
-  }
-
-  private findHumanReviewItems(
-    verification: VerificationEntry[],
-    evidence: EvidenceEntry[],
-    reviewSensitivity: { domain: string; level: string }[],
-  ): string[] {
-    const items: string[] = []
-
-    for (const rs of reviewSensitivity) {
-      items.push(`Domain ${rs.domain} has review sensitivity: ${rs.level}`)
-    }
-
-    for (const v of verification) {
+    for (const v of this.input.verification) {
       if (v.status === 'needs_human_review') {
-        items.push(`Verification: ${v.check}`)
+        items.push(`Verify: ${v.check}${v.notes ? ` (${v.notes})` : ''}`)
       }
     }
-
-    for (const e of evidence) {
-      if (e.status === 'needs_review') {
-        items.push(`Evidence: ${e.claim}`)
-      }
+    for (const e of this.input.evidence) {
+      if (e.status === 'needs_review') items.push(`Evidence: ${e.claim}`)
     }
-
-    return items.length > 0 ? items : ['No human review items flagged.']
+    if (this.input.riskAssessment.requiresExplicitHumanApproval) {
+      items.push('Task-level risk requires explicit human approval before merge.')
+    }
+    if (items.length === 0) {
+      return section('human-review', 'Human Review Required', '_No human review items flagged._')
+    }
+    return section('human-review', 'Human Review Required', items.map((i) => `- [ ] ${i}`).join('\n'))
   }
 
-  private generateReviewGuidance(
-    domains: string[],
-    sensitivity: { domain: string; level: string }[],
-    files: { path: string; domain?: string; risk?: string }[],
-    riskAreas: string[],
-  ): string {
-    const parts: string[] = []
+  // -- Section 11 — Reviewer Guide ----------------------------------------
 
-    if (sensitivity.length > 0) {
-      parts.push('Priority review areas (by sensitivity):')
-      const sorted = [...sensitivity].sort((a, b) => {
-        const levels: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, none: 0 }
-        return (levels[b.level] ?? 0) - (levels[a.level] ?? 0)
-      })
-      for (const s of sorted) {
-        parts.push(`- ${s.domain} (${s.level})`)
-      }
-      parts.push('')
-    }
+  buildReviewerGuideSection(): PRGeneratorSection {
+    const out: string[] = []
+    const { task, belief, riskAssessment } = this.input
+    const promoted = this.input.patches.find((p) => p.promoted)
 
-    if (riskAreas.length > 0) {
-      parts.push('Risk areas:')
-      for (const r of riskAreas) {
-        parts.push(`- ${r}`)
-      }
-      parts.push('')
-    }
-
-    if (files.length > 0) {
-      parts.push('Files to review first:')
-      const highRiskFiles = files.filter((f) => f.risk === 'high' || f.risk === 'critical')
-      const normalFiles = files.filter((f) => !highRiskFiles.includes(f))
-      for (const f of highRiskFiles) {
-        parts.push(`- [HIGH] ${f.path}${f.domain ? ` (${f.domain})` : ''}`)
-      }
-      for (const f of normalFiles) {
-        parts.push(`- ${f.path}${f.domain ? ` (${f.domain})` : ''}${f.risk ? ` [${f.risk}]` : ''}`)
-      }
-    }
-
-    return parts.join('\n') || 'Standard review process applies.'
-  }
-
-  private generateDiffSummaryByDomain(files: { path: string; domain?: string; risk?: string }[]): string {
-    const byDomain = new Map<string, { files: string[]; risks: string[] }>()
-
-    for (const f of files) {
-      const domain = f.domain ?? 'uncategorized'
-      if (!byDomain.has(domain)) byDomain.set(domain, { files: [], risks: [] })
-      const entry = byDomain.get(domain)!
-      entry.files.push(f.path)
-      if (f.risk) entry.risks.push(f.risk)
-    }
-
-    const parts: string[] = []
-    for (const [domain, info] of byDomain) {
-      const riskBadge = info.risks.length > 0 ? ` [${[...new Set(info.risks)].join(', ')}]` : ''
-      parts.push(`### ${domain}${riskBadge}`)
-      parts.push(`${info.files.length} file(s) changed:`)
-      for (const f of info.files) {
-        parts.push(`- \`${f}\``)
-      }
-      parts.push('')
-    }
-    return parts.join('\n')
-  }
-
-  private inferDomains(files: string[]): string[] {
-    const domains = new Set<string>()
-    for (const manifest of this.domainManifests) {
-      for (const pattern of manifest.owns) {
-        const regex = this.patternToRegex(pattern)
-        if (files.some((f) => regex.test(f))) {
-          domains.add(manifest.domain)
-          break
-        }
-      }
-    }
-    return [...domains]
-  }
-
-  private mapFilesToDomains(files: string[]): { path: string; domain?: string; risk?: string }[] {
-    return files.map((f) => {
-      const domain = this.domainManifests.find((m) =>
-        m.owns.some((p) => this.patternToRegex(p).test(f)),
+    out.push('### Review order (highest leverage first)')
+    if (promoted) {
+      out.push(
+        `1. **Start with the promoted patch** (\`${promoted.id}\`) — ${promoted.hypothesis}. ` +
+          `This is the patch that survived verification.`,
       )
-      return {
-        path: f,
-        domain: domain?.domain,
-        risk: domain?.riskProfile.includes('security') || domain?.riskProfile.includes('permissions')
-          ? 'high'
-          : domain?.riskProfile.includes('billing')
-            ? 'critical'
-            : undefined,
-      }
-    })
-  }
+    } else {
+      out.push('1. **No patch was promoted** — verify the staged changes are safe to merge as-is.')
+    }
 
-  private assessRiskAreas(domains: string[], verification: VerificationEntry[]): string[] {
-    const risks: string[] = []
-    for (const manifest of this.domainManifests) {
-      if (domains.includes(manifest.domain)) {
-        risks.push(...manifest.riskProfile)
+    if (belief.uncertainties.length > 0) {
+      const top = belief.uncertainties
+        .slice()
+        .sort((a, b) => severityRank(b.riskLevel) - severityRank(a.riskLevel))
+        .slice(0, 3)
+      out.push(`2. **Resolve the top open uncertainties**:`)
+      for (const u of top) out.push(`   - [${u.riskLevel}] ${u.text}`)
+    }
+
+    if (riskAssessment.requiresMoreVerification) {
+      out.push(`3. **Run additional verification** — task-level risk flagged \`requiresMoreVerification\`.`)
+    }
+    if (riskAssessment.requiresExplicitHumanApproval) {
+      out.push(`4. **Obtain explicit human approval** before merge.`)
+    }
+    out.push(`${promoted ? '5' : riskAssessment.requiresExplicitHumanApproval ? '5' : '4'}. **Skim the diff by domain** below.`)
+
+    const domainFiles = new Map<string, string[]>()
+    for (const f of task.filesTouched) {
+      const d = this.domainFor(f) ?? 'uncategorized'
+      if (!domainFiles.has(d)) domainFiles.set(d, [])
+      domainFiles.get(d)!.push(f)
+    }
+    if (domainFiles.size > 0) {
+      out.push('')
+      out.push('### Diff by domain')
+      for (const [d, files] of domainFiles) {
+        out.push(`- **${d}** (${files.length})`)
+        for (const f of files.slice(0, 10)) out.push(`  - \`${f}\``)
+        if (files.length > 10) out.push(`  - _…${files.length - 10} more_`)
       }
     }
-    // Add failed checks as risks
-    for (const v of verification) {
-      if (v.status === 'failed' && v.riskLevel) {
-        risks.push(`Check failed: ${v.check} (${v.riskLevel})`)
-      }
+
+    return section('reviewer-guide', 'Reviewer Guide', out.join('\n'))
+  }
+
+  // -- Section 12 — Exact Artifact References -----------------------------
+
+  buildArtifactRefsSection(): PRGeneratorSection {
+    const { artifactRefs } = this.input
+    if (artifactRefs.length === 0) {
+      return section('artifacts', 'Exact Artifact References', '_No artifacts linked._')
     }
-    return [...new Set(risks)]
+    const out: string[] = []
+    for (const a of artifactRefs) {
+      const title = a.title ?? a.kind
+      out.push(`- [\`${a.path}\`](.forge/artifacts/${a.path}) — **${title}** _(kind: ${a.kind}, id: ${a.id})_`)
+      if (a.summary) out.push(`  - ${a.summary}`)
+    }
+    return section('artifacts', 'Exact Artifact References', out.join('\n'))
   }
 
-  private getReviewSensitivity(domains: string[]): { domain: string; level: string }[] {
-    return this.domainManifests
-      .filter((m) => domains.includes(m.domain))
-      .filter((m) => m.reviewSensitivity !== 'none')
-      .map((m) => ({ domain: m.domain, level: m.reviewSensitivity }))
+  // -- Meta ---------------------------------------------------------------
+
+  buildMeta(title: string, summary: string): PRGeneratorMeta {
+    const g = this.input.claimEvidenceGraph
+    const top = this.topHypothesis()
+    const r = this.input.riskAssessment
+    return {
+      acceptedCount: (this.input.contract?.criteria ?? []).filter((c) => c.status === 'verified').length,
+      totalCriteria: this.input.contract?.criteria.length ?? 0,
+      topHypothesisConfidence: top?.confidence ?? 0,
+      riskLevel: r.level,
+      riskFlags: {
+        requiresMoreEvidence: r.requiresMoreEvidence,
+        requiresMoreVerification: r.requiresMoreVerification,
+        requiresConservativeEdits: r.requiresConservativeEdits,
+        requiresMoreCheckpoints: r.requiresMoreCheckpoints,
+        requiresExplicitHumanApproval: r.requiresExplicitHumanApproval,
+        requiresClearerWarnings: r.requiresClearerWarnings,
+        requiresStrongerReviewGuidance: r.requiresStrongerReviewGuidance,
+      },
+      hasHumanReviewItems:
+        g.needsHumanReview.length > 0 ||
+        this.input.belief.humanReviewRequirements.some((h) => h.status === 'open') ||
+        this.input.verification.some((v) => v.status === 'needs_human_review') ||
+        this.input.evidence.some((e) => e.status === 'needs_review') ||
+        r.requiresExplicitHumanApproval,
+      hasStaleClaims: g.staleClaims.length > 0,
+      hasContradictedClaims: g.contradictedClaims.length > 0,
+      hasNeedsHumanReviewClaims: g.needsHumanReview.length > 0,
+      artifactCount: this.input.artifactRefs.length,
+    }
   }
 
-  private patternToRegex(pattern: string): RegExp {
-    const escaped = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*\*/g, '___DOUBLESTAR___')
-      .replace(/\*/g, '[^/]*')
-      .replace(/___DOUBLESTAR___/g, '.*')
-    return new RegExp(`^${escaped}`)
+  // -- Helpers ------------------------------------------------------------
+
+  private topHypothesis() {
+    const hyps = this.input.belief.hypotheses
+    if (hyps.length === 0) return undefined
+    return hyps.slice().sort((a, b) => b.confidence - a.confidence)[0]
+  }
+
+  private riskFlagSummary(): string {
+    const flags = this.activeRiskFlags()
+    return flags.length > 0 ? flags.join(', ') : 'no special handling'
+  }
+
+  private activeRiskFlags(): string[] {
+    const r = this.input.riskAssessment
+    const flags: string[] = []
+    if (r.requiresMoreEvidence) flags.push('more evidence')
+    if (r.requiresMoreVerification) flags.push('more verification')
+    if (r.requiresConservativeEdits) flags.push('conservative edits')
+    if (r.requiresMoreCheckpoints) flags.push('more checkpoints')
+    if (r.requiresExplicitHumanApproval) flags.push('explicit human approval')
+    if (r.requiresClearerWarnings) flags.push('clearer warnings')
+    if (r.requiresStrongerReviewGuidance) flags.push('stronger review guidance')
+    return flags
+  }
+
+  private domainFor(path: string): string | undefined {
+    for (const m of this.domainManifests) {
+      if (m.owns.some((p) => patternToRegex(p).test(path))) return m.domain
+    }
+    return undefined
+  }
+
+  private formatAction(a: VerificationAction): string {
+    const icon = actionIcon(a.status)
+    const target = a.targetAcceptanceCriteria.length > 0 ? a.targetAcceptanceCriteria.join(', ') : a.targetClaims.join(', ') || '—'
+    return `- ${icon} \`${a.actionType}\` _(${a.id})_ → ${target} — ${a.selectionReason}`
   }
 }
 
-/**
- * Render a PRSummary as a reviewable markdown PR body. Ordered per AGENTS.md's
- * reviewability requirements: what changed, why, acceptance, tests, risks,
- * evidence, failure/recovery, and "what to review first".
- */
-export function renderPRSummaryMarkdown(s: PRSummary): string {
-  const out: string[] = []
-  const h = (t: string) => out.push(`## ${t}`, '')
-  const p = (t: string) => out.push(t, '')
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
 
-  out.push(`# ${s.title}`, '')
-  p(s.summary)
+function section(id: string, title: string, markdown: string): PRGeneratorSection {
+  return { id, title, markdown }
+}
 
-  h('Motivation')
-  p(s.motivation)
-
-  h('Implementation notes')
-  p(s.implementationNotes)
-
-  if (s.acceptanceCriteria.length > 0) {
-    h('Acceptance criteria')
-    for (const c of s.acceptanceCriteria) {
-      const icon = c.status === 'verified' ? '✅' : c.status === 'failed' ? '❌' : '🔶'
-      out.push(`- ${icon} ${c.description}${c.riskArea ? ` _(risk: ${c.riskArea})_` : ''}`)
-    }
-    out.push('')
+function statusIcon(status: string): string {
+  switch (status) {
+    case 'verified':
+      return '✅'
+    case 'failed':
+      return '❌'
+    case 'needs_review':
+      return '🔶'
+    case 'blocked':
+      return '⛔'
+    case 'skipped':
+      return '⏭️'
+    default:
+      return '○'
   }
+}
 
-  h('Test plan')
-  p(s.testPlan)
-
-  h('Verification summary')
-  p('```\n' + s.verificationSummary + '\n```')
-
-  if (s.riskAreas.length > 0) {
-    h('Risk areas')
-    for (const r of s.riskAreas) out.push(`- ${r}`)
-    out.push('')
+function actionIcon(status: string): string {
+  switch (status) {
+    case 'passed':
+      return '✅'
+    case 'failed':
+      return '❌'
+    case 'needs_human_review':
+      return '🔶'
+    case 'running':
+      return '⏳'
+    case 'blocked':
+      return '⛔'
+    case 'skipped':
+      return '⏭️'
+    case 'stale':
+      return '⚠️'
+    default:
+      return '○'
   }
+}
 
-  h('Migration notes')
-  p(s.migrationNotes)
-
-  h('Evidence summary')
-  p('```\n' + s.evidenceSummary + '\n```')
-
-  h('Failures & recovery')
-  p('```\n' + s.failureRecoverySummary + '\n```')
-
-  if (s.knownLimitations.length > 0) {
-    h('Known limitations')
-    for (const l of s.knownLimitations) out.push(`- ${l}`)
-    out.push('')
+function severityRank(s: string): number {
+  switch (s) {
+    case 'critical':
+      return 4
+    case 'high':
+      return 3
+    case 'medium':
+      return 2
+    case 'low':
+      return 1
+    default:
+      return 0
   }
+}
 
-  if (s.followUpItems.length > 0) {
-    h('Follow-up items')
-    for (const f of s.followUpItems) out.push(`- ${f}`)
-    out.push('')
-  }
-
-  if (s.humanReviewItems.length > 0) {
-    h('Human review required')
-    for (const i of s.humanReviewItems) out.push(`- ${i}`)
-    out.push('')
-  }
-
-  h('Review guidance')
-  p(s.reviewGuidance)
-
-  if (s.diffSummaryByDomain.trim()) {
-    h('Changes by domain')
-    p(s.diffSummaryByDomain)
-  }
-
-  out.push('---', '', '🤖 Generated by [Forge](https://github.com/coenhewes/forge)')
-  return out.join('\n')
+function patternToRegex(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '___DOUBLESTAR___')
+    .replace(/\*/g, '[^/]*')
+    .replace(/___DOUBLESTAR___/g, '.*')
+  return new RegExp(`^${escaped}`)
 }

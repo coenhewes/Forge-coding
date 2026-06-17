@@ -12,6 +12,7 @@
     { "path": "../forge-types" },
     { "path": "../forge-state" },
     { "path": "../forge-verification" },
-    { "path": "../forge-harness" }
+    { "path": "../forge-harness" },
+    { "path": "../forge-belief" }
   ]
 }
