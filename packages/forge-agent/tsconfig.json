@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "composite": true,
+    "noEmit": false,
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../forge-types" },
+    { "path": "../forge-provider" },
+    { "path": "../forge-harness" },
+    { "path": "../forge-state" },
+    { "path": "../forge-verification" }
+  ]
+}

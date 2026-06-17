@@ -1,0 +1,211 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/forge-agent:
+    dependencies:
+      '@forge/harness':
+        specifier: workspace:*
+        version: link:../forge-harness
+      '@forge/provider':
+        specifier: workspace:*
+        version: link:../forge-provider
+      '@forge/state':
+        specifier: workspace:*
+        version: link:../forge-state
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+      '@forge/verification':
+        specifier: workspace:*
+        version: link:../forge-verification
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-cli:
+    dependencies:
+      '@forge/agent':
+        specifier: workspace:*
+        version: link:../forge-agent
+      '@forge/state':
+        specifier: workspace:*
+        version: link:../forge-state
+      '@forge/tui':
+        specifier: workspace:*
+        version: link:../forge-tui
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+      '@forge/verification':
+        specifier: workspace:*
+        version: link:../forge-verification
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-harness:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-pr:
+    dependencies:
+      '@forge/harness':
+        specifier: workspace:*
+        version: link:../forge-harness
+      '@forge/state':
+        specifier: workspace:*
+        version: link:../forge-state
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+      '@forge/verification':
+        specifier: workspace:*
+        version: link:../forge-verification
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-provider:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-state:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-trace:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-tui:
+    dependencies:
+      '@forge/state':
+        specifier: workspace:*
+        version: link:../forge-state
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+      '@forge/verification':
+        specifier: workspace:*
+        version: link:../forge-verification
+      blessed:
+        specifier: ^0.1.81
+        version: 0.1.81
+    devDependencies:
+      '@types/blessed':
+        specifier: ^0.1.19
+        version: 0.1.27
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-types:
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-verification:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+packages:
+
+  '@types/blessed@0.1.27':
+    resolution: {integrity: sha512-ZOQGjLvWDclAXp0rW5iuUBXeD6Gr1PkitN7tj7/G8FCoSzTsij6OhXusOzMKhwrZ9YlL2Pmu0d6xJ9zVvk+Hsg==}
+
+  '@types/node@22.19.21':
+    resolution: {integrity: sha512-VMeFBSCKQKmm2swI2kW51SFusDqekC6q9trBCvJ/JliDchFSuoYYKN7yVNjPthP1HKZcx3U1gI/wTcEBjEFKTA==}
+
+  blessed@0.1.81:
+    resolution: {integrity: sha512-LoF5gae+hlmfORcG1M5+5XZi4LBmvlXTzwJWzUlPryN/SJdSflZvROM2TwkT0GMpq7oqT48NRd4GS7BiVBc5OQ==}
+    engines: {node: '>= 0.8.0'}
+    hasBin: true
+
+  typescript@5.9.3:
+    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
+  undici-types@6.21.0:
+    resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+
+snapshots:
+
+  '@types/blessed@0.1.27':
+    dependencies:
+      '@types/node': 22.19.21
+
+  '@types/node@22.19.21':
+    dependencies:
+      undici-types: 6.21.0
+
+  blessed@0.1.81: {}
+
+  typescript@5.9.3: {}
+
+  undici-types@6.21.0: {}

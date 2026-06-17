@@ -1,0 +1,33 @@
+{
+  "name": "@forge/cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/cli.js",
+  "types": "./dist/cli.d.ts",
+  "bin": {
+    "forge": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@forge/types": "workspace:*",
+    "@forge/agent": "workspace:*",
+    "@forge/state": "workspace:*",
+    "@forge/verification": "workspace:*",
+    "@forge/tui": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}

@@ -1,0 +1,5 @@
+export { DEFAULT_DOMAINS, getDomainManifests, getDomainKeywords, matchDomainsByTask } from './manifests.js'
+export { routeTask } from './router.js'
+export type { RouterOptions } from './router.js'
+export { detectCrossDomainChanges, requestDomainExpansion } from './expansion.js'
+export type { CrossDomainChange } from './expansion.js'

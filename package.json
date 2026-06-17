@@ -1,0 +1,15 @@
+{
+  "name": "forge",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Long-horizon software engineering agent",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "clean": "pnpm -r clean",
+    "forge": "node packages/forge-cli/dist/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
