@@ -7,9 +7,21 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "clean": "pnpm -r clean",
-    "forge": "node packages/forge-cli/dist/cli.js"
+    "forge": "node packages/forge-cli/dist/cli.js",
+    "pretest": "pnpm build",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0",
+    "@forge/types": "workspace:*",
+    "@forge/state": "workspace:*",
+    "@forge/verification": "workspace:*",
+    "@forge/harness": "workspace:*",
+    "@forge/pr": "workspace:*",
+    "@forge/eval": "workspace:*"
   }
 }

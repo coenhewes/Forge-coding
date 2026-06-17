@@ -1,3 +1,5 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { join, dirname } from 'node:path'
 import type {
   AcceptanceContract,
   AcceptanceCriterion,
@@ -44,8 +46,11 @@ const DEFAULT_CRITERION_TEMPLATES: Record<string, string[]> = {
 
 export class AcceptanceContractEngine {
   private contracts = new Map<string, AcceptanceContract>()
+  private stateDir: string
 
-  constructor(private options?: ContractEngineOptions) {}
+  constructor(private options?: ContractEngineOptions) {
+    this.stateDir = options?.stateDir ?? '.forge'
+  }
 
   async createContract(
     taskId: string,
@@ -61,6 +66,7 @@ export class AcceptanceContractEngine {
       updatedAt: now,
     }
     this.contracts.set(taskId, contract)
+    await this.persist(contract)
     return contract
   }
 
@@ -74,7 +80,8 @@ export class AcceptanceContractEngine {
   }
 
   async getContract(taskId: string): Promise<AcceptanceContract | undefined> {
-    return this.contracts.get(taskId)
+    if (this.contracts.has(taskId)) return this.contracts.get(taskId)
+    return this.load(taskId)
   }
 
   async updateCriterionStatus(
@@ -83,7 +90,7 @@ export class AcceptanceContractEngine {
     status: CriterionStatus,
     evidenceRef?: string,
   ): Promise<AcceptanceContract> {
-    const contract = this.contracts.get(taskId)
+    const contract = await this.getContract(taskId)
     if (!contract) throw new Error(`Contract not found for task ${taskId}`)
 
     const updatedCriteria = contract.criteria.map((c) => {
@@ -101,6 +108,7 @@ export class AcceptanceContractEngine {
     }
 
     this.contracts.set(taskId, updated)
+    await this.persist(updated)
     return updated
   }
 
@@ -108,7 +116,7 @@ export class AcceptanceContractEngine {
     taskId: string,
     criterion: AcceptanceCriterion,
   ): Promise<AcceptanceContract> {
-    const contract = this.contracts.get(taskId)
+    const contract = await this.getContract(taskId)
     if (!contract) throw new Error(`Contract not found for task ${taskId}`)
 
     const updated: AcceptanceContract = {
@@ -118,6 +126,7 @@ export class AcceptanceContractEngine {
     }
 
     this.contracts.set(taskId, updated)
+    await this.persist(updated)
     return updated
   }
 
@@ -131,7 +140,7 @@ export class AcceptanceContractEngine {
     percentComplete: number
     allVerified: boolean
   }> {
-    const contract = this.contracts.get(taskId)
+    const contract = await this.getContract(taskId)
     if (!contract) {
       return { total: 0, verified: 0, failed: 0, needsReview: 0, blocked: 0, skipped: 0, percentComplete: 0, allVerified: false }
     }
@@ -154,6 +163,27 @@ export class AcceptanceContractEngine {
       skipped,
       percentComplete,
       allVerified: total > 0 && verified === total,
+    }
+  }
+
+  private contractPath(taskId: string): string {
+    return join(this.stateDir, 'verification', `acceptance-${taskId}.json`)
+  }
+
+  private async persist(contract: AcceptanceContract): Promise<void> {
+    const filePath = this.contractPath(contract.taskId)
+    await mkdir(dirname(filePath), { recursive: true })
+    await writeFile(filePath, JSON.stringify(contract, null, 2), 'utf-8')
+  }
+
+  private async load(taskId: string): Promise<AcceptanceContract | undefined> {
+    try {
+      const content = await readFile(this.contractPath(taskId), 'utf-8')
+      const contract = JSON.parse(content) as AcceptanceContract
+      this.contracts.set(taskId, contract)
+      return contract
+    } catch {
+      return undefined
     }
   }
 

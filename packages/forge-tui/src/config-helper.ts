@@ -19,6 +19,7 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     repoGraph: true, domainSystem: true, evidenceLedger: true,
     failureLedger: true, decisionLedger: true, checkpointSystem: true, trace: true,
   },
+  git: { autoBranch: true, autoCommit: true, pr: 'file', branchPrefix: 'forge/' },
 }
 
 export async function initConfig(fileConfig: ForgeConfigFile): Promise<void> {

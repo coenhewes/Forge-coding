@@ -89,6 +89,9 @@ export async function buildGraph(
 
   // 2. Scan source files for imports, exports, symbols, calls
   const fileToImports: Map<string, string[]> = new Map()
+  // Cache file contents so references/call sites can be resolved in a second
+  // pass against the COMPLETE symbol table (cross-file calls depend on this).
+  const fileContents: Map<string, string> = new Map()
 
   for await (const entry of walkDir(resolvedRoot)) {
     if (entry.isDirectory || !isSourceFile(entry.path)) continue
@@ -110,6 +113,7 @@ export async function buildGraph(
     } catch {
       continue
     }
+    fileContents.set(entry.path, content)
 
     // Parse imports
     const imports = parseImports(content, entry.path)
@@ -150,12 +154,21 @@ export async function buildGraph(
       }
     }
 
-    // Parse references
+  }
+
+  // 2b. Second pass: resolve references and call sites against the complete
+  // symbol table so cross-file usages are captured (e.g. a helper defined in
+  // one file and called from many others).
+  const allDefs = Array.from(symbolDefs.values())
+  const funcDefs = allDefs.filter((d) => d.kind === 'function')
+  for (const [filePath, content] of fileContents) {
+    const fileNodeId = `file:${filePath}`
+
     if (includeReferences) {
-      const refs = parseReferences(content, entry.path, Array.from(symbolDefs.values()))
+      const refs = parseReferences(content, filePath, allDefs)
       for (const ref of refs) {
         symbolRefs.push(ref)
-        const edgeId = `edge:references:${entry.path}:${ref.name}:${ref.line}`
+        const edgeId = `edge:references:${filePath}:${ref.name}:${ref.line}`
         if (!edges.has(edgeId)) {
           edges.set(edgeId, {
             source: fileNodeId,
@@ -166,10 +179,8 @@ export async function buildGraph(
       }
     }
 
-    // Parse call sites
     if (includeCallSites) {
-      const defsForCalls = Array.from(symbolDefs.values()).filter((d) => d.kind === 'function')
-      const calls = parseCallSites(content, entry.path, defsForCalls)
+      const calls = parseCallSites(content, filePath, funcDefs)
       for (const call of calls) {
         callSites.push(call)
         const edgeId = `edge:calls:${call.caller}:${call.callee}:${call.line}`

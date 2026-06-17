@@ -122,7 +122,8 @@ export function parseReferences(content: string, file: string, defs: SymbolDefin
     const nameRe = new RegExp(`\\b${escapeRegex(def.name)}\\b`, 'g')
     while ((match = nameRe.exec(content)) !== null) {
       const line = countLines(content, match.index)
-      if (line === def.line) continue
+      // Skip the definition's own declaration line (only in its own file).
+      if (file === def.file && line === def.line) continue
       refs.push({
         name: def.name,
         file,
@@ -140,19 +141,18 @@ export function parseReferences(content: string, file: string, defs: SymbolDefin
 export function parseCallSites(content: string, file: string, defs: SymbolDefinition[]): CallSite[] {
   const calls: CallSite[] = []
   const defNames = new Set(defs.map((d) => d.name))
+  // Locations of definitions in THIS file, to exclude the declaration itself
+  // (e.g. `export function foo(` should not count as a call to foo).
+  const defLocations = new Set(defs.filter((d) => d.file === file).map((d) => `${d.line}`))
   let match: RegExpExecArray | null
 
   const callRe = /(\w+)\s*\(/g
   while ((match = callRe.exec(content)) !== null) {
     const name = match[1]!
-    if (defNames.has(name)) {
-      calls.push({
-        caller: file,
-        callee: name,
-        file,
-        line: countLines(content, match.index),
-      })
-    }
+    if (!defNames.has(name)) continue
+    const line = countLines(content, match.index)
+    if (defLocations.has(`${line}`)) continue
+    calls.push({ caller: file, callee: name, file, line })
   }
 
   return calls

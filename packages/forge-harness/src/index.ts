@@ -1,6 +1,9 @@
 export { scanRepository } from './repo-map/index.js'
 export type { ScanOptions, FileEntry } from './repo-map/index.js'
 
+export { assessTaskRisk } from './risk/index.js'
+export type { AssessRiskInput } from './risk/index.js'
+
 export { buildGraph } from './repo-graph/index.js'
 export type { BuildGraphOptions } from './repo-graph/index.js'
 export { parseImports, parseExports, parseReferences, parseCallSites } from './repo-graph/index.js'
@@ -23,6 +26,7 @@ export {
   ContextBuilder,
   generateCapabilitiesFromManifests,
   generateToolDefinitions,
+  buildCapabilityRegistry,
   authCapabilities,
   dbCapabilities,
   testCapabilities,
