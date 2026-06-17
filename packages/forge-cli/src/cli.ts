@@ -8,11 +8,11 @@ import { TaskStateEngine, AcceptanceContractEngine, EvidenceLedgerEngine, Failur
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
 import { AgentLoop } from '@forge/agent'
 import type { ForgeConfig, ForgeConfigFile } from '@forge/types'
-import { Dashboard, ConfigWizard } from '@forge/tui'
+import { Dashboard, ConfigWizard, Repl } from '@forge/tui'
 
 async function main() {
   const args = process.argv.slice(2)
-  const command = args[0] ?? 'help'
+  const command = args[0]
 
   switch (command) {
     case 'init':
@@ -43,8 +43,10 @@ async function main() {
       await cmdSetup()
       break
     case 'help':
-    default:
       showHelp()
+      break
+    default:
+      await cmdRepl()
       break
   }
 }
@@ -347,6 +349,12 @@ async function cmdDashboard(args: string[]) {
 
   const dashboard = new Dashboard({ stateDir, initialTaskId: taskId })
   await dashboard.start()
+}
+
+async function cmdRepl() {
+  const config = await getConfig()
+  const repl = new Repl(config)
+  await repl.start()
 }
 
 async function cmdSetup() {
