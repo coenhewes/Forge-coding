@@ -15,6 +15,7 @@ export interface CompletionRequest {
   system?: string
   messages: Message[]
   tools?: ToolDefinition[]
+  toolChoice?: string
   maxTokens?: number
   temperature?: number
   stream?: boolean

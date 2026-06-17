@@ -4,6 +4,7 @@ import type {
   CompletionChunk,
   CompletionResult,
   ModelProvider,
+  ToolCall,
 } from '@forge/types'
 
 import {
@@ -22,6 +23,8 @@ export class OpenAIProvider implements ModelProvider {
   private baseUrl: string
   private apiKey: string
 
+  private pendingToolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map()
+
   constructor(private config: ProviderConfig) {
     this.baseUrl = config.apiUrl ?? DEFAULT_BASE_URL
     this.apiKey = config.apiKey ?? ''
@@ -32,6 +35,7 @@ export class OpenAIProvider implements ModelProvider {
 
   async *complete(request: CompletionRequest): AsyncIterable<CompletionChunk> {
     const url = buildApiUrl(this.baseUrl, '/chat/completions')
+    this.pendingToolCalls.clear()
 
     const body: Record<string, unknown> = {
       model: request.model || this.config.model,
@@ -40,6 +44,7 @@ export class OpenAIProvider implements ModelProvider {
     }
 
     if (request.tools) body.tools = mapTools(request.tools)
+    if (request.toolChoice) body.tool_choice = request.toolChoice
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
 
@@ -64,8 +69,44 @@ export class OpenAIProvider implements ModelProvider {
       if (delta?.content) chunk.content = delta.content as string
       if (finishReason) chunk.finishReason = finishReason as CompletionChunk['finishReason']
 
-      const toolCalls = parseToolCallsFromChunk(data)
-      if (toolCalls) chunk.toolCalls = toolCalls
+      // Accumulate tool call deltas from streaming chunks
+      const toolCallDeltas = delta?.tool_calls as Record<string, unknown>[] | undefined
+      if (toolCallDeltas) {
+        for (const tcd of toolCallDeltas) {
+          const index = (tcd.index as number) ?? this.pendingToolCalls.size
+          if (!this.pendingToolCalls.has(index)) {
+            const func = tcd.function as Record<string, unknown> | undefined
+            this.pendingToolCalls.set(index, {
+              id: (tcd.id as string) || '',
+              name: (func?.name as string) || '',
+              arguments: (func?.arguments as string) || '',
+            })
+          } else {
+            const existing = this.pendingToolCalls.get(index)!
+            const func = tcd.function as Record<string, unknown> | undefined
+            if (tcd.id) existing.id = tcd.id as string
+            if (func?.name) existing.name = func.name as string
+            if (func?.arguments) existing.arguments += func.arguments as string
+          }
+        }
+      }
+
+      // Emit complete tool calls when finish reason is tool_calls
+      if (finishReason === 'tool_calls' && this.pendingToolCalls.size > 0) {
+        const toolCalls: ToolCall[] = []
+        for (const [, pc] of this.pendingToolCalls) {
+          let input: Record<string, unknown> = {}
+          if (pc.arguments) {
+            try {
+              input = JSON.parse(pc.arguments)
+            } catch {
+              input = {}
+            }
+          }
+          toolCalls.push({ id: pc.id, name: pc.name, input })
+        }
+        chunk.toolCalls = toolCalls
+      }
 
       yield chunk
     }

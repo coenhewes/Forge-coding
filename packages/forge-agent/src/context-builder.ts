@@ -137,8 +137,14 @@ export class AgentContextBuilder {
 
     parts.push(
       '',
+      '## CRITICAL INSTRUCTION: Tool Usage',
+      'You MUST use the available tools to complete this task. You can read files, write code, search code, run commands, and record state.',
+      'Do NOT apologize for lacking access or capabilities. You have all the tools you need.',
+      'If you need to understand the codebase, use search_code or glob_files. Then read specific files. Then make changes.',
+      'Always run the relevant build/test/lint commands after making changes to verify they work correctly.',
+      '',
       '## Available Tools',
-      'You have access to the following tools. Use them to explore, edit, verify, and track your work.',
+      'Use these tools to explore, edit, verify, and track your work.',
     )
 
     return parts.join('\n')

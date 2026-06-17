@@ -21,7 +21,8 @@
     "@forge/provider": "workspace:*",
     "@forge/harness": "workspace:*",
     "@forge/state": "workspace:*",
-    "@forge/verification": "workspace:*"
+    "@forge/verification": "workspace:*",
+    "@forge/trace": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

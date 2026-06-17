@@ -19,6 +19,9 @@ importers:
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state
+      '@forge/trace':
+        specifier: workspace:*
+        version: link:../forge-trace
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types
