@@ -2,3 +2,5 @@ node_modules/
 dist/
 .forge/
 *.tsbuildinfo
+.env
+.local/
