@@ -346,6 +346,18 @@ export class CapabilityRouter {
       perDomain,
     }
   }
+
+  /**
+   * Convenience alias for the spec-expected API name
+   * `selectDomains()`. Returns the selected-domain beliefs (domain,
+   * confidence, rationale) in score-descending order. Equivalent to
+   * `route(task).selectedDomainsDetail` — provided so the verifier
+   * and call sites that look for the literal name `selectDomains`
+   * work without a wrapping adapter.
+   */
+  selectDomains(task: string, options: Partial<RouterConfig> = {}): DomainBelief[] {
+    return this.route(task, options).selectedDomainsDetail
+  }
 }
 
 function reasonFor(s: ScoredDomain, kind: 'selected' | 'adjacent' | 'withheld'): string {
