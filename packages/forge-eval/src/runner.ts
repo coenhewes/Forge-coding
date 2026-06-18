@@ -28,6 +28,10 @@ export interface ArmResult {
   label: string
   runtimeMs: number
   result: AgentResult
+  metrics?: {
+    verifiedCompletionRate?: number
+    [key: string]: unknown
+  }
 }
 
 export interface ComparisonReport {
@@ -127,6 +131,7 @@ export function formatReport(report: ComparisonReport): string {
     ['evidence entries', (a) => a.result.evidenceCount],
     ['decisions', (a) => a.result.decisionCount],
     ['failures recorded', (a) => a.result.failureCount],
+    ['verified-completion', (a) => a.metrics?.verifiedCompletionRate ?? (a.result.verificationPassed && a.result.acceptancePassed ? 1 : 0)],
     ['verification passed', (a) => String(a.result.verificationPassed)],
     ['acceptance passed', (a) => String(a.result.acceptancePassed)],
     ['risk level', (a) => a.result.riskLevel ?? '—'],

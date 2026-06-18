@@ -27,6 +27,7 @@
  */
 import type {
   AcceptanceContract,
+  ArtifactRef,
   Checkpoint,
   DecisionEntry,
   DomainManifest,
@@ -44,13 +45,14 @@ import { getDomainManifests } from '@forge/harness'
 import { renderPRBody } from './templates/pr-body.js'
 
 // ---------------------------------------------------------------------------
-// Local types (re-exported from ./types.ts so consumers get a single import
-// surface; we also re-export them here for the v1 shim in index.ts).
+// Local types — section/output/meta. ArtifactRef lives in @forge/types
+// (promoted from this package). The legacy import path @forge/pr/ArtifactRef
+// still works via the re-export in ./types.ts and ./index.ts.
 // ---------------------------------------------------------------------------
 
-export type { ArtifactRef, PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
+export type { PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
 
-import type { ArtifactRef, PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
+import type { PRGeneratorSection, PRGeneratorOutput, PRGeneratorMeta } from './types.js'
 
 export interface PRGeneratorInput {
   task: TaskState
@@ -528,7 +530,13 @@ class PRGeneratorContext {
     const out: string[] = []
     for (const a of artifactRefs) {
       const title = a.title ?? a.kind
-      out.push(`- [\`${a.path}\`](.forge/artifacts/${a.path}) — **${title}** _(kind: ${a.kind}, id: ${a.id})_`)
+      const location = 'path' in a ? `.forge/artifacts/${a.path}` : a.uri
+      const label = 'path' in a ? a.path : a.uri
+      const meta = [`kind: ${a.kind}`, `id: ${a.id}`]
+      if (a.mime) meta.push(`mime: ${a.mime}`)
+      if (a.size !== undefined) meta.push(`size: ${a.size}B`)
+      if (a.checksum) meta.push(`sha256: ${a.checksum.slice(0, 12)}…`)
+      out.push(`- [\`${label}\`](${location}) — **${title}** _(${meta.join(', ')})_`)
       if (a.summary) out.push(`  - ${a.summary}`)
     }
     return section('artifacts', 'Exact Artifact References', out.join('\n'))

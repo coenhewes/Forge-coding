@@ -16,6 +16,8 @@
     "@forge/verification": "workspace:*",
     "@forge/agent": "workspace:*",
     "@forge/belief": "workspace:*",
+    "@forge/trace": "workspace:*",
+    "@forge/pr": "workspace:*",
     "blessed": "^0.1.81"
   },
   "devDependencies": {

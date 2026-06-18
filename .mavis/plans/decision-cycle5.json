@@ -1,0 +1,12 @@
+{
+  "last_cycle": [
+    {
+      "task_id": "t40-agent-loop",
+      "verdict": "accept",
+      "reason": "Belief-guided six-stage machine (LOCALIZE→PROBE→EDIT→VERIFY→REPAIR→FINALIZE) wired to TaskBeliefState + ActiveVerificationPlanner + ProbePlanner + DiagnosticEngine. Permission engine rejects out-of-domain writes. Tool-output bounding persists full bytes to .forge/artifacts with truncated preview in model history. Resume path reconciles stale 'running' commands rows. Build clean, 100/15 tests pass (15 new). Two resume caveats acknowledged honestly by producer; not blocking."
+    }
+  ],
+  "next_cycle": [],
+  "plan_complete": false,
+  "message_to_user": "Agent loop is wired to belief + verification + state-store. Three parallel tracks can run now: TUI/CLI, PR generator + eval harness, and MCP/plugins."
+}

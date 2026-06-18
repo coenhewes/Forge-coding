@@ -168,3 +168,6 @@ export type {
   ForgeConfigFile,
   GitConfig,
 } from './config.js'
+
+export type { ArtifactRef } from './artifact.js'
+export { isLocalArtifact, isRemoteArtifact } from './artifact.js'

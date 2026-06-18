@@ -15,6 +15,8 @@ import type {
   Hypothesis,
   ProbeRecommendation,
   VerificationAction,
+  ActiveVerificationPlan,
+  EvidenceValueScore,
 } from '@forge/types'
 
 import { createProvider } from '@forge/provider'
@@ -44,11 +46,13 @@ import { findStaleClaimsForFiles } from '@forge/verification-planner'
 
 import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { TraceEventInput } from '@forge/state-store'
+import { createContextServer, type ForgeContextServer } from '@forge/context-server'
 
 import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
 import type { GitConfig, ProviderConfig } from '@forge/types'
 import { writeFile, mkdir } from 'node:fs/promises'
-import { join, dirname } from 'node:path'
+import { basename, join, dirname } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
 
 import { AgentContextBuilder } from './context-builder.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
@@ -216,6 +220,7 @@ export class AgentLoop {
 
   /** Optional Postgres state store (in 'postgres' mode). */
   private stateStore?: ForgeStateStore
+  private contextServer?: ForgeContextServer
 
   /** Trace events captured during the current run. */
   private pendingTrace: TraceEventInput[] = []
@@ -300,34 +305,36 @@ export class AgentLoop {
    * `PermissionEngine.defaultRules(ctx)` and can be overridden via
    * `config.permissionRules`.
    */
-  private async initSubsystems(taskId: string, repoId: string): Promise<void> {
-    // Belief store — always backed by InMemoryBeliefStore so unit
-    // tests work without Postgres. When a real ForgeStateStore is
-    // provided, the InMemoryBeliefStore captures the in-memory view
-    // and the real store's repos stay the durable source of truth.
+  private async initSubsystems(taskId: string, repoId: string, goal: string): Promise<void> {
+    // Belief store — backed by Postgres when the durable state store is
+    // available, otherwise by the in-memory test shim.
     this.beliefBackend = new InMemoryBeliefStore()
-    const stateStoreLike = this.beliefBackend.asStateStoreLike()
-    this.beliefStore = new BeliefStore(stateStoreLike)
+    this.beliefStore = this.stateStore
+      ? new BeliefStore(this.stateStore)
+      : new BeliefStore(this.beliefBackend.asStateStoreLike())
 
     // Initial task belief state. We start with a single "initial
     // understanding" hypothesis (the task is the claim) and one
     // claim per acceptance criterion we'll generate below.
-    const belief = await this.beliefStore.createTaskBeliefState(taskId, {
-      repoId,
-      goal: this.config.mode === 'implement' ? 'implement task' : this.config.mode,
-      acceptanceCriteria: [],
-      hypotheses: [
-        {
-          claim: 'Initial: investigate the codebase before editing',
-          status: 'plausible',
-          confidence: 0.5,
-          relevantDomains: this.activeDomains,
-          relevantGraphNodes: [],
-        },
-      ],
-      claims: [],
-    })
-    void belief
+    const existingBelief = await this.beliefStore.loadTaskBeliefState(taskId)
+    if (!existingBelief) {
+      const belief = await this.beliefStore.createTaskBeliefState(taskId, {
+        repoId,
+        goal,
+        acceptanceCriteria: [],
+        hypotheses: [
+          {
+            claim: 'Initial: investigate the codebase before editing',
+            status: 'plausible',
+            confidence: 0.5,
+            relevantDomains: this.activeDomains,
+            relevantGraphNodes: [],
+          },
+        ],
+        claims: [],
+      })
+      void belief
+    }
 
     // Permission engine. Built from config rules (if any) layered
     // on top of the default rule chain.
@@ -341,18 +348,107 @@ export class AgentLoop {
       for (const rule of this.config.permissionRules) this.permissionEngine.addRule(rule)
     }
 
-    // Wire optional Postgres state store.
+  }
+
+  private async initDurableState(taskId: string, task: string): Promise<string> {
     if (this.config.stateStore) {
       this.stateStore = this.config.stateStore
+    } else if (this.config.stateStoreMode === 'file') {
+      return randomUUID()
     } else if (this.config.stateStoreMode === 'postgres' || process.env.FORGE_DATABASE_URL) {
       this.stateStore = new ForgeStateStore({
         config: defaultStateStoreConfig(this.config.workDir, process.env.FORGE_DATABASE_URL),
       })
     }
+    if (!this.stateStore) return randomUUID()
+
+    await this.stateStore.init()
+    this.contextServer = createContextServer(this.stateStore)
+
+    const existingRepo = await this.stateStore.repos.repos.getByRootPath(this.config.workDir)
+    const repo = existingRepo ?? await this.stateStore.repos.repos.insert({
+      id: randomUUID(),
+      rootPath: this.config.workDir,
+      name: basename(this.config.workDir),
+      currentBranch: this.workingBranch ?? this.baseBranch ?? null,
+      payload: {
+        packageCount: this.repoMap?.packages.length ?? 0,
+        appCount: this.repoMap?.apps.length ?? 0,
+      },
+    })
+
+    const existingTask = await this.stateStore.repos.tasks.get(taskId)
+    if (!existingTask) {
+      await this.stateStore.tx(async (ctx) => {
+        await ctx.repos.tasks.insert({
+          id: taskId,
+          repoId: repo.id,
+          title: task.slice(0, 120) || 'Forge task',
+          originalRequest: task,
+          interpretedGoal: task,
+          status: 'pending',
+          mode: this.config.mode,
+          activeBranch: this.workingBranch ?? null,
+          activePatchCandidateId: null,
+          currentSummary: null,
+          nextAction: 'Initialize repo intelligence and belief state',
+          payload: {},
+        })
+        await ctx.trace({
+          type: 'task_created',
+          taskId,
+          repoId: repo.id,
+          actor: 'system',
+          summary: `Task created: ${task.slice(0, 160)}`,
+          payload: { mode: this.config.mode },
+        })
+      })
+    }
+
+    return repo.id
+  }
+
+  private async persistAcceptanceContract(taskId: string, repoId: string, contract: AcceptanceContract): Promise<Map<string, string>> {
+    const ids = new Map<string, string>()
+    if (!this.stateStore) {
+      for (const criterion of contract.criteria) ids.set(criterion.id, criterion.id)
+      return ids
+    }
+
+    const existing = await this.stateStore.repos.acceptance.listByTask(taskId)
+    for (const criterion of contract.criteria) {
+      const match = existing.find((row) => row.text === criterion.description)
+      if (match) {
+        ids.set(criterion.id, match.id)
+        continue
+      }
+      const row = await this.stateStore.tx(async (ctx) => {
+        const inserted = await ctx.repos.acceptance.insert({
+          id: randomUUID(),
+          taskId,
+          text: criterion.description,
+          status: criterion.status === 'needs_review' ? 'needs_review' : criterion.status,
+          riskLevel: criterion.riskArea ?? null,
+          requiresHumanReview: criterion.status === 'needs_review',
+          payload: { sourceCriterionId: criterion.id, evidenceRefs: criterion.evidenceRefs, notes: criterion.notes },
+        })
+        await ctx.trace({
+          type: 'acceptance_criterion_added',
+          taskId,
+          repoId,
+          actor: 'system',
+          summary: `Acceptance criterion added: ${criterion.description}`,
+          payload: { criterionId: inserted.id, sourceCriterionId: criterion.id },
+        })
+        return inserted
+      })
+      ids.set(criterion.id, row.id)
+    }
+    return ids
   }
 
   async run(task: string): Promise<AgentResult> {
-    const taskId = `task-${Date.now()}`
+    const taskId = randomUUID()
     return this.runWithId(task, taskId, { resumed: false })
   }
 
@@ -390,6 +486,9 @@ export class AgentLoop {
 
     // Phase 2b: Create a working branch for implementation work.
     this.startGitBranch(taskId)
+
+    // Phase 2c: Initialize durable Postgres state when configured.
+    const repoId = await this.initDurableState(taskId, task)
 
     // Phase 3: Route task to domains
     this.domainSelection = routeTask(task, this.repoMap, this.repoGraph)
@@ -430,17 +529,20 @@ export class AgentLoop {
     }
 
     // Phase 7b: Initialise belief + permission subsystems
-    const repoId = (this.repoMap as { repoId?: string } | undefined)?.repoId ?? '00000000-0000-0000-0000-000000000000'
-    await this.initSubsystems(taskId, repoId)
+    await this.initSubsystems(taskId, repoId, task)
+
+    const acceptanceIdByCriterion = await this.persistAcceptanceContract(taskId, repoId, contract)
 
     // Seed claims from the acceptance contract.
+    const existingClaims = new Set((await this.beliefStore.loadTaskBeliefState(taskId))?.claims.map((c) => c.text) ?? [])
     for (const criterion of contract.criteria) {
+      if (existingClaims.has(criterion.description)) continue
       await this.beliefStore.addClaim(taskId, {
         text: criterion.description,
         status: 'unverified',
         confidence: 0,
         riskLevel: criterion.riskArea === 'high' || criterion.riskArea === 'critical' || criterion.riskArea === 'medium' || criterion.riskArea === 'low' ? criterion.riskArea : 'low',
-        acceptanceCriterionRefs: [criterion.id],
+        acceptanceCriterionRefs: [acceptanceIdByCriterion.get(criterion.id) ?? criterion.id],
       })
     }
 
@@ -591,6 +693,7 @@ export class AgentLoop {
       uncertainties: internal.belief?.uncertainties ?? [],
       filesChanged: [],
     })
+    await this.persistActiveVerificationPlan(verifyPlan)
     internal.topVerifyAction = verifyPlan.recommendedAction ?? null
 
     const completion = evaluateCompletion({
@@ -598,6 +701,79 @@ export class AgentLoop {
       actions: verifyPlan.candidateActions,
     })
     internal.canComplete = completion.ready
+  }
+
+  private async persistActiveVerificationPlan(plan: ActiveVerificationPlan): Promise<void> {
+    if (!this.contextServer) return
+    try {
+      const existing = await this.stateStore?.repos.verificationActions.listByTask(plan.taskId)
+      const existingPlannerIds = new Set((existing ?? []).map((row) => String(row.payload?.plannerActionId ?? row.id)))
+      for (const action of plan.candidateActions) {
+        if (existingPlannerIds.has(action.id)) continue
+        const durableActionId = stableUuid(action.id)
+        await this.contextServer.write('verification.record_action', {
+          verificationAction: {
+            id: durableActionId,
+            taskId: action.taskId,
+            actionType: action.actionType,
+            command: action.command ?? null,
+            capability: action.capability ?? null,
+            status: action.status,
+            expectedEvidenceValue: action.expectedEvidenceValue,
+            selectionReason: action.selectionReason,
+            estimatedRuntimeMs: action.estimatedRuntimeMs ?? null,
+            estimatedCost: action.estimatedCost ?? null,
+            flakinessRisk: action.flakinessRisk ?? null,
+            setupCost: action.setupCost ?? null,
+            evidenceQuality: action.evidenceQuality ?? null,
+            reviewUsefulness: action.reviewUsefulness ?? null,
+            resultEvidenceId: action.resultEvidenceId ?? null,
+            payload: {
+              plannerActionId: action.id,
+              targetClaims: action.targetClaims,
+              targetAcceptanceCriteria: action.targetAcceptanceCriteria,
+              targetHypotheses: action.targetHypotheses,
+              targetRisks: action.targetRisks,
+            },
+          },
+        }, { actor: 'verifier' })
+        for (const claimId of action.targetClaims) {
+          await this.contextServer.write('verification.link_action_claim', {
+            verificationActionClaimLink: {
+              id: stableUuid(`${action.id}:claim:${claimId}`),
+              verificationActionId: durableActionId,
+              claimId,
+              linkType: 'targets',
+              expectedConfidenceDelta: scoreForAction(plan.scores, action.id)?.components.expectedConfidenceShift ?? null,
+              actualConfidenceDelta: null,
+            },
+          }, { actor: 'verifier' })
+        }
+        const score = scoreForAction(plan.scores, action.id)
+        if (score) {
+          await this.contextServer.write('verification.record_action_score', {
+            verificationActionScore: {
+              id: stableUuid(`${action.id}:score:${score.totalScore}`),
+              verificationActionId: durableActionId,
+              totalScore: score.totalScore,
+              claimImportance: score.components.claimImportance,
+              expectedConfidenceShift: score.components.expectedConfidenceShift,
+              riskWeight: score.components.riskWeight,
+              hypothesisDiscrimination: score.components.hypothesisDiscrimination,
+              evidenceQuality: score.components.evidenceQuality,
+              reviewUsefulness: score.components.reviewUsefulness,
+              runtimePenalty: score.components.runtimePenalty,
+              flakinessPenalty: score.components.flakinessPenalty,
+              setupPenalty: score.components.setupPenalty,
+              contextPenalty: score.components.contextPenalty,
+              explanation: score.explanation,
+            },
+          }, { actor: 'verifier' })
+        }
+      }
+    } catch (err) {
+      void err
+    }
   }
 
   /**
@@ -1232,9 +1408,11 @@ export class AgentLoop {
     if (!this.stateStore || this.pendingTrace.length === 0) return
     const events = this.pendingTrace.splice(0)
     try {
+      const task = await this.stateStore.repos.tasks.get(taskId)
+      const repoId = task?.repoId ?? null
       await this.stateStore.tx(async (ctx) => {
         for (const ev of events) {
-          await ctx.trace(ev)
+          await ctx.trace({ ...ev, repoId: ev.repoId ?? repoId })
         }
       })
     } catch {
@@ -1440,6 +1618,18 @@ export class AgentLoop {
 
 function toolResultMetadata(result: { metadata?: Record<string, unknown> }): Record<string, unknown> {
   return result.metadata ?? {}
+}
+
+function scoreForAction(scores: EvidenceValueScore[], actionId: string): EvidenceValueScore | undefined {
+  return scores.find((score) => score.actionId === actionId)
+}
+
+function stableUuid(input: string): string {
+  const chars = createHash('sha256').update(input).digest('hex').slice(0, 32).split('')
+  chars[12] = '4'
+  chars[16] = ((Number.parseInt(chars[16] ?? '0', 16) & 0x3) | 0x8).toString(16)
+  const hex = chars.join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
 // Silence the unused-symbol warning while keeping the export shape stable.

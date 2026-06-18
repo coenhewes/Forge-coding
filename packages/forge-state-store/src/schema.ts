@@ -1,4 +1,4 @@
-export const REQUIRED_SCHEMA_VERSION = 2
+export const REQUIRED_SCHEMA_VERSION = 3
 
 export interface Migration {
   version: number
@@ -437,6 +437,41 @@ create index if not exists idx_verification_actions_payload_gin on verification_
 -- The column is nullable so existing rows (which had mime inferred
 -- from file extension at read time) keep working.
 alter table artifacts add column if not exists mime text;
+`,
+  },
+  {
+    version: 3,
+    name: 'add_sessions_and_prompts',
+    sql: `
+create table if not exists sessions (
+  id uuid primary key,
+  task_id uuid not null references tasks(id),
+  repo_id uuid not null references repos(id),
+  status text not null,
+  model_provider text,
+  model_name text,
+  mode text,
+  current_stage text,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists prompts (
+  id uuid primary key,
+  session_id uuid not null references sessions(id),
+  task_id uuid not null references tasks(id),
+  prompt_type text not null,
+  role text not null,
+  content text not null,
+  status text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  promoted_at timestamptz
+);
+
+create index if not exists idx_sessions_task_status on sessions(task_id, status);
+create index if not exists idx_prompts_session_time on prompts(session_id, created_at asc);
 `,
   },
 ]

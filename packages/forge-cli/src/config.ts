@@ -47,8 +47,20 @@ export function configPath(stateDir?: string): string {
   return join(stateDir ?? DEFAULT_STATE_DIR, 'config.json')
 }
 
+/**
+ * Honor `FORGE_STATE_DIR` env var when no explicit `stateDir` is
+ * passed. This lets the CLI commands and tests redirect state
+ * to a hermetic temp directory without monkey-patching cwd.
+ */
+function effectiveStateDir(stateDir?: string): string {
+  if (stateDir) return stateDir
+  const env = process.env.FORGE_STATE_DIR
+  if (env && env.length > 0) return env
+  return DEFAULT_STATE_DIR
+}
+
 export async function loadConfig(stateDir?: string): Promise<ForgeConfig | null> {
-  const fp = configPath(stateDir)
+  const fp = configPath(effectiveStateDir(stateDir))
   try {
     const content = await readFile(fp, 'utf-8')
     const parsed = JSON.parse(content) as ForgeConfigFile
@@ -60,7 +72,8 @@ export async function loadConfig(stateDir?: string): Promise<ForgeConfig | null>
 
 export function resolveConfig(fileConfig: ForgeConfigFile): ForgeConfig {
   const workDir = process.cwd()
-  const stateDir = join(workDir, DEFAULT_STATE_DIR)
+  const envStateDir = process.env.FORGE_STATE_DIR
+  const stateDir = envStateDir && envStateDir.length > 0 ? envStateDir : join(workDir, DEFAULT_STATE_DIR)
 
   return {
     provider: fileConfig.provider,
@@ -86,7 +99,8 @@ export function resolveConfig(fileConfig: ForgeConfigFile): ForgeConfig {
 
 export async function initConfig(overrides?: Partial<ForgeConfigFile>): Promise<ForgeConfig> {
   const workDir = process.cwd()
-  const stateDir = join(workDir, DEFAULT_STATE_DIR)
+  const envStateDir = process.env.FORGE_STATE_DIR
+  const stateDir = envStateDir && envStateDir.length > 0 ? envStateDir : join(workDir, DEFAULT_STATE_DIR)
 
   const fileConfig: ForgeConfigFile = {
     provider: overrides?.provider ?? DEFAULT_CONFIG.provider,
@@ -112,5 +126,5 @@ export async function initConfig(overrides?: Partial<ForgeConfigFile>): Promise<
 }
 
 export function isInitialized(stateDir?: string): boolean {
-  return existsSync(configPath(stateDir))
+  return existsSync(configPath(effectiveStateDir(stateDir)))
 }

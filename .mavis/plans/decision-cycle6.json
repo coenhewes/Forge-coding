@@ -1,0 +1,77 @@
+{
+  "last_cycle": [
+    {
+      "task_id": "t50-tui-cli",
+      "verdict": "manual_retry",
+      "reason": "Task timed out at 30min — original scope (17 CLI subcommands + 12 TUI panels + slash commands + command palette + dashboard + setup/doctor flows) was too big for one worker. Rejecting to retry with smaller scope."
+    },
+    {
+      "task_id": "t60-pr-eval",
+      "verdict": "manual_retry",
+      "reason": "Task timed out at 30min — original scope (PR template redesign from belief+verification state, eval harness extension, 6 new fixtures, baseline-comparison harness) was too big for one worker. Splitting for retry."
+    },
+    {
+      "task_id": "t70-extensibility",
+      "verdict": "manual_retry",
+      "reason": "Task timed out at 30min — original scope (MCP client/server, plugin registry with manifest + lifecycle, skill registry, provider catalog, subagent runners, plus tests for each) was way too big. Splitting for retry."
+    }
+  ],
+  "next_cycle": [
+    {
+      "task_id": "t50a-tui-panels-minimal",
+      "title": "TUI: belief + verification + trace panels + dashboard host",
+      "prompt": "Add 6 minimal TUI panels under packages/forge-tui/src/panels/ that read from the state store + belief + verification modules (no model-facing writes — panels are read-only views of state). Each panel is a class with render(width, height): string and handleKey(key): void. (1) TaskPanel — current task goal + status + next action. (2) BeliefPanel — top 3 hypotheses with confidence bars. (3) VerificationPanel — verification plan + claim confidence gaps (status != verified). (4) EvidencePanel — last 10 evidence ledger entries. (5) TracePanel — last 20 trace events as a timeline. (6) FailurePanel — failed attempts + disproven hypotheses. Wire them into a new packages/forge-tui/src/dashboard.ts that renders a 3x2 grid (left/right split, top/bottom split). Use blessed. No slash commands, no palette, no setup flows in this slice — that is a follow-up. Test at tests/tui-panels.test.ts: snapshot-test each panel render with a fixed BeliefState + VerificationPlan fixture. Build clean, pnpm test 5/5 new pass. Same exit-code discipline: pnpm -r build > /tmp/build.log 2>&1; echo $?. Report new commit hash. 20-minute budget.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Open tests/tui-panels.test.ts — confirm each of 6 panels has at least one snapshot render test that does NOT throw. Independently run pnpm --filter @forge/tui build > /tmp/tui_build.log 2>&1; echo $? — must be 0. Read packages/forge-tui/src/dashboard.ts and confirm it renders panels in a grid without coupling to specific models. FAIL if any panel returns hardcoded text or throws on missing belief state.",
+      "timeout_ms": 1200000
+    },
+    {
+      "task_id": "t50b-cli-commands-minimal",
+      "title": "CLI: minimal viable commands + JSON output",
+      "prompt": "Add minimal viable CLI commands under packages/forge-cli/src/commands/. Read the existing config.ts and index.ts first. Each command is a function that takes args, calls into state-store + agent-loop or returns JSON. (1) forge init — idempotent setup: write .env, init Postgres schema (calls store.init()), create .gitignore. (2) forge run <task> — invokes AgentLoop.run(task). (3) forge sessions — list tasks from state store. (4) forge status [taskId] — single task summary. (5) forge verify <taskId> — list open verification matrix. (6) forge evidence <taskId> [--claim id] — list evidence ledger. (7) forge checkpoint <taskId> — list patch candidates. (8) forge doctor — env + DB + provider reachability check. Each command MUST support --json flag for headless output. Wire them into cli.ts as subcommands. CRITICAL: capture exit code correctly — pnpm -r build > /tmp/build.log 2>&1; echo $? (do NOT pipe through tail). Tests at tests/cli-commands.test.ts: each command tested with --json and --text output. 20-minute budget. Report commit hash.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Run node packages/forge-cli/dist/cli.js --help — must list all 8 commands. Run node packages/forge-cli/dist/cli.js sessions --json — must produce valid JSON or empty array. Open tests/cli-commands.test.ts — confirm --json path is tested for every command (no command is text-only). Independently verify: pnpm -r build > /tmp/build.log 2>&1; echo $? — must be 0. FAIL if any command silently swallows errors.",
+      "timeout_ms": 1200000
+    },
+    {
+      "task_id": "t60a-pr-generator-from-belief",
+      "title": "PR generator: consume belief+verification state and emit 11-section markdown",
+      "prompt": "Rewrite packages/forge-pr/src/pr-generator.ts to consume the new state. New signature: generatePRSummary(input: PRGeneratorInput): Promise<PRGeneratorOutput> where input has belief: TaskBeliefState, claimEvidenceGraph: ClaimEvidenceGraph, activeVerification: ActiveVerificationPlan, artifactRefs: ArtifactRef[], riskAssessment: TaskRiskAssessment (plus the existing fields). Output sections in this order: Title, Summary (<=8 lines), Acceptance status, Claim-Evidence Summary (verified / disproven / stale / human-review-required), Active Verification Summary (planned, completed, deferred), Failed Hypotheses and Recovery, Decisions Ledger, Risk Review Guide, Changed Domains, Human Review Required, Reviewer Guide, Exact Artifact References. Move template to packages/forge-pr/src/templates/. Tests at tests/pr-generator.test.ts with fixtures for: clean task (all verified), task with stale claims (must show in Claim-Evidence Summary), task with high-risk domain (must show in Risk Review Guide). 20-minute budget. Report commit hash. EXIT CODE DISCIPLINE: pnpm -r build > /tmp/build.log 2>&1; echo $?.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Open tests/pr-generator.test.ts — confirm at least one fixture exercises each of the 11 sections. Independently run: pnpm -r build > /tmp/build.log 2>&1; echo $? — must be 0. Read packages/forge-pr/src/templates/ — confirm 11 sections appear in the documented order. FAIL if any section is missing or if any test fixture is hand-rolled and not actually exercising the generator.",
+      "timeout_ms": 1200000
+    },
+    {
+      "task_id": "t60b-eval-fixture",
+      "title": "Eval: add ONE team-invitations fixture + baseline harness",
+      "prompt": "Add ONE new fixture to packages/forge-eval/fixtures/: team-invitations — a stub monorepo with the existing sample-saas pattern extended to include invitations functionality (invite, accept, expire, revoke) in the db schema + a few route stubs. Extend packages/forge-eval/src/runner.ts to run both the new fixture and the existing sample-saas. Add a baseline-comparison harness at packages/forge-eval/src/baseline.ts: takes a fixture + a flat flag (skips belief+verification modules) and reports metrics (verified-completion-rate, files-edited-irrelevant, repeated-failed-attempts). Tests at tests/eval-fixture.test.ts. Skip the other 5 fixtures called out in the plan — one is enough to prove the harness works. 20-minute budget. Report commit hash. EXIT CODE DISCIPLINE: pnpm -r build > /tmp/build.log 2>&1; echo $?.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Confirm packages/forge-eval/fixtures/team-invitations exists with at least one src file + one test file. Confirm packages/forge-eval/src/baseline.ts exposes the documented metrics. Run the new eval fixture test in isolation: pnpm test tests/eval-fixture.test.ts. Independently verify: pnpm -r build > /tmp/build.log 2>&1; echo $? — must be 0.",
+      "timeout_ms": 1200000
+    },
+    {
+      "task_id": "t70a-mcp-skeleton",
+      "title": "MCP: server-mode skeleton exposing 3 capabilities",
+      "prompt": "Add packages/forge-integrations/src/mcp/ with: server.ts — JSON-RPC over stdio exposing task.get_current_state, belief.get_top_hypotheses, verification.plan_next_action (stubs that read from state store + belief + verification modules). client.ts — minimal MCP client that lists tools from a server and calls them. Wire both into cli.ts: forge mcp serve (launches server) and forge mcp list (queries a server). Tests at tests/mcp.test.ts: round-trip a tool call. 20-minute budget. Report commit hash. EXIT CODE DISCIPLINE: pnpm -r build > /tmp/build.log 2>&1; echo $?.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Open packages/forge-integrations/src/mcp/server.ts — confirm JSON-RPC framing exists. Open tests/mcp.test.ts — confirm round-trip works (request → response). Independently verify: pnpm -r build > /tmp/build.log 2>&1; echo $? — must be 0. Run: node packages/forge-cli/dist/cli.js mcp --help — must list serve and list subcommands.",
+      "timeout_ms": 1200000
+    },
+    {
+      "task_id": "t70b-providers-and-plugin-stub",
+      "title": "Provider catalog + plugin registry stubs (no subagent runner yet)",
+      "prompt": "Add packages/forge-provider/src/catalog.ts: registry of supported providers with capability metadata (tools, vision, context_window, cost_tier). Wire providers CLI command: forge providers list + forge providers test <name>. Add packages/forge-integrations/src/plugins/registry.ts: typed plugin manifest with version + capabilities + permissions + lifecycle hooks. Skip the skill registry, skip subagent runners — those are follow-ups. Tests at tests/provider-catalog.test.ts and tests/plugin-registry.test.ts. 20-minute budget. Report commit hash. EXIT CODE DISCIPLINE: pnpm -r build > /tmp/build.log 2>&1; echo $?.",
+      "assigned_to": "general",
+      "verified_by": "verifier",
+      "verify_prompt": "Open packages/forge-provider/src/catalog.ts — confirm at least 3 providers listed (anthropic, openai, ollama at minimum). Open packages/forge-integrations/src/plugins/registry.ts — confirm manifest type includes permissions. Independently verify: pnpm -r build > /tmp/build.log 2>&1; echo $? — must be 0. Run: node packages/forge-cli/dist/cli.js providers list — must list at least the existing forge-provider entries.",
+      "timeout_ms": 1200000
+    }
+  ],
+  "plan_complete": false,
+  "message_to_user": "Substrate is done and verified. Last three tracks (TUI/CLI, PR+eval, MCP/plugins) were too big for one worker in 30 min — splitting each in two with tighter scope and 20-min budgets."
+}

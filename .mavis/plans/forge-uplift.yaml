@@ -1,0 +1,817 @@
+version: 1
+plan:
+  name: 'Forge full product uplift — belief graph + state-store + verification + agent loop'
+  max_concurrency: 3
+  max_consecutive_failures: 2
+  max_cycles: 12
+  auto_reject_retries: 1
+  verifier_config:
+    default_verifiers: [verifier]
+    audit_sample_rate: 0.0
+
+# ───────────────────────────────────────────────────────────────────────
+# GROUND RULES — every task in this plan MUST follow these:
+# 1. Workspace: /Users/coenhewes/Documents/Forge-code/Forge-coding
+# 2. Postgres: local instance managed by task t00-foundation. Tasks that
+#    need DB access read FORGE_DATABASE_URL from .env (foundation sets it).
+# 3. Reference repos:
+#      /Users/coenhewes/Documents/Forge-code/_refs/opencode      (MIT, USE for code shape)
+#      /Users/coenhewes/Documents/Forge-code/_refs/claude-code  (UNLICENSED, REFERENCE ONLY — no source reuse, no file copy)
+#    When porting ideas from opencode, keep MIT attribution headers in
+#    derived files: "// Derived from opencode (MIT): <file> — <year>"
+# 4. TypeScript strict, ESM, no `any`. Use `unknown` + narrowing.
+# 5. No new file-system mutation surface exposed to the model. All
+#    model-facing writes go through @forge/context-server capabilities.
+# 6. Tests live in:
+#      tests/<package>.test.ts (integration across packages)
+#      packages/<pkg>/src/__tests__/*.test.ts (unit, colocated)
+#    Run `pnpm -r build && pnpm test` as the baseline gate.
+# 7. Do NOT delete existing .forge file-based state. It's the migration
+#    source. Add new code that can read from it.
+# 8. New .forge paths are allowed for large exact artifacts (.forge/artifacts/*).
+# ───────────────────────────────────────────────────────────────────────
+
+tasks:
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 0 — Foundation (sequential, blocks everything else)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t00-foundation
+    title: 'foundation: Postgres up, baseline build green, missing src/index.ts files, package wiring'
+    assigned_to: general
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Bootstrap Forge so every later task can land cleanly. Workspace is
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Deliverables (each must end in a passing `pnpm -r build && pnpm test` from
+      the repo root, plus this task's own smoke checks):
+
+      1. **Local Postgres** running on localhost:5432.
+         - Postgres 16 is installed at /opt/homebrew/opt/postgresql@16.
+         - initdb a data dir under /Users/coenhewes/Documents/Forge-code/Forge-coding/.local/pgdata
+           (use a non-default port to avoid colliding with any system pg, e.g. 54329).
+         - Start the server (pg_ctl), create role `forge` with password `forge`,
+           create database `forge`. Verify `pg_isready -p 54329` succeeds.
+         - Write .env at the repo root with FORGE_DATABASE_URL=postgres://forge:forge@localhost:54329/forge.
+         - Add .env to .gitignore if not already ignored.
+
+      2. **Baseline build green.**
+         - Run `pnpm install` then `pnpm -r build`. Fix every package that fails.
+         - The plan calls out an empty `packages/forge-context-server/src/`.
+           Read its package.json (it imports `@forge/state-store` and `@forge/types`)
+           and create `src/index.ts` that exports a single placeholder:
+             `export const CONTEXT_SERVER_VERSION = '0.0.1';`
+           Add a vitest test at `tests/context-server.test.ts` asserting the
+           export exists. Same minimum scaffold for `forge-integrations/src/index.ts`
+           (export a typed empty `IntegrationRegistry`) and `forge-vscode/src/index.ts`
+           (export a typed `ForgeVSCodeExtension` shell). Do NOT add VS Code wiring.
+
+      3. **Workspace package wiring.**
+         - Open `package.json` and `pnpm-workspace.yaml`. Confirm all 17 packages
+           in `packages/` are picked up. Add the missing devDeps to root
+           `package.json` so tests can import them: `@forge/agent`, `@forge/cli`,
+           `@forge/belief`, `@forge/verification-planner`, `@forge/tui`,
+           `@forge/trace`, `@forge/provider`, `@forge/harness`, `@forge/context-server`,
+           `@forge/state-store`, `@forge/integrations`, `@forge/vscode`.
+         - Add `postgres` and `pg` (whichever the existing `forge-state-store` schema
+           needs — check first; if neither is there, use `postgres` (porsager/postgres),
+           not the heavier `pg`, since we already use ESM and untyped drivers everywhere).
+           Add to root devDeps AND to `forge-state-store` package.json deps.
+
+      4. **Migration runner smoke test.**
+         - In `forge-state-store/src/store.ts`, add a `runMigrations()` method that
+           reads `MIGRATIONS` from `schema.ts`, applies any unapplied versions to the
+           schema_migrations table in a single transaction, returns applied versions.
+         - Add `tests/state-store-migrations.test.ts` that creates a temp Postgres
+           schema, runs migrations, asserts all 20+ tables from `schema.ts` exist.
+
+      5. **Reference-repo marker.**
+         - At the repo root create `docs/REFERENCE_REPOS.md` documenting the two
+           reference clones, the license of each, and the rule that opencode-derived
+           files must carry MIT attribution. Reference repos themselves stay outside
+           the workspace (under `_refs/`).
+
+      Stop conditions:
+        - `pnpm -r build` exits 0
+        - `pnpm test` passes (all existing tests + the new ones you added)
+        - `pg_isready -p 54329` reports accepting connections
+        - `FORGE_DATABASE_URL=... psql -c 'select 1'` exits 0
+        - Commit hash reported in deliverable.md
+
+      Do NOT touch the agent loop, belief graph internals, or any other package
+      beyond what's described above. That's other tracks' work.
+
+    verify_prompt: |
+      Independently verify each deliverable. Do NOT just re-read producer's
+      deliverable.md.
+
+      1. `cd /Users/coenhewes/Documents/Forge-code/Forge-coding && pnpm -r build`
+         — must exit 0. Capture full output.
+      2. `pnpm test` — must pass. Capture the count.
+      3. `pg_isready -p 54329` — must say "accepting connections".
+      4. `FORGE_DATABASE_URL=postgres://forge:forge@localhost:54329/forge psql -c '\dt'`
+         — must list every table declared in packages/forge-state-store/src/schema.ts.
+      5. Open packages/forge-context-server/src/index.ts and confirm it exports
+         a real symbol (not `export {}`). Same for forge-integrations and forge-vscode.
+      6. Read docs/REFERENCE_REPOS.md — confirm it documents the license rules.
+
+      FAIL with the exact missing piece if any step fails.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 1 — Durable state store + context-server (depends on t00)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t10-state-store-impl
+    title: 'state store: real Postgres read/write, artifact store, trace events in same txn'
+    assigned_to: general
+    depends_on: [t00-foundation]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Implement the durable Postgres-backed state store. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Required deliverables:
+
+      1. **Typed repositories** under `packages/forge-state-store/src/repos/`:
+         one file per logical group:
+         - `repos.ts`        — repos + repo_nodes + repo_edges CRUD
+         - `tasks.ts`        — tasks + task_snapshots
+         - `acceptance.ts`   — acceptance_criteria
+         - `beliefs.ts`      — beliefs + hypotheses (structure only — Track 2
+                               will wire belief-update logic; you just need
+                               CRUD + query-by-task)
+         - `evidence.ts`     — claims + evidence + claim_evidence_links
+         - `failures.ts`     — failures
+         - `decisions.ts`    — decisions
+         - `probes.ts`       — probes + patch_candidates
+         - `verification.ts` — verification_checks (+ verification_actions,
+                               verification_action_claim_links, verification_action_scores,
+                               verification_history — those tables are added in
+                               Track 3, so leave a stub returning [] for now)
+         - `commands.ts`     — commands + artifacts
+         - `trace.ts`        — trace_events
+         - `sessions.ts`     — sessions + prompts (used by Track 4)
+
+         Each repo gets a class with typed methods that take a postgres.js
+         `Sql` instance and return typed rows. Use the table column types from
+         schema.ts as source of truth. No raw SQL exposed to callers.
+
+      2. **ForgeStateStore facade** in `store.ts`:
+         - `init()` — connects to FORGE_DATABASE_URL, runs `runMigrations()`.
+         - `tx<T>(fn: (tx) => Promise<T>): Promise<T>` — wraps a postgres.js
+           transaction. Important: this is the unit at which trace events must be
+           written. Add a `tx.trace(event)` helper that inserts into trace_events
+           within the same txn; if the txn rolls back, the trace event rolls back too.
+         - Repositories are accessed via `store.repos.tasks`, `store.repos.beliefs`, etc.
+         - `health()` — returns StateStoreHealth (version, connection count, table counts).
+         - `backup(path)`, `restore(path)`, `export(path)` (pg_dump), `import(path)`.
+         - `orphanArtifacts()` — find artifacts in .forge/artifacts with no metadata row.
+
+      3. **Artifact store** in `artifact-store.ts` (already exists at 53 lines).
+         Wire it to Postgres: write artifact bytes to
+         `.forge/artifacts/<taskId>/<artifactId>` (path resolved from
+         stateDir default `~/.forge/state`), insert metadata row in `artifacts`
+         table with sha256, size, mime, content_hash. `getArtifact(id)` returns
+         `{ metadata, bytes }`. Add `pruneOrphans(dryRun=true)` using
+         `store.orphanArtifacts()`.
+
+      4. **Trace integration** — every important state write must emit a trace
+         event in the SAME transaction as the write. Example pattern:
+         ```ts
+         await store.tx(async (tx) => {
+           await tx.repos.tasks.update(taskId, { status: 'verifying' });
+           await tx.trace({ type: 'task_status_changed', taskId, payload: { status: 'verifying' } });
+         });
+         ```
+         Add an explicit note in store.ts docs: "state changes are durable; trace
+         events are co-transactional."
+
+      5. **Tests** at `tests/state-store-real.test.ts`:
+         - Open Postgres (use FORGE_DATABASE_URL or a per-test schema), init store,
+           create task → snapshot → acceptance criteria → repo node → belief → claim → evidence → failure → decision → verification check → command → artifact → trace.
+           All in one txn. Assert rollback semantics: deliberately throw mid-txn,
+           assert no rows committed AND no trace events committed.
+         - Add `tests/artifact-store.test.ts` — write 1MB blob, read back, hash
+           matches, prune test.
+
+      6. **Compatibility shim** — keep the existing file-based engines in
+         `@forge/state` working. Add a method `importFromFileState(stateDir)` on
+         ForgeStateStore that reads `.forge/tasks/<taskId>/*.json` and inserts
+         into Postgres. This is the migration path called out in the plan
+         ("keep existing `.forge` readers as migration/import compatibility only").
+
+      Reference docs to read first:
+        - /Users/coenhewes/Documents/Forge-code/_refs/opencode/packages/opencode/src/session/
+          (architecture only — don't copy)
+        - feature_requests/featurerequest2.md (postgres schema sketch)
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      Re-derive, do not just read the diff.
+
+      1. `pnpm -r build && pnpm test` from repo root — green.
+      2. Open tests/state-store-real.test.ts — does it actually exercise
+         the txn-rollback-trace-co-commit guarantee? Run it in isolation.
+         Confirm by inserting an intentional throw into the producer's
+         happy-path test temporarily and verifying the rollback fires; revert.
+      3. Open Postgres with FORGE_DATABASE_URL and run:
+           `select count(*) from trace_events;` after running a small ad-hoc
+         driver script that calls store.tx with a successful write and a
+         failed write. Counts must match exactly.
+      4. Open packages/forge-state-store/src/store.ts — is `tx<T>` actually
+         wrapping postgres.js's `sql.begin()` or similar? Or is it a fake
+         that just calls the methods sequentially? FAIL if fake.
+      5. Confirm the artifact store actually persists bytes to disk AND
+         records metadata in Postgres; check both with an ad-hoc test.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 2 — Active repo belief graph (depends on t10)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t20-belief-graph
+    title: 'belief graph: task/repo belief state, probes, truth maintenance, diagnostic updates'
+    assigned_to: general
+    depends_on: [t10-state-store-impl]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Promote the @forge/belief package from prototype to control system backed by
+      the Postgres state store. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      The existing stubs are at:
+        packages/forge-belief/src/graph.ts       (280 lines — TaskBeliefState, Hypothesis)
+        packages/forge-belief/src/probes.ts      (92 lines — ProbePlanner)
+        packages/forge-belief/src/diagnostics.ts (39 lines — DiagnosticEngine)
+
+      Read them first. Don't throw them away — extend them.
+
+      Required deliverables:
+
+      1. **Persistence layer** — wrap belief state in the state store.
+         Add `BeliefStore` class in `packages/forge-belief/src/store.ts` that
+         takes `ForgeStateStore` and exposes typed methods:
+         - `createTaskBeliefState(taskId, input): Promise<TaskBeliefState>`
+         - `loadTaskBeliefState(taskId): Promise<TaskBeliefState | null>`
+         - `addHypothesis(taskId, hyp): Promise<Hypothesis>`
+         - `updateHypothesis(taskId, hypId, patch): Promise<Hypothesis>`
+         - `invalidateHypothesis(taskId, hypId, reason, contradictingEvidenceIds)`
+         - `addClaim(taskId, claim): Promise<Claim>`
+         - `attachEvidence(taskId, claimId, evidenceId, polarity: 'supports' | 'contradicts'): Promise<void>`
+         - `updateClaimConfidence(taskId, claimId, confidence, status): Promise<Claim>`
+         - `addContradiction(taskId, claimId, evidenceId, note): Promise<void>`
+         - `addProbe(taskId, probe): Promise<ProbeRecommendation>`
+         - `recordProbeResult(taskId, probeId, outcome: 'supports' | 'contradicts' | 'inconclusive', notes)`
+
+         All methods MUST go through `stateStore.tx(...)` so the belief state
+         and the trace_events row land together.
+
+      2. **Probe planner** — extend the existing probes.ts:
+         - Score candidates by: claim importance, confidence gap (1 - current_confidence),
+           hypothesis discrimination potential, evidence quality, runtime cost,
+           risk of side effects, and flakiness.
+         - Return ordered recommendations with the scoring breakdown exposed
+           (don't hide the math).
+         - Filter out probes that have already been run for the same claim AND
+           returned inconclusive (use the state store to check).
+         - "Next best probe" = highest-scored candidate that is not blocked.
+
+      3. **Truth maintenance** — add `packages/forge-belief/src/truth.ts`:
+         - `runTruthMaintenance(taskId)` — for every claim, recompute confidence
+           from current evidence: starts at prior, then for each `supports` adds
+           evidence.weight * (1 - prior), for each `contradicts` subtracts
+           evidence.weight * prior, clamped to [0,1].
+         - Detect contradictions: if a claim has both supporting and contradicting
+           evidence, mark it `status: 'conflicted'`.
+         - Detect stale: if a claim has no evidence for >24h OR evidence files
+           have been edited since attach, mark `status: 'stale'`.
+         - Emit trace events for every status change.
+
+      4. **Diagnostic engine** — extend diagnostics.ts:
+         - `diagnose(taskId, failedCheck)` — given a failed verification check,
+           propose 1-3 candidate root-cause hypotheses based on: failed file paths
+           → repo_nodes → belief graph region. Use the existing graph's
+           `getRelatedGraphRegion` capability (in harness).
+         - Each hypothesis links to contradicting evidence (the failed check)
+           and at least one supporting alternative-cause candidate.
+
+      5. **Assurance case generator** — add `packages/forge-belief/src/assurance.ts`:
+         - `generateAssuranceCase(taskId)` — returns a `ClaimEvidenceGraph`
+           suitable for PR output: list of verified claims (with evidence refs),
+           unverified claims, disproven hypotheses, stale claims needing human review.
+         - Used by Track 6 PR generator.
+
+      6. **Tests** at `tests/belief-graph.test.ts`:
+         - Seed a task, add 3 hypotheses, attach mixed evidence, run truth
+           maintenance, assert confidence values.
+         - Force a contradiction, assert status='conflicted'.
+         - Force stale (mock time), assert status='stale'.
+         - Run probe planner, assert scores sum correctly and the top probe
+           is the highest-utility one.
+         - Diagnostic engine: feed it a failed check pointing to auth/middleware.ts,
+           assert it proposes route-guard vs role-mapping vs session-expiry
+           hypotheses.
+
+      Reference: feature_requests/featurerequest1.md (full spec).
+      Opencode ref: /Users/coenhewes/Documents/Forge-code/_refs/opencode/packages/opencode/src/session/
+      (study for session-event-driven belief update patterns; do not copy).
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      Adversarial re-derive. Do not re-read producer diff.
+
+      1. `pnpm -r build && pnpm test` green.
+      2. Open `packages/forge-belief/src/truth.ts` — hand-compute the expected
+         confidence for a fixture with 2 supporting (weight 0.4 each) and 1
+         contradicting (weight 0.5), prior 0.5. Run the actual function.
+         Compare.
+      3. Insert a deliberate duplicate hypothesis (same id) — does the store
+         reject it OR does truth maintenance corrupt state? Try and FAIL if
+         duplicate is silently accepted.
+      4. Run probe planner twice for the same task with the same input. Are
+         the recommendations identical? They should be — probe ordering must
+         be deterministic.
+      5. Confirm DiagnosticEngine's hypotheses are NOT all the same root cause.
+         If the engine returns 3 hypotheses that all say "frontend bug",
+         FAIL.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 3 — Active verification planner (depends on t10, parallel with t20)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t30-verification-planner
+    title: 'verification planner: candidate actions, evidence-value scorer, claim confidence, stale invalidation'
+    assigned_to: general
+    depends_on: [t10-state-store-impl]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Promote @forge/verification-planner from stub to active system. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Existing:
+        packages/forge-verification-planner/src/planner.ts (232 lines)
+        packages/forge-verification-planner/src/scorer.ts  (65 lines)
+
+      Required deliverables:
+
+      1. **Candidate action generation** — extend planner.ts:
+         - Inputs: acceptance criteria (from state store), changed files,
+           affected tests (from @forge/verification), risk areas, belief graph
+           open uncertainties, prior failed actions.
+         - Outputs: ordered list of `VerificationAction` candidates. Each
+           candidate has: type ('test' | 'command' | 'capability' | 'review' |
+           'visual' | 'security' | 'migration'), target, rationale,
+           expected evidence kind, claimIds addressed.
+         - For high-risk tasks (auth, permissions, billing, migrations,
+           security, privacy, data deletion, public APIs, multi-tenant,
+           secrets, deployment config), at least one candidate MUST be
+           a security/review action even if tests pass.
+
+      2. **Evidence-value scorer** — extend scorer.ts:
+         Score each candidate by:
+         - claim_importance × (1 - current_confidence)       — uncertainty reduction
+         - hypothesis_discrimination_potential                 — does it distinguish hypotheses?
+         - evidence_quality                                    — direct vs indirect
+         - risk                                                — higher risk ⇒ higher weight
+         - review_usefulness                                    — does PR benefit?
+         - runtime_ms, setup_ms                                — costs (penalty)
+         - flakiness_score                                     — penalty (from history)
+
+         Return `EvidenceValueScore` with breakdown. Determinism required
+         (same input ⇒ same output).
+
+      3. **Claim confidence updater** — add `packages/forge-verification-planner/src/confidence.ts`:
+         - `recordActionResult(taskId, actionId, result)` — takes a verification
+           action result (pass/fail/error, evidence id, command output summary),
+           updates linked claim confidence in the state store inside one txn,
+           emits trace event.
+         - Pass with strong evidence ⇒ confidence += (1 - confidence) * 0.5
+         - Pass with weak evidence ⇒ confidence += (1 - confidence) * 0.2
+         - Fail ⇒ confidence -= confidence * 0.6
+         - Multiple passes stabilize; failures don't reset to 0 (so failed
+           attempts don't get "punished" too hard).
+         - Update belief store's belief graph in the same txn.
+
+      4. **Stale-claim invalidation** — add `packages/forge-verification-planner/src/stale.ts`:
+         - `markStaleForChangedFiles(taskId, changedFiles)` — finds all claims
+           whose supporting evidence references any of the changed files
+           (directly or transitively through the repo graph) and marks them
+           `status: 'stale'` if they were previously `verified`.
+         - Returns the list of invalidated claims so they re-enter the plan
+           queue automatically.
+
+      5. **Completion gating** — add `packages/forge-verification-planner/src/gating.ts`:
+         - `canComplete(taskId)` — returns `{ ready: boolean, blockers: string[] }`.
+         - All high-risk claims MUST be verified OR marked human-review-required
+           before completion. Otherwise `ready: false, blockers: [high-risk
+           unverified claims]`.
+         - Any stale claim blocks completion until re-verified.
+         - Any contradiction blocks completion until resolved.
+
+      6. **Tests** at `tests/verification-planner.test.ts`:
+         - Plan candidates for a sample-saas task; assert security review
+           candidate is in top 3 for an auth-domain task.
+         - Record action result pass → confidence moves up; fail → confidence
+           moves down. Two passes do not sum linearly.
+         - markStaleForChangedFiles: claim verified earlier, then a file
+           it referenced is edited → status flips to stale.
+         - canComplete: high-risk unverified claim blocks; human-review
+           marked allows.
+
+      Reference: feature_requests/featurerequest3.md (full spec).
+      Reference sample fixture: packages/forge-eval/fixtures/sample-saas/
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      Re-derive, do not rubber-stamp.
+
+      1. `pnpm -r build && pnpm test` green.
+      2. Open scorer.ts — verify the scoring formula is actually implemented
+         (not stubbed). Hand-compute a score from a fixture and compare.
+      3. Create a fixture task with one auth-domain claim, no other claims.
+         Run planner. Assert a security review action is in the candidate
+         list. FAIL if it's missing.
+      4. Test the gate: write a script that creates a task with 1 high-risk
+         unverified claim and calls canComplete. Assert ready=false.
+         Then mark human-review-required. Assert ready=true.
+      5. Determinism: run planner twice on identical input, diff outputs.
+         Must be byte-identical.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 4 — Agent loop refactor (depends on t20 and t30)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t40-agent-loop
+    title: 'agent loop: belief-guided stages, tool-output bounding, permission rules, resumable session'
+    assigned_to: general
+    depends_on: [t20-belief-graph, t30-verification-planner]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Refactor packages/forge-agent/src/agent-loop.ts to be belief-guided and
+      resumable. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Current agent loop reads at packages/forge-agent/src/agent-loop.ts (729 lines).
+      It already has: state, capability fabric, expansion, finalize. It is
+      missing: belief integration, active verification planning, tool-output
+      bounding, permission rules, resumability across crashes, durable session
+      lifecycle.
+
+      Required deliverables:
+
+      1. **Belief-guided stage machine** — replace the inner loop with explicit
+         stages driven by belief + verification state:
+         - LOCALIZE: read TaskBeliefState, identify open uncertainties.
+         - PROBE:    if any high-uncertainty claim or hypothesis without
+                     discriminating evidence exists, request ProbePlanner's top
+                     probe as a tool call. Iterate up to N probes per loop pass.
+         - EDIT:     once top hypothesis has confidence > threshold, allow
+                     write/edit tools.
+         - VERIFY:   after each edit, run VerificationPlanner's top action,
+                     mark stale claims, update confidence.
+         - REPAIR:   if verify fails, run DiagnosticEngine on the failed check
+                     to propose a new hypothesis, mark the old one invalid in
+                     the belief store, continue from PROBE.
+         - FINALIZE: only when VerificationPlanner.canComplete() returns ready
+                     (or human-review-required explicitly set).
+
+         Stage transitions emit trace events.
+
+      2. **Resumable session runner** — the loop must survive:
+         - Process crash mid-tool-call: persist toolCallId + startedAt before
+           invoking the tool; on startup, query `commands` table for
+           `status='running'` rows older than threshold and mark them 'interrupted'
+           with the partial output captured.
+         - Context compaction: when working messages exceed budget, replace
+           middle section with a structured summary that references the
+           belief-store ids of the dropped facts (so retrieval is exact).
+         - Inbox-style prompt resumption: when resuming a session, re-admit
+           the prior prompt into the context with a 'resumed' marker.
+
+      3. **Tool-output bounding** — every tool result has a default
+         character budget (e.g. 4000 chars in model history; full bytes
+         persisted to .forge/artifacts). Add `compactToolResult(content,
+         artifactRef, budget)` helper. Wire it into ToolExecutor.
+
+      4. **Permission rules** — extend ToolExecutor with a `PermissionEngine`
+         that takes a `PermissionRule[]` (allow/deny/ask patterns matched
+         against tool name + arguments). Default rules:
+         - allow read_file anywhere
+         - allow write_file in active domain's allowed_writes
+         - ask run_command if command matches `git push`, `rm -rf`, `sudo`,
+           or other destructive patterns
+         - deny anything outside active domains' allowed_writes
+         Read-only mode (plan/review) denies all write tools.
+
+      5. **State-store integration** — replace the file-based engines'
+         stateDir reads with stateStore calls. Keep the existing file-based
+         engines as a `LegacyFileStateAdapter` that the stateStore can
+         import from on first init (per t10's compat shim). Default mode
+         uses Postgres.
+
+      6. **Public API stays stable** — keep AgentLoop.run(task) returning
+         AgentResult. Add AgentLoop.resume(taskId) as the new entry point
+         for crashed sessions.
+
+      7. **Tests** at `tests/agent-loop.test.ts`:
+         - Fake provider returning scripted responses. Drive a full
+           LOCALIZE → PROBE → EDIT → VERIFY → REPAIR → VERIFY → FINALIZE
+           sequence. Assert trace events fire at each stage transition.
+         - Permission denial: write_file outside allowed_writes is rejected
+           before the model sees the result.
+         - Crash recovery: simulate a tool call returning 'interrupted' status
+           and confirm the next loop iteration marks it and continues.
+         - Tool-output bound: a 100KB tool result appears in model history
+           truncated to budget, full bytes persisted to .forge/artifacts.
+
+      Reference: packages/forge-agent/src/agent-loop.ts (existing), opencode
+      session patterns in /Users/coenhewes/Documents/Forge-code/_refs/opencode/packages/opencode/src/session/
+      (study only, do not copy).
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - Existing tests in tests/state.test.ts still pass (your refactor
+          must not regress the file-state path)
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      Adversarial re-derive.
+
+      1. `pnpm -r build && pnpm test` green. ALL existing tests, not just
+         the new ones.
+      2. Open agent-loop.ts — does the stage machine exist as named stages,
+         or is it just a sequence of method calls with comments? Trace
+         events must be emitted at each transition.
+      3. Permission check: write a test that attempts write_file outside
+         the active domain's allowed_writes. The model must NOT see a
+         successful tool result — it must see an error. Verify by
+         inspecting the tool_message sent back to the provider.
+      4. Resume: kill the loop mid-tool-call (throw from inside a fake
+         tool). Restart. Confirm the in-flight toolCallId is recovered.
+      5. Tool output bound: assert that a 100KB tool result's bytes on disk
+         match the input, and the in-model version is truncated to budget.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 5 — TUI + CLI (depends on t40)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t50-tui-cli
+    title: 'TUI panels + CLI commands — belief board, verification plan, sessions, slash commands'
+    assigned_to: general
+    depends_on: [t40-agent-loop]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Add the missing TUI panels and CLI commands. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Required deliverables:
+
+      1. **New CLI commands** in `packages/forge-cli/src/commands/`:
+         - `init.ts`     — `forge init` — bootstrap .forge/ + .env + Postgres schema
+         - `run.ts`      — `forge run "<task>"` — run agent loop
+         - `resume.ts`   — `forge resume <taskId>` — resume interrupted session
+         - `sessions.ts` — `forge sessions` — list tasks with status + risk level
+         - `status.ts`   — `forge status [taskId]` — current task state summary
+         - `dashboard.ts`— `forge dashboard` — launch the TUI
+         - `belief.ts`   — `forge belief <taskId>` — print task belief state
+         - `verify.ts`   — `forge verify <taskId>` — run active verification plan
+         - `evidence.ts` — `forge evidence <taskId> [--claim <id>]` — print evidence ledger
+         - `checkpoint.ts` — `forge checkpoint <taskId>` — list patch candidates
+         - `pr.ts`       — `forge pr <taskId>` — generate PR markdown
+         - `doctor.ts`   — `forge doctor` — check Postgres, providers, repo map
+         - `mcp.ts`      — `forge mcp <add|list|serve>` — MCP stub (real impl in t60)
+         - `plugins.ts`  — `forge plugins <list|info>` — plugin stub
+         - `skills.ts`   — `forge skills <list|run>` — skill stub
+         - `config.ts`   — `forge config <get|set>` — forge config
+         - `providers.ts`— `forge providers <list|test>` — provider catalog
+
+         Wire them into `packages/forge-cli/src/cli.ts` as subcommands. Each
+         command supports `--json` for headless output (so CI/automation can
+         use them).
+
+      2. **TUI panels** in `packages/forge-tui/src/panels/`:
+         - `TaskPanel`           — current task status + interpretation
+         - `BeliefPanel`         — top hypotheses with confidence bars
+         - `ProbePanel`          — probe queue with rationale
+         - `ContradictionPanel`  — open contradictions + stale claims
+         - `VerificationPanel`   — verification plan + claim gaps
+         - `EvidencePanel`       — recent evidence ledger entries
+         - `FailurePanel`        — failed attempts + disproven hypotheses
+         - `DecisionPanel`       — recent decisions
+         - `TracePanel`          — recent trace events (timeline)
+         - `CheckpointPanel`     — patch candidates + promotion status
+         - `PrReadinessPanel`    — PR readiness checklist
+         - `CostPanel`           — token usage + runtime per stage
+
+         Each panel is a class with `render(width, height): string` and
+         `handleKey(key): void`. Keep the existing blessed dashboard
+         working as the layout host; panels slot into a left/right grid.
+
+      3. **Slash commands** in REPL (`packages/forge-tui/src/repl.ts`):
+         `/belief`, `/probes`, `/verify`, `/evidence`, `/failures`, `/trace`,
+         `/checkpoint`, `/pr`, `/doctor`, `/resume <taskId>`, `/sessions`,
+         `/mode <implement|repair|review|maintain|research>`, `/budget <n>`,
+         `/compact`.
+
+      4. **Tests** at `tests/cli.test.ts` and `tests/tui-panels.test.ts`:
+         - Each CLI command runs with --json and produces valid JSON.
+         - Each TUI panel renders without throwing given a fixed BeliefState fixture.
+
+      Reference: opencode TUI at
+      /Users/coenhewes/Documents/Forge-code/_refs/opencode/packages/opencode/src/cli/cmd/tui.tsx
+      and packages/tui/. MIT — study for layout, do not copy verbatim.
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - All 17 CLI commands reachable from `forge --help`
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      1. `pnpm -r build && pnpm test` green.
+      2. `node packages/forge-cli/dist/cli.js --help` lists every command
+         from the spec. FAIL if any is missing.
+      3. `node packages/forge-cli/dist/cli.js sessions --json` exits 0
+         with valid JSON.
+      4. Each TUI panel class has at least one unit test asserting render
+         doesn't throw.
+      5. Slash commands: spot-check 3 of them by reading repl.ts. The
+         dispatch table must include all 13 from the spec.
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 6 — PR generator rewrite + eval harness (depends on t40)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t60-pr-eval
+    title: 'PR rewrite from belief + verification state + eval harness extension'
+    assigned_to: general
+    depends_on: [t40-agent-loop]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Rewrite the PR generator to consume the belief/verification outputs and
+      extend the eval harness. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Required deliverables:
+
+      1. **New PR generator** in `packages/forge-pr/src/pr-generator.ts`:
+         The current generator takes (TaskState, AcceptanceContract, VerificationEntry[],
+         EvidenceEntry[], FailureEntry[], DecisionEntry[], Checkpoint[], PatchCandidate[])
+         and returns a summary. Replace with:
+
+         ```ts
+         generatePRSummary(input: PRGeneratorInput): Promise<PRGeneratorOutput>
+
+         interface PRGeneratorInput {
+           task: TaskState
+           contract: AcceptanceContract
+           verification: VerificationEntry[]
+           evidence: EvidenceEntry[]
+           failures: FailureEntry[]
+           decisions: DecisionEntry[]
+           checkpoints: Checkpoint[]
+           patches: PatchCandidate[]
+           belief: TaskBeliefState         // NEW
+           claimEvidenceGraph: ClaimEvidenceGraph  // NEW — from belief/assurance
+           activeVerification: ActiveVerificationPlan  // NEW — from planner
+           artifactRefs: ArtifactRef[]     // NEW — exact outputs to link
+           riskAssessment: TaskRiskAssessment  // NEW
+         }
+         ```
+
+         Output sections (in this order):
+         - Title (derived from task + first acceptance criterion)
+         - Summary (≤8 lines)
+         - Acceptance status (criteria + status + risk)
+         - Claim-Evidence Summary (verified / disproven / stale / human-review-required)
+         - Active Verification Summary (planned, completed, deferred)
+         - Failed Hypotheses and Recovery
+         - Decisions Ledger (key choices with rationale)
+         - Risk Review Guide
+         - Changed Domains (from belief)
+         - Human Review Required (checklist)
+         - Reviewer Guide (what to look at first)
+         - Exact Artifact References (links to .forge/artifacts/...)
+
+         The PR body markdown template goes in `packages/forge-pr/src/templates/`.
+
+      2. **Eval harness extension** in `packages/forge-eval/`:
+         - New fixtures: `team-invitations`, `auth-repair`, `migration-feature`,
+           `frontend-bug-with-screenshot`, `review-comment-response`, `ci-failure-repair`.
+           Start with `team-invitations` and `auth-repair` (high signal).
+         - `runner.ts` already exists; extend it to also run the active
+           verification planner + belief graph, not just the legacy
+           verification matrix.
+         - Add metrics: verified completion rate, files-edited-irrelevant,
+           repeated-failed-attempts, claim-evidence coverage, stale-claim
+           invalidations, recovery-from-failure, resume-success.
+         - Add baseline-comparison harness: for each fixture, run a "flat"
+           baseline (AgentLoop with belief=false, verification_planner=false)
+           and report deltas.
+
+      3. **End-to-end test** at `tests/e2e-team-invitations.test.ts`:
+         - Spin up sample-saas fixture, run `forge run "Add team invitations with roles, expiry, audit logs"`,
+           assert: branch created, files changed in correct domains, belief
+           state has top hypothesis with confidence > 0.7, verification plan
+           ran at least one security-review action, PR markdown contains all
+           11 sections.
+
+      Reference: feature_requests/featurerequest1.md §"Example final PR section".
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - E2E test passes
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      1. `pnpm -r build && pnpm test` green.
+      2. Open PR template markdown. Confirm all 11 sections are present.
+      3. Run e2e test. Must pass.
+      4. Confirm baseline-comparison harness actually produces a delta
+         table (run the flat baseline + full Forge on team-invitations
+         fixture and compare metrics).
+
+  # ════════════════════════════════════════════════════════════════════
+  # TRACK 7 — MCP + plugins + provider catalog + subagents (depends on t40)
+  # ════════════════════════════════════════════════════════════════════
+  - id: t70-extensibility
+    title: 'MCP client/server, plugin registry, provider catalog, subagent runners'
+    assigned_to: general
+    depends_on: [t40-agent-loop]
+    verified_by: verifier
+    timeout_ms: 1800000
+    prompt: |
+      Add the extensibility layer. Workspace
+      /Users/coenhewes/Documents/Forge-code/Forge-coding.
+
+      Required deliverables:
+
+      1. **MCP client/server** in `packages/forge-integrations/src/mcp/`:
+         - `client.ts` — connect to MCP servers, list tools/resources, call them
+         - `server.ts` — Forge acts as an MCP server exposing
+           `task.get_current_state`, `belief.get_top_hypotheses`,
+           `verification.plan_next_action`, `trace.get_recent_events`,
+           `pr.get_review_guidance`. JSON-RPC over stdio.
+         - Wire into CLI: `forge mcp serve` launches the server.
+         - Tests at `tests/mcp.test.ts`: round-trip a tool call.
+
+      2. **Plugin registry** in `packages/forge-integrations/src/plugins/`:
+         - `registry.ts` — load plugins from .forge/plugins/*.ts (dynamic import
+           of user-supplied code with explicit permissions declared in plugin
+           manifest).
+         - `manifest.ts` — typed plugin manifest with version, capabilities,
+           permissions, lifecycle hooks (onTaskStart, onEdit, onVerify, onPR).
+         - Tests at `tests/plugins.test.ts`: register a stub plugin,
+           confirm lifecycle hooks fire.
+
+      3. **Skill registry** in `packages/forge-integrations/src/skills/`:
+         - Mirror of plugin system but for skill workflows (declarative
+           multi-step procedures invoked by `/skill <name>`).
+         - `SkillRunner.execute(taskId, skillName, input): Promise<SkillResult>`.
+
+      4. **Provider catalog + policy** in `packages/forge-provider/`:
+         - `catalog.ts` — registry of supported providers with capability metadata
+           (tools, vision, context window, cost tier).
+         - `policy.ts` — rules that decide which provider/model a task uses
+           based on risk + complexity + user preference.
+         - Wire `providers.ts` CLI command to list/test.
+
+      5. **Subagent runners** in `packages/forge-agent/src/subagents/`:
+         - `research.ts` — subagent for repo research tasks
+         - `verify.ts` — subagent for additional verification runs
+         - `review.ts` — subagent for code review
+         - All share the same state store, so writes from one subagent are
+         visible to the orchestrator. Use the state store's
+         `tx` for race-safe writes (track subagent run id in commands table).
+
+      6. **Tests** at `tests/mcp.test.ts`, `tests/plugins.test.ts`,
+         `tests/subagents.test.ts`.
+
+      Reference: opencode MCP + plugin code under
+      /Users/coenhewes/Documents/Forge-code/_refs/opencode/packages/opencode/src/mcp/
+      and packages/plugin/. MIT — study for protocol shape; original code.
+
+      Stop conditions:
+        - `pnpm -r build && pnpm test` green
+        - All four sub-deliverables have tests
+        - Commit hash reported in deliverable.md
+
+    verify_prompt: |
+      1. `pnpm -r build && pnpm test` green.
+      2. Spin up `forge mcp serve` in background, send a JSON-RPC request
+         manually with curl, confirm a valid response.
+      3. Register a plugin with an onTaskStart hook. Confirm the hook
+         fires when `forge run` is called.
+      4. Provider catalog: confirm at least one provider entry lists
+         its capability metadata.
+      5. Subagent: spawn a verify subagent and confirm its writes appear
+         in the same Postgres tables the orchestrator reads from.

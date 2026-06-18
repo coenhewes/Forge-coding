@@ -120,19 +120,23 @@ it when adding a migration that the rest of the workspace must require
 to function. The `state-store` package checks this on `health()` and
 surfaces a warning if the running DB is behind.
 
-## Scaffold package conventions
+## Integration package conventions
 
-Three packages shipped as typed placeholders for later tracks to fill
-in. Each one exports a `*_VERSION` constant and a typed handle, with no
-real wiring:
+These packages expose stable public handles for downstream agents and
+tools:
 
-- `@forge/context-server` → `CONTEXT_SERVER_VERSION` + `ContextServerHandle`
-- `@forge/integrations` → `INTEGRATION_REGISTRY` (frozen, typed empty)
-- `@forge/vscode` → `FORGE_VSCODE_EXTENSION` (frozen, no `vscode` dep)
+- `@forge/context-server` is the model-facing durable state boundary.
+  It exposes typed read/write capabilities backed by `ForgeStateStore`
+  and emits co-transactional trace events for writes.
+- `@forge/integrations` contains the typed integration registry,
+  domain manifests, semantic router, probe fabric, MCP server/client,
+  and plugin registry.
+- `@forge/vscode` remains a lightweight extension shell with
+  `FORGE_VSCODE_EXTENSION` and no runtime `vscode` dependency.
 
 Tests live in `tests/{context-server,integrations,vscode}.test.ts` and
-assert the public surface. Future tracks can replace the bodies without
-touching the tests if they keep the exports stable.
+assert the public surface. Future tracks should keep those exports
+stable even as the package bodies grow.
 
 ## Reference repos
 
