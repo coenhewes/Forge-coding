@@ -1,4 +1,5 @@
 import type { ProviderConfig, SubagentConfig } from './provider.js'
+import type { LocalModelConfig } from './local-model.js'
 
 export interface ForgeConfig {
   provider: ProviderConfig
@@ -17,6 +18,8 @@ export interface ForgeConfig {
     trace: boolean
   }
   git: GitConfig
+  /** Optional local-model layer config (non-authoritative accelerator). */
+  localModel?: LocalModelConfig
 }
 
 /** How Forge integrates with git/GitHub when running a task. */
@@ -45,4 +48,5 @@ export interface ForgeConfigFile {
   logLevel?: ForgeConfig['logLevel']
   features?: Partial<ForgeConfig['features']>
   git?: Partial<GitConfig>
+  localModel?: LocalModelConfig
 }

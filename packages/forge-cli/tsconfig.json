@@ -13,6 +13,7 @@
     { "path": "../forge-agent" },
     { "path": "../forge-state" },
     { "path": "../forge-verification" },
+    { "path": "../forge-local-model" },
     { "path": "../forge-tui" }
   ]
 }

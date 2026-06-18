@@ -1,4 +1,4 @@
-import type { ProviderConfig, ModelProvider } from '@forge/types'
+import type { ProviderConfig, ModelProvider, EmbeddingProvider } from '@forge/types'
 
 import { OpenRouterProvider } from './openrouter.js'
 import { OllamaProvider } from './ollama.js'
@@ -54,6 +54,26 @@ export function resolveApiKey(config: ProviderConfig): string | undefined {
     if (value) return value
   }
   return undefined
+}
+
+/** Default Ollama embedding model when the caller does not specify one. */
+export const DEFAULT_OLLAMA_EMBED_MODEL = 'nomic-embed-text'
+
+/**
+ * Create an embedding provider for a config. Only providers that expose an
+ * embeddings endpoint are supported; today that is Ollama (local + cloud).
+ * Returns `null` for providers without embedding support so callers can
+ * degrade gracefully rather than crash.
+ */
+export function createEmbeddingProvider(config: ProviderConfig): EmbeddingProvider | null {
+  const resolved: ProviderConfig = { ...config, apiKey: resolveApiKey(config) }
+  switch (resolved.name) {
+    case 'ollama':
+    case 'ollama-cloud':
+      return new OllamaProvider(resolved)
+    default:
+      return null
+  }
 }
 
 export function createProvider(config: ProviderConfig): ModelProvider {

@@ -1,4 +1,4 @@
-export const REQUIRED_SCHEMA_VERSION = 3
+export const REQUIRED_SCHEMA_VERSION = 4
 
 export interface Migration {
   version: number
@@ -472,6 +472,52 @@ create table if not exists prompts (
 
 create index if not exists idx_sessions_task_status on sessions(task_id, status);
 create index if not exists idx_prompts_session_time on prompts(session_id, created_at asc);
+`,
+  },
+  {
+    version: 4,
+    name: 'add_local_model_runs_and_embeddings',
+    sql: `
+-- Local-model layer: durable, auditable provenance for every delegated
+-- sub-task. input_artifact_id / output_artifact_id are the STABLE references
+-- through which the byte-exact input and the model output stay recoverable —
+-- so a compacted summary can always be traced back to the original. Local
+-- output is never authoritative; this table is provenance/observability only.
+create table if not exists local_model_runs (
+  id uuid primary key,
+  task_id uuid references tasks(id),
+  task_kind text not null,
+  model text not null,
+  provider text not null,
+  input_artifact_id uuid references artifacts(id),
+  output_artifact_id uuid references artifacts(id),
+  latency_ms integer,
+  input_tokens integer,
+  output_tokens integer,
+  confidence numeric,
+  fallback_used boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+-- Embeddings for semantic retrieval over repo-graph nodes and evidence.
+-- Stored as jsonb float[] to avoid a hard pgvector dependency; cosine is
+-- computed in-process. (pgvector is a later optimization.) content_hash lets
+-- callers skip re-embedding unchanged targets.
+create table if not exists embeddings (
+  id uuid primary key,
+  repo_id uuid not null references repos(id),
+  target_type text not null,
+  target_ref text not null,
+  model text not null,
+  dim integer not null,
+  vector jsonb not null,
+  content_hash text not null,
+  created_at timestamptz not null default now(),
+  unique (repo_id, target_type, target_ref, model)
+);
+
+create index if not exists idx_local_model_runs_task on local_model_runs(task_id, created_at desc);
+create index if not exists idx_embeddings_repo_target on embeddings(repo_id, target_type);
 `,
   },
 ]

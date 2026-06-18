@@ -182,37 +182,81 @@ export function mapMessages(messages: Message[]): Record<string, unknown>[] {
 }
 
 export function mapAnthropicMessages(messages: Message[]): Record<string, unknown>[] {
-  const result: Record<string, unknown>[] = []
+  // Anthropic-format endpoints (Anthropic + MiniMax) require: no inline
+  // `system` turns (system is a top-level param), strictly alternating
+  // user/assistant roles, and non-empty content. The agent loop can produce
+  // sequences that violate these (compaction injects a mid-stream system
+  // message; consecutive nudges create same-role runs), which yields HTTP 400.
+  // So we normalize to content-block arrays, then merge consecutive same-role
+  // turns and drop empties to guarantee a valid request.
+  type Block = Record<string, unknown>
+  const normalized: { role: 'user' | 'assistant'; content: Block[] }[] = []
+
   for (const m of messages) {
-    if (m.role === 'system') continue
+    if (m.role === 'system') {
+      // Inline system → a user note (system proper is passed separately).
+      if (m.content) normalized.push({ role: 'user', content: [{ type: 'text', text: m.content }] })
+      continue
+    }
     if (m.role === 'tool') {
-      result.push({
+      normalized.push({
         role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: m.toolCallId,
-            content: m.content,
-          },
-        ],
+        content: [{ type: 'tool_result', tool_use_id: m.toolCallId, content: m.content }],
       })
     } else if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-      const content: Record<string, unknown>[] = []
-      if (m.content) {
-        content.push({ type: 'text', text: m.content })
-      }
+      const content: Block[] = []
+      if (m.content) content.push({ type: 'text', text: m.content })
       for (const tc of m.toolCalls) {
-        content.push({
-          type: 'tool_use',
-          id: tc.id,
-          name: tc.name,
-          input: tc.input,
-        })
+        content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input })
       }
-      result.push({ role: 'assistant', content })
+      normalized.push({ role: 'assistant', content })
     } else {
-      result.push({ role: m.role, content: m.content })
+      const content: Block[] = m.content ? [{ type: 'text', text: m.content }] : []
+      normalized.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content })
     }
+  }
+
+  // Merge consecutive same-role turns (concatenate their blocks).
+  const merged: { role: 'user' | 'assistant'; content: Block[] }[] = []
+  for (const msg of normalized) {
+    const last = merged[merged.length - 1]
+    if (last && last.role === msg.role) last.content.push(...msg.content)
+    else merged.push({ role: msg.role, content: [...msg.content] })
+  }
+
+  // Remove orphan tool blocks. Anthropic requires every `tool_use` to be
+  // followed by a matching `tool_result` and rejects a `tool_result` with no
+  // preceding `tool_use` (HTTP 400). History compaction can drop one side of a
+  // pair (e.g. keep a tool_result whose tool_use was trimmed), so we keep only
+  // blocks whose partner id is present somewhere in the sequence.
+  const toolUseIds = new Set<string>()
+  const toolResultIds = new Set<string>()
+  for (const m of merged) {
+    for (const b of m.content) {
+      if (b.type === 'tool_use' && typeof b.id === 'string') toolUseIds.add(b.id)
+      if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') toolResultIds.add(b.tool_use_id)
+    }
+  }
+
+  const filtered = merged
+    .map((m) => ({
+      role: m.role,
+      content: m.content.filter((b) => {
+        if (b.type === 'text') return (b.text as string)?.length > 0
+        if (b.type === 'tool_use') return toolResultIds.has(b.id as string)
+        if (b.type === 'tool_result') return toolUseIds.has(b.tool_use_id as string)
+        return true
+      }),
+    }))
+    .filter((m) => m.content.length > 0)
+
+  // Re-merge: dropping an emptied turn can leave two same-role turns adjacent,
+  // which Anthropic also rejects.
+  const result: { role: 'user' | 'assistant'; content: Block[] }[] = []
+  for (const m of filtered) {
+    const last = result[result.length - 1]
+    if (last && last.role === m.role) last.content.push(...m.content)
+    else result.push(m)
   }
   return result
 }
@@ -238,6 +282,47 @@ export function mapAnthropicTools(tools?: ToolDefinition[]): Record<string, unkn
   }))
 }
 
+/**
+ * Parse tool-call argument JSON without ever throwing. Models frequently emit
+ * truncated argument strings when a response hits its token cap (the JSON ends
+ * mid-string). We try a strict parse, then a best-effort repair (close any open
+ * string and balance brackets), and finally give up by returning `undefined` so
+ * the caller can drop the malformed call rather than crash the whole run.
+ */
+export function safeParseToolInput(raw: string | undefined): Record<string, unknown> | undefined {
+  if (!raw || !raw.trim()) return {}
+  try {
+    return JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    // Best-effort repair of a truncated object: close an unterminated string,
+    // then append the missing closing brackets in reverse nesting order.
+    try {
+      let s = raw
+      const quotes = (s.match(/(?<!\\)"/g) ?? []).length
+      if (quotes % 2 === 1) s += '"'
+      const stack: string[] = []
+      let inStr = false
+      let esc = false
+      for (const ch of s) {
+        if (inStr) {
+          if (esc) esc = false
+          else if (ch === '\\') esc = true
+          else if (ch === '"') inStr = false
+          continue
+        }
+        if (ch === '"') inStr = true
+        else if (ch === '{') stack.push('}')
+        else if (ch === '[') stack.push(']')
+        else if (ch === '}' || ch === ']') stack.pop()
+      }
+      while (stack.length) s += stack.pop()
+      return JSON.parse(s) as Record<string, unknown>
+    } catch {
+      return undefined
+    }
+  }
+}
+
 export function parseToolCallsFromChunk(data: Record<string, unknown>): ToolCall[] | undefined {
   const choices = data.choices as Record<string, unknown>[] | undefined
   if (!choices || choices.length === 0) return undefined
@@ -253,7 +338,7 @@ export function parseToolCallsFromChunk(data: Record<string, unknown>): ToolCall
     return {
       id: tc.id as string,
       name: func?.name as string ?? '',
-      input: func?.arguments ? JSON.parse(func.arguments as string) : {},
+      input: safeParseToolInput(func?.arguments as string | undefined) ?? {},
     }
   })
 }

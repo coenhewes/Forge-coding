@@ -46,6 +46,9 @@ const EXPECTED_TABLES = [
   'human_approvals',
   'pr_state',
   'integration_events',
+  // migration v4 — local-model layer
+  'local_model_runs',
+  'embeddings',
 ]
 
 describe.skipIf(!HAS_DB)('@forge/state-store runMigrations', () => {

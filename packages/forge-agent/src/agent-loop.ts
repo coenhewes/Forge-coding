@@ -48,6 +48,9 @@ import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { TraceEventInput } from '@forge/state-store'
 import { createContextServer, type ForgeContextServer } from '@forge/context-server'
 
+import { LocalModelService, CompactionPolicy } from '@forge/local-model'
+import type { LocalModelConfig } from '@forge/types'
+
 import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
 import type { GitConfig, ProviderConfig } from '@forge/types'
 import { writeFile, mkdir } from 'node:fs/promises'
@@ -112,6 +115,22 @@ export interface AgentConfig {
   toolOutputBudget?: number
   /** When true, the agent loop will not actually invoke the LLM. */
   dryRun?: boolean
+  /**
+   * Long-horizon run budget. The loop runs until done, blocked, or the budget
+   * is exhausted (then it returns a resumable `paused` status). Lets a run go
+   * for hours instead of a hard iteration cap.
+   */
+  budget?: {
+    maxWallClockMs?: number
+    maxIterations?: number
+  }
+  /**
+   * Optional local-model layer config. When present (and not dryRun), the loop
+   * delegates context compaction of large tool outputs to a cheap local model,
+   * cutting frontier context pressure. The layer is non-authoritative and
+   * falls back to deterministic truncation when unavailable.
+   */
+  localModel?: LocalModelConfig
 }
 
 export interface AgentResult {
@@ -161,11 +180,15 @@ interface InternalState {
   stageTrace: Array<{ stage: StageName; iteration: number; reason: string }>
   /** Consecutive "no tool call" iterations (drives the stop heuristic). */
   consecutiveNoTool: number
+  /** Consecutive failed/truncated completions (drives error tolerance). */
+  consecutiveErrors: number
 }
 
 export class AgentLoop {
   private config: AgentConfig
   private provider: ModelProvider | null
+  /** Last provider error message (for corrective nudges after a failed call). */
+  private lastProviderError?: string
 
   private taskEngine: TaskStateEngine
   private acceptanceEngine: AcceptanceContractEngine
@@ -179,6 +202,9 @@ export class AgentLoop {
   private traceRecorder: TraceRecorder
   private evidenceMemory: EvidenceMemory
   private testSelector?: AffectedTestSelector
+  /** Non-authoritative local-model accelerator + compaction policy. */
+  private localModel?: LocalModelService
+  private compactionPolicy?: CompactionPolicy
 
   private repoMap?: import('@forge/types').RepoMap
   private repoGraph?: import('@forge/types').RepoGraph
@@ -246,6 +272,23 @@ export class AgentLoop {
     this.contextBuilder = new AgentContextBuilder()
     this.traceRecorder = new TraceRecorder({ stateDir })
     this.evidenceMemory = new EvidenceMemory({ stateDir })
+
+    // Local-model layer (opt-in). Exact inputs/outputs are persisted through
+    // EvidenceMemory (stable refs) and every call is traced. Non-authoritative
+    // by construction: results never touch belief/verification directly.
+    if (config.localModel && !config.dryRun) {
+      this.localModel = new LocalModelService(config.localModel, undefined, {
+        artifacts: this.evidenceMemory,
+        trace: {
+          record: (taskId, description, payload) =>
+            this.traceRecorder.record(taskId, 'local_model_invoked', description, { payload }).then(() => undefined),
+        },
+      })
+      this.compactionPolicy = new CompactionPolicy(this.localModel, {
+        thresholdChars: config.localModel.compactionThresholdChars,
+        targetTokens: config.localModel.summaryTargetTokens,
+      })
+    }
 
     this.git = config.git ?? {
       autoBranch: true,
@@ -342,6 +385,7 @@ export class AgentLoop {
     const rules = PermissionEngine.defaultRules({
       domains: this.domainManifests.filter((d) => this.activeDomains.includes(d.domain)),
       readOnly: isReadOnlyMode,
+      capabilityTools: Array.from(this.capabilityRegistry?.getAll().keys() ?? []),
     })
     this.permissionEngine = new PermissionEngine(rules)
     if (this.config.permissionRules) {
@@ -472,7 +516,10 @@ export class AgentLoop {
     taskId: string,
     options: { resumed: boolean },
   ): Promise<AgentResult> {
-    const maxIterations = this.config.maxIterations ?? 50
+    const maxIterations = this.config.budget?.maxIterations ?? this.config.maxIterations ?? 50
+    const maxWallClockMs = this.config.budget?.maxWallClockMs
+    const runStartedAt = Date.now()
+    let budgetExhausted = false
 
     // Phase 1: Initialize task state (idempotent for resume).
     const existing = await this.taskEngine.getTask(taskId)
@@ -568,6 +615,7 @@ export class AgentLoop {
       canComplete: false,
       stageTrace: [],
       consecutiveNoTool: 0,
+      consecutiveErrors: 0,
     }
 
     const fire = (event: Omit<AgentEvent, 'iteration'>) => {
@@ -579,6 +627,10 @@ export class AgentLoop {
     let lastDecisionReason = 'initial'
 
     while (internal.iteration < maxIterations) {
+      if (maxWallClockMs && Date.now() - runStartedAt >= maxWallClockMs) {
+        budgetExhausted = true
+        break
+      }
       internal.iteration++
 
       // Compact when the working log grows large; reference belief-store
@@ -625,6 +677,19 @@ export class AgentLoop {
         internal.passId += 1
         continue
       }
+    }
+
+    // If the loop ended without a terminal stage (iteration cap or wall-clock
+    // budget), the task is not done — mark it resumable rather than a vague
+    // 'exploring'. `forge resume` reconstructs from durable state and continues.
+    if (finalStatus === 'exploring') {
+      finalStatus = 'paused' as TaskStatus
+      finalSummary =
+        finalSummary ||
+        (budgetExhausted
+          ? `Paused at time budget after ${internal.iteration} iterations. Resume to continue.`
+          : `Paused at iteration budget (${maxIterations}). Resume to continue.`)
+      await this.taskEngine.updateStatus(taskId, 'paused' as TaskStatus).catch(() => undefined)
     }
 
     await this.traceRecorder.completeTask(taskId)
@@ -696,9 +761,13 @@ export class AgentLoop {
     await this.persistActiveVerificationPlan(verifyPlan)
     internal.topVerifyAction = verifyPlan.recommendedAction ?? null
 
+    // The completion gate also requires acceptance criteria to be verified,
+    // so an empty belief set can never read as "done" (see gating.ts).
+    const acc = await this.acceptanceEngine.getCompletionStatus(internal.taskId)
     const completion = evaluateCompletion({
       claims: (internal.belief?.claims ?? []) as Claim[],
       actions: verifyPlan.candidateActions,
+      acceptance: { total: acc.total, verified: acc.verified },
     })
     internal.canComplete = completion.ready
   }
@@ -833,7 +902,7 @@ export class AgentLoop {
       capabilityNames: _capabilityTools.map((t) => t.name),
       riskAssessment: this.taskRisk,
     })
-    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools)
+    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools, internal.taskId)
     if (completion.content) fire({ type: 'thinking', message: completion.content.slice(0, 500) })
     // If the model chose to call a tool (e.g. read_file) we still respect
     // that and let the result flow into the working log.
@@ -911,7 +980,7 @@ export class AgentLoop {
       capabilityNames: _capabilityTools.map((t) => t.name),
       riskAssessment: this.taskRisk,
     })
-    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools)
+    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools, internal.taskId)
     return this.handleCompletion(internal, tools, contract, boundedContext, _capabilityTools, fire, completion)
   }
 
@@ -1069,17 +1138,71 @@ export class AgentLoop {
       fire({ type: 'thinking', message: completion.content.slice(0, 2000) })
     }
 
-    if (!completion.toolCalls || completion.toolCalls.length === 0) {
-      internal.messages.push({ role: 'assistant', content: completion.content || '' })
-      internal.consecutiveNoTool += 1
-      if (internal.consecutiveNoTool >= 2) {
-        return { terminal: true, terminalStatus: 'completed', summary: completion.content || 'Task completed.' }
+    // Provider error (after retries): never crash — nudge and retry, with a
+    // bounded tolerance so a persistently-broken provider eventually blocks.
+    if (completion.finishReason === 'error') {
+      internal.consecutiveErrors += 1
+      const detail = this.lastProviderError ? ` (${this.lastProviderError})` : ''
+      fire({ type: 'error', message: `Model call failed${detail}; retrying` })
+      if (internal.consecutiveErrors >= 5) {
+        return { terminal: true, terminalStatus: 'blocked', summary: `Repeated model-call failures${detail}. Resume to retry.` }
+      }
+      // A repeated failure is often a too-large request (context overflow →
+      // some providers return an opaque 400). Compact the working history to
+      // shrink the next request before retrying.
+      if (internal.consecutiveErrors >= 2) {
+        internal.messages = await this.compactMessages(internal.messages, internal.taskId, true)
       }
       internal.messages.push({
         role: 'user',
         content:
-          'You did not call any tool. If the task is complete and verified, call finish_task. ' +
-          'Otherwise continue working: use the available tools to explore, edit, and verify.',
+          `The previous model call failed${detail}. This often means the response was too large and was cut off. ` +
+          `Continue, and when writing files keep each tool call small (one file at a time, split very large files).`,
+      })
+      return {}
+    }
+    internal.consecutiveErrors = 0
+
+    // A truncated response with no usable tool call (hit the token cap mid
+    // tool-argument): ask the model to produce smaller output rather than spin.
+    if (completion.finishReason === 'length' && (!completion.toolCalls || completion.toolCalls.length === 0)) {
+      internal.messages.push({ role: 'assistant', content: completion.content || '' })
+      internal.messages.push({
+        role: 'user',
+        content:
+          'Your last response was cut off at the token limit before completing a tool call. ' +
+          'Write smaller outputs: create files one at a time and split large file contents into multiple edits.',
+      })
+      return {}
+    }
+
+    if (!completion.toolCalls || completion.toolCalls.length === 0) {
+      internal.messages.push({ role: 'assistant', content: completion.content || '' })
+      internal.consecutiveNoTool += 1
+
+      // Only treat "model went quiet" as completion if the gate actually
+      // passes (acceptance criteria verified). Otherwise the model stopped
+      // before finishing the work — keep nudging, then fail honestly rather
+      // than reporting a false "completed".
+      if (internal.canComplete) {
+        return { terminal: true, terminalStatus: 'completed', summary: completion.content || 'Task completed.' }
+      }
+      if (internal.consecutiveNoTool >= 4) {
+        return {
+          terminal: true,
+          terminalStatus: 'blocked',
+          summary:
+            'Model stopped calling tools before acceptance criteria were verified. ' +
+            'The task is not complete; resume to continue.',
+        }
+      }
+      internal.messages.push({
+        role: 'user',
+        content:
+          'You did not call any tool, and the acceptance criteria are NOT yet verified, so the task is not done. ' +
+          'Do not stop. Use the tools to make progress: read the relevant files, edit_file to implement the change, ' +
+          'run_tests to check it, update_acceptance to mark each criterion verified once its evidence passes, ' +
+          'and only then call finish_task.',
       })
       return {}
     }
@@ -1309,29 +1432,120 @@ export class AgentLoop {
     void fire
   }
 
+  /** How many of the most recent raw turns to replay alongside the situation report. */
+  private static readonly RECENT_WINDOW = 14
+
+  /**
+   * State-backed context (AGENTS.md: "never rely purely on a long chat
+   * transcript"). Each turn the model sees: the original task, a SITUATION
+   * REPORT regenerated from durable state (criteria + check status, open
+   * subtasks, recent evidence refs, failures-not-to-repeat, files touched),
+   * and only the last N raw turns. This bounds context regardless of run
+   * length and makes runs resumable — the durable state is the memory.
+   */
+  private async buildSituationReport(taskId: string): Promise<Message | null> {
+    try {
+      const task = await this.taskEngine.getTask(taskId)
+      if (!task) return null
+      const lines: string[] = ['[SITUATION REPORT — regenerated from durable state each turn]']
+      lines.push(`Goal: ${task.currentInterpretation || task.originalRequest}`)
+      lines.push(`Status: ${task.status} | Next: ${task.nextAction || '(decide)'}`)
+
+      const contract = await this.acceptanceEngine.getContract(taskId).catch(() => undefined)
+      if (contract && contract.criteria.length > 0) {
+        const verified = contract.criteria.filter((c) => c.status === 'verified').length
+        lines.push('', `Acceptance criteria (${verified}/${contract.criteria.length} verified):`)
+        for (const c of contract.criteria) {
+          const icon = c.status === 'verified' ? '✓' : c.status === 'failed' ? '✗' : '○'
+          const checks = c.requiredChecks?.length ? ` [checks: ${c.requiredChecks.join(',')}]` : ''
+          lines.push(`  ${icon} [${c.id}] ${c.description}${checks}`)
+        }
+      }
+
+      const checks = await this.verificationEngine.getEntries(taskId).catch(() => [])
+      if (checks.length > 0) {
+        lines.push('', `Verification checks: ${checks.map((e) => `${e.check}=${e.status}`).join(' ')}`)
+      }
+
+      const openSubtasks = (task.subtasks ?? []).filter((s) => s.status !== 'completed')
+      if (openSubtasks.length > 0) {
+        lines.push('', 'Open subtasks:')
+        for (const s of openSubtasks.slice(0, 12)) lines.push(`  ☐ ${s.description ?? s.id}`)
+      }
+
+      const recentEvidence = await this.evidenceMemory.queryByTask(taskId, 6).catch(() => [])
+      if (recentEvidence.length > 0) {
+        lines.push('', 'Recent evidence (recoverable by id):')
+        for (const a of recentEvidence) lines.push(`  ${a.id} (${a.kind}) ${a.description.slice(0, 80)}`)
+      }
+
+      const failures = await this.failureEngine.getEntries(taskId).catch(() => [])
+      if (failures.length > 0) {
+        lines.push('', 'Failures so far (do NOT repeat these approaches):')
+        for (const f of failures.slice(-3)) {
+          const desc = (f as { summary?: string; description?: string }).summary
+            ?? (f as { description?: string }).description ?? JSON.stringify(f).slice(0, 100)
+          lines.push(`  ⚠ ${String(desc).slice(0, 120)}`)
+        }
+      }
+
+      if (task.filesTouched.length > 0) {
+        lines.push('', `Files touched: ${task.filesTouched.slice(0, 20).join(', ')}`)
+      }
+      lines.push('', 'Continue from here: take the next concrete action toward verifying all criteria.')
+      return { role: 'user', content: lines.join('\n') }
+    } catch {
+      return null
+    }
+  }
+
   private async runCompletion(
     system: string,
     baseMessages: Message[],
     history: Message[],
     tools: ToolDefinition[],
+    taskId: string,
   ): Promise<CompletionResult> {
     if (!this.provider) {
       // dryRun — synthesize a no-tool completion so the loop can advance.
       return { content: 'dry-run: no provider configured', finishReason: 'stop' }
     }
-    const streamChunks: CompletionChunk[] = []
-    for await (const chunk of this.provider.complete({
-      model: this.config.provider.model,
-      system,
-      messages: [...baseMessages, ...history],
-      tools,
-      toolChoice: 'auto',
-      maxTokens: this.config.provider.maxTokens ?? 4096,
-      temperature: this.config.provider.temperature ?? 0.2,
-    })) {
-      streamChunks.push(chunk)
+    // State-backed context: original task + fresh situation report + a bounded
+    // window of recent turns (not the whole transcript). Orphan tool blocks
+    // from the window cut are scrubbed by the provider message mapper.
+    const situation = await this.buildSituationReport(taskId)
+    const recentWindow = history.slice(-AgentLoop.RECENT_WINDOW)
+    const assembled: Message[] = situation
+      ? [...baseMessages, situation, ...recentWindow]
+      : [...baseMessages, ...recentWindow]
+    // A single failed completion (network blip, provider 4xx/5xx, truncated
+    // tool JSON) must never crash a long-horizon run. Retry once, then degrade
+    // to a 'error' finishReason that the loop turns into a corrective nudge.
+    const maxAttempts = 2
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const streamChunks: CompletionChunk[] = []
+        for await (const chunk of this.provider.complete({
+          model: this.config.provider.model,
+          system,
+          messages: assembled,
+          tools,
+          toolChoice: 'auto',
+          maxTokens: this.config.provider.maxTokens ?? 8192,
+          temperature: this.config.provider.temperature ?? 0.2,
+        })) {
+          streamChunks.push(chunk)
+        }
+        return this.mergeStreamResult(streamChunks)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.lastProviderError = msg
+        if (attempt >= maxAttempts) {
+          return { content: '', finishReason: 'error' }
+        }
+      }
     }
-    return this.mergeStreamResult(streamChunks)
+    return { content: '', finishReason: 'error' }
   }
 
   /**
@@ -1432,8 +1646,9 @@ export class AgentLoop {
     ]
   }
 
-  private async compactMessages(messages: Message[], taskId: string): Promise<Message[]> {
-    if (messages.length <= 30) return messages
+  private async compactMessages(messages: Message[], taskId: string, force = false): Promise<Message[]> {
+    if (!force && messages.length <= 30) return messages
+    if (messages.length <= 12) return messages
     const keepStart = 2
     const keepEnd = 10
     const start = messages.slice(0, keepStart)
@@ -1455,7 +1670,29 @@ export class AgentLoop {
       `[Compacted ${middle.length} messages from previous iterations]`,
       `Belief-store references preserved (exact retrieval available): ${[...referenced].slice(0, 20).join(', ') || 'none'}`,
     ]
-    void taskId
+
+    // When the local-model layer is available, replace the deterministic
+    // placeholder with a real semantic summary of the dropped tool outputs.
+    // The exact originals remain recoverable via the stored artifact id, so
+    // this only reduces working-context size — it never loses evidence.
+    if (this.localModel && (await this.localModel.available())) {
+      const droppedToolText = middle
+        .filter((m) => m.role === 'tool' && typeof m.content === 'string')
+        .map((m) => m.content)
+        .join('\n---\n')
+      if (droppedToolText.length > 0) {
+        const result = await this.localModel.summarize({
+          taskId,
+          content: droppedToolText,
+          label: `${middle.length} compacted iteration messages`,
+        })
+        summaryLines.push('', 'Summary of dropped tool output (non-authoritative):', result.summary)
+        if (result.sourceArtifactId) {
+          summaryLines.push(`Exact original: ${result.sourceArtifactId} (evidence.get_exact_artifact)`)
+        }
+      }
+    }
+
     return [
       ...start,
       { role: 'system', content: summaryLines.join('\n') },

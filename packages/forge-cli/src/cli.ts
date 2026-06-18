@@ -10,6 +10,7 @@ import {
   runCheckpoint,
   runDoctor,
   runProviders,
+  runLocal,
   parseArgs,
   emit,
 } from './commands/index.js'
@@ -38,6 +39,7 @@ const COMMANDS: Record<string, (parsed: import('./commands/output.js').ParsedArg
   checkpoint: runCheckpoint as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   doctor: runDoctor as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   providers: runProviders as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
+  local: runLocal as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
 }
 
 async function main() {
@@ -53,7 +55,9 @@ async function main() {
     case 'verify':
     case 'evidence':
     case 'checkpoint':
-    case 'doctor': {
+    case 'doctor':
+    case 'providers':
+    case 'local': {
       const parsed = parseArgs(rest)
       const handler = COMMANDS[command as string]
       if (!handler) {
@@ -112,6 +116,7 @@ Minimal commands (each supports --json / --text):
   forge checkpoint <taskId>       List patch candidates and checkpoints
   forge doctor                    Env + DB + provider reachability check
   forge providers <list|test>     List supported LLM providers, or probe one
+  forge local <status|test>       Inspect/exercise the local-model layer
 
 Advanced:
   forge resume <taskId> [answer]  Resume a paused/blocked task

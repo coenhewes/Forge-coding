@@ -229,8 +229,15 @@ describe('AgentLoop stage machine', () => {
     // The full sequence LOCALIZE → PROBE → EDIT → VERIFY → REPAIR →
     // VERIFY → FINALIZE is asserted on the pure stage machine in the
     // `nextStage` describe below. Here we just confirm the agent loop
-    // emitted at least one stage trace event.
-    expect(result.status).toMatch(/completed|failed|blocked/)
+    // emitted stage trace events and returned a valid status.
+    //
+    // NOTE: this loop runs in dryRun mode (no real model), so the model can
+    // never verify acceptance criteria. The completion gate therefore (and
+    // correctly) prevents a false "completed" — the run ends 'blocked' (model
+    // went quiet without finishing) or 'exploring' (iteration limit). It must
+    // NOT report 'completed'.
+    expect(['exploring', 'blocked', 'needs_review', 'failed']).toContain(result.status)
+    expect(result.status).not.toBe('completed')
   })
 
   it('denies write_file outside allowed_writes before the model sees the result', async () => {
@@ -587,10 +594,11 @@ describe('Stage machine nextStage()', () => {
     let s5 = nextStage(ctx)
     stages.push(s5.next)
 
-    // Expected: PROBE (low conf + high-uncertainty claim) → REPAIR
-    // (top hypothesis still low conf) → EDIT (now high conf) → REPAIR
-    // (verify failed) → FINALIZE (canComplete).
-    expect(stages).toEqual(['PROBE', 'REPAIR', 'EDIT', 'REPAIR', 'FINALIZE'])
+    // Expected: PROBE (low conf + high-uncertainty claim) → EDIT (probes
+    // exhausted, open claims remain → attempt implementation rather than spin
+    // in REPAIR) → EDIT (now high conf) → REPAIR (verify failed) → FINALIZE
+    // (canComplete).
+    expect(stages).toEqual(['PROBE', 'EDIT', 'EDIT', 'REPAIR', 'FINALIZE'])
   })
 })
 

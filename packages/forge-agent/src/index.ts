@@ -15,3 +15,6 @@ export type { CompactedToolResult, CompactOptions } from './tool-output.js'
 
 export { nextStage, topHypothesisFor, openClaimsFor, DEFAULT_EDIT_CONFIDENCE, DEFAULT_MAX_PROBES_PER_PASS } from './stages.js'
 export type { StageName, StageContext, StageDecision } from './stages.js'
+
+export { detectChecks, runVerification } from './verification-bar.js'
+export type { RunnableCheck, CheckResult } from './verification-bar.js'

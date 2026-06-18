@@ -102,10 +102,19 @@ export function nextStage(ctx: StageContext, options: {
     if (h.confidence >= editConfidence && h.status !== 'unknown') {
       return { next: 'EDIT', reason: `Top hypothesis ${h.id} confidence ${h.confidence.toFixed(2)} >= ${editConfidence}` }
     }
+    // Low-confidence hypothesis: fall through. We only reach here once probing
+    // is exhausted (the PROBE branch above didn't fire), so there is no way
+    // left to raise confidence by investigating — looping in REPAIR would spin
+    // forever. Attempt an implementation instead (see below).
   }
 
-  if (ctx.topHypothesis) {
-    return { next: 'REPAIR', reason: 'No hypothesis met the edit confidence threshold' }
+  // No confident/actionable hypothesis. A straightforward implement task may
+  // never form one (the work is "just do it", not "investigate"), and once
+  // probes are exhausted, attempting an EDIT is how the agent makes progress
+  // and generates real evidence. REPAIR is reserved for a failed verify
+  // (handled at the top) or a disproven hypothesis (handled above).
+  if (ctx.openClaims.length > 0) {
+    return { next: 'EDIT', reason: 'Open acceptance criteria remain and probes are exhausted — attempt implementation' }
   }
 
   return { next: 'REPAIR', reason: 'No viable hypothesis — request diagnostic' }
