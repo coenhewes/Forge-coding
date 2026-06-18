@@ -12,6 +12,8 @@ export type ArtifactKind =
   | 'tool_result'
   | 'graph_fact'
   | 'human_decision'
+  | 'local_model_input'
+  | 'local_model_output'
 
 export interface EvidenceArtifact {
   id: string

@@ -35,6 +35,7 @@
     "@forge/verification": "workspace:*",
     "@forge/integrations": "workspace:*",
     "@forge/provider": "workspace:*",
+    "@forge/local-model": "workspace:*",
     "@forge/tui": "workspace:*"
   },
   "devDependencies": {

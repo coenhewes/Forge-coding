@@ -4,6 +4,9 @@ import type {
   CompletionChunk,
   CompletionResult,
   ModelProvider,
+  EmbeddingProvider,
+  EmbeddingRequest,
+  EmbeddingResult,
 } from '@forge/types'
 
 import {
@@ -13,11 +16,12 @@ import {
   mapMessages,
   getSystemMessage,
   mergeChunks,
+  ProviderError,
 } from './base.js'
 
 const DEFAULT_BASE_URL = 'http://localhost:11434'
 
-export class OllamaProvider implements ModelProvider {
+export class OllamaProvider implements ModelProvider, EmbeddingProvider {
   private baseUrl: string
 
   constructor(private config: ProviderConfig) {
@@ -66,5 +70,36 @@ export class OllamaProvider implements ModelProvider {
       chunks.push(chunk)
     }
     return mergeChunks(chunks)
+  }
+
+  /**
+   * Embed a batch of texts via Ollama's `/api/embed` endpoint
+   * (`{ model, input: string[] }` → `{ embeddings: number[][] }`).
+   * Non-streaming JSON; reuses the shared timeout-capped fetch.
+   */
+  async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
+    const url = buildApiUrl(this.baseUrl, '/api/embed')
+    const response = await fetchStream(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: request.model || this.config.model,
+        input: request.texts,
+      }),
+      timeoutMs: this.config.timeoutMs,
+    })
+
+    const data = (await response.json()) as {
+      embeddings?: number[][]
+      prompt_eval_count?: number
+    }
+    const vectors = data.embeddings
+    if (!Array.isArray(vectors) || vectors.length !== request.texts.length) {
+      throw new ProviderError('Ollama embed: unexpected response shape')
+    }
+    return {
+      vectors,
+      usage: data.prompt_eval_count ? { inputTokens: data.prompt_eval_count } : undefined,
+    }
   }
 }

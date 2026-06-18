@@ -15,6 +15,7 @@ import {
   mapAnthropicTools,
   getSystemMessage,
   mergeChunks,
+  safeParseToolInput,
 } from './base.js'
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com/v1'
@@ -124,14 +125,17 @@ export class AnthropicProvider implements ModelProvider {
     // Emit tool calls as a final chunk if we collected any
     if (this.pendingToolCalls.size > 0) {
       const toolCalls: ToolCall[] = []
+      let truncated = false
       for (const [id, tc] of this.pendingToolCalls) {
-        toolCalls.push({
-          id,
-          name: tc.name,
-          input: tc.input ? JSON.parse(tc.input) : {},
-        })
+        const parsed = safeParseToolInput(tc.input)
+        if (parsed === undefined) {
+          truncated = true
+          continue
+        }
+        toolCalls.push({ id, name: tc.name, input: parsed })
       }
-      yield { toolCalls, finishReason: 'tool_calls' }
+      if (toolCalls.length > 0) yield { toolCalls, finishReason: 'tool_calls' }
+      if (truncated) yield { finishReason: 'length' }
     }
   }
 

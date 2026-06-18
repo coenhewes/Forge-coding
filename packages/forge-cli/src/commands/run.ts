@@ -23,6 +23,7 @@ import { AgentLoop } from '@forge/agent'
 import type { AgentResult, AgentConfig } from '@forge/agent'
 import type { CommandResult, ParsedArgs } from './output.js'
 import { getOption } from './output.js'
+import { createRunRenderer } from './run-renderer.js'
 
 export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentResult | { taskId: string; status: string; summary: string }>> {
   const filePath = getOption(parsed, 'file')
@@ -59,14 +60,29 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
     config = await initConfig()
   }
 
+  // Long-horizon budget from flags: --hours <n> and/or --max-iterations <n>.
+  const hours = Number(getOption(parsed, 'hours'))
+  const maxIters = Number(getOption(parsed, 'max-iterations'))
+  const budget: AgentConfig['budget'] = {
+    maxWallClockMs: Number.isFinite(hours) && hours > 0 ? Math.round(hours * 3600_000) : undefined,
+    maxIterations: Number.isFinite(maxIters) && maxIters > 0 ? maxIters : undefined,
+  }
+
   const agentConfig: AgentConfig = {
     provider: config.provider,
     workDir: config.workDir,
     stateDir: config.stateDir,
     mode: config.mode,
-    maxIterations: 50,
+    // Default cap stays modest; --hours/--max-iterations raise it for long runs.
+    maxIterations: budget.maxIterations ?? 50,
+    budget: budget.maxWallClockMs || budget.maxIterations ? budget : undefined,
     features: config.features,
     git: config.git,
+    // Activate the non-authoritative local-model layer (compaction/triage)
+    // when configured. Falls back to deterministic behavior if unavailable.
+    localModel: config.localModel,
+    // Live event stream to stderr (kept off stdout so --json stays clean).
+    onEvent: createRunRenderer(!parsed.json),
   }
 
   const logLines: string[] = [
@@ -122,6 +138,9 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
 
   if (result.status === 'blocked') {
     summaryLines.push('', `⚠ Task is blocked. Use: forge resume ${result.taskId}`)
+  }
+  if (result.status === 'paused') {
+    summaryLines.push('', `⏸ Budget reached — task paused (resumable). Use: forge resume ${result.taskId}`)
   }
 
   return {

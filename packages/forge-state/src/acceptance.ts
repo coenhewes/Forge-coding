@@ -10,38 +10,17 @@ export interface ContractEngineOptions {
   stateDir?: string
 }
 
-const DEFAULT_CRITERION_TEMPLATES: Record<string, string[]> = {
-  auth: [
-    'Authentication flow works correctly',
-    'Authorization checks are in place for all protected routes',
-    'Permission boundaries are respected',
-    'Role-based access control functions as expected',
-    'Session management is secure',
-  ],
-  backend: [
-    'API endpoints return correct status codes',
-    'Error handling covers edge cases',
-    'Input validation is applied',
-    'Response format matches contract',
-  ],
-  database: [
-    'Migration runs successfully up and down',
-    'Schema changes are backward compatible',
-    'Data integrity is preserved',
-    'No data loss on migration',
-  ],
-  frontend: [
-    'UI renders correctly across viewport sizes',
-    'User interactions work as expected',
-    'Loading states are handled',
-    'Error states are displayed appropriately',
-  ],
-  tests: [
-    'New behavior has corresponding tests',
-    'Existing tests still pass',
-    'Edge cases are covered',
-    'Test quality meets project standards',
-  ],
+/**
+ * One concise, *verifiable* criterion per high-signal domain. Acceptance
+ * criteria gate completion, so each must be something the agent can actually
+ * confirm with evidence — not aspirational boilerplate.
+ */
+const DOMAIN_CRITERION: Record<string, string> = {
+  auth: 'Authorization checks protect the affected routes',
+  backend: 'Affected API endpoints return correct status codes and validate input',
+  database: 'Migrations apply cleanly and preserve data integrity',
+  frontend: 'Affected UI renders and handles its key states',
+  tests: 'The project test suite passes',
 }
 
 export class AcceptanceContractEngine {
@@ -192,30 +171,45 @@ export class AcceptanceContractEngine {
     domains?: string[],
   ): AcceptanceCriterion[] {
     const criteria: AcceptanceCriterion[] = []
-    const lower = description.toLowerCase()
-    const domainsToCheck = domains ?? this.inferDomains(description)
 
-    for (const domain of domainsToCheck) {
-      const templates = DEFAULT_CRITERION_TEMPLATES[domain]
-      if (!templates) continue
-      for (const template of templates) {
-        criteria.push({
-          id: `${domain}-${criteria.length + 1}`,
-          description: template,
-          status: 'needs_review',
-          evidenceRefs: [],
-          riskArea: domain === 'auth' ? 'security' : domain,
-        })
-      }
+    // Ground the criteria in the actual task. The caller's domain selection
+    // can be over-broad (e.g. routing a string utility to "frontend"), which
+    // would add unverifiable criteria that can never be satisfied. So we only
+    // keep domains that are also reflected in the task text.
+    const inferred = this.inferDomains(description)
+    const requested = domains ?? inferred
+    const grounded = requested.filter((d) => inferred.includes(d))
+    const effective = grounded.length > 0 ? grounded : inferred
+
+    // 1) A concrete, task-derived primary criterion.
+    const firstLine = (description.split('\n').find((l) => l.trim()) ?? description).trim()
+    const summary = firstLine.length > 160 ? `${firstLine.slice(0, 157)}…` : firstLine
+    const primaryRisk = effective.includes('auth') ? 'security' : effective[0]
+    criteria.push({
+      id: 'task-1',
+      description: `Implementation satisfies the task: ${summary}`,
+      status: 'needs_review',
+      evidenceRefs: [],
+      riskArea: primaryRisk,
+    })
+
+    // 2) If the task involves tests, require the suite to pass.
+    if (/\b(test|tests|spec|e2e|suite|passes|passing)\b/i.test(description)
+      && !effective.includes('tests')) {
+      effective.push('tests')
     }
 
-    // Add general criteria
-    if (criteria.length === 0) {
+    // 3) One targeted, verifiable criterion per relevant domain.
+    for (const domain of effective) {
+      const text = DOMAIN_CRITERION[domain]
+      if (!text || criteria.some((c) => c.description === text)) continue
       criteria.push({
-        id: 'general-1',
-        description: 'The implementation satisfies the task requirements',
+        id: `${domain}-1`,
+        description: text,
         status: 'needs_review',
         evidenceRefs: [],
+        riskArea: domain === 'auth' ? 'security' : domain,
+        requiredChecks: domain === 'tests' ? ['test'] : undefined,
       })
     }
 

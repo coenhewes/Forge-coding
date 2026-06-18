@@ -41,6 +41,14 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     pr: 'file',
     branchPrefix: 'forge/',
   },
+  localModel: {
+    // Opt-in: enabled only when a local provider is reachable (probed once).
+    enabled: 'auto',
+    maxInputChars: 24_000,
+    timeoutMs: 20_000,
+    summaryTargetTokens: 200,
+    compactionThresholdChars: 4_000,
+  },
 }
 
 export function configPath(stateDir?: string): string {
@@ -94,6 +102,9 @@ export function resolveConfig(fileConfig: ForgeConfigFile): ForgeConfig {
       ...DEFAULT_CONFIG.git,
       ...fileConfig.git,
     },
+    localModel: fileConfig.localModel
+      ? { ...DEFAULT_CONFIG.localModel, ...fileConfig.localModel }
+      : DEFAULT_CONFIG.localModel,
   }
 }
 

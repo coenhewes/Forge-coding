@@ -1,4 +1,4 @@
-export type TaskStatus = 'pending' | 'exploring' | 'implementing' | 'verifying' | 'completed' | 'failed' | 'blocked' | 'needs_review'
+export type TaskStatus = 'pending' | 'exploring' | 'implementing' | 'verifying' | 'completed' | 'failed' | 'blocked' | 'needs_review' | 'paused'
 
 export type SubtaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked'
 

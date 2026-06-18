@@ -50,6 +50,7 @@ export type {
   AcceptanceContract,
   AcceptanceCriterion,
   CriterionStatus,
+  VerificationCheckKind,
 } from './acceptance.js'
 
 export type {
@@ -171,3 +172,29 @@ export type {
 
 export type { ArtifactRef } from './artifact.js'
 export { isLocalArtifact, isRemoteArtifact } from './artifact.js'
+
+export type {
+  LocalTaskKind,
+  LocalModelEnablement,
+  LocalModelConfig,
+  LocalModelUsage,
+  LocalModelProvenance,
+  LocalModelResultBase,
+  SummarizeRequest,
+  SummarizeResult,
+  ClassifyRequest,
+  ClassifyResult,
+  ExtractRequest,
+  ExtractedField,
+  ExtractResult,
+  RerankRequest,
+  RerankResult,
+  EmbedRequest,
+  EmbedResult,
+  EmbeddingRequest,
+  EmbeddingResult,
+  EmbeddingProvider,
+  LocalModelRun,
+  EmbeddingTargetType,
+  EmbeddingRecord,
+} from './local-model.js'

@@ -29,6 +29,9 @@ importers:
       '@forge/integrations':
         specifier: workspace:*
         version: link:packages/forge-integrations
+      '@forge/local-model':
+        specifier: workspace:*
+        version: link:packages/forge-local-model
       '@forge/pr':
         specifier: workspace:*
         version: link:packages/forge-pr
@@ -86,6 +89,9 @@ importers:
       '@forge/harness':
         specifier: workspace:*
         version: link:../forge-harness
+      '@forge/local-model':
+        specifier: workspace:*
+        version: link:../forge-local-model
       '@forge/pr':
         specifier: workspace:*
         version: link:../forge-pr
@@ -145,6 +151,9 @@ importers:
       '@forge/integrations':
         specifier: workspace:*
         version: link:../forge-integrations
+      '@forge/local-model':
+        specifier: workspace:*
+        version: link:../forge-local-model
       '@forge/provider':
         specifier: workspace:*
         version: link:../forge-provider
@@ -234,6 +243,19 @@ importers:
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-local-model:
+    dependencies:
+      '@forge/provider':
+        specifier: workspace:*
+        version: link:../forge-provider
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

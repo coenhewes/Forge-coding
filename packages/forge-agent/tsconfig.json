@@ -11,6 +11,7 @@
   "references": [
     { "path": "../forge-types" },
     { "path": "../forge-provider" },
+    { "path": "../forge-local-model" },
     { "path": "../forge-harness" },
     { "path": "../forge-state" },
     { "path": "../forge-state-store" },

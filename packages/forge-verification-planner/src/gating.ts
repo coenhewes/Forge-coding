@@ -22,6 +22,13 @@ export interface CompletionInput {
   actions?: VerificationAction[]
   /** Minimum evidence value for an action to be "high-value". Defaults to 0.7. */
   highValueThreshold?: number
+  /**
+   * Acceptance-criteria progress. When provided, completion additionally
+   * requires that every acceptance criterion is verified — and that at least
+   * one exists. This closes the "vacuously ready" hole where an empty belief
+   * set (no claims) would otherwise pass the gate with zero work done.
+   */
+  acceptance?: { total: number; verified: number }
 }
 
 export interface CompletionResult {
@@ -88,6 +95,17 @@ export function evaluateCompletion(input: CompletionInput): CompletionResult {
   for (const action of actions) {
     if (action.status === 'skipped' && action.expectedEvidenceValue >= threshold && !action.selectionReason) {
       blockers.push(`Skipped high-value verification action without reason: ${action.id}`)
+    }
+  }
+
+  // Acceptance criteria must all be verified (and at least one must exist).
+  // This prevents "completion" with no work done / nothing established.
+  if (input.acceptance) {
+    const { total, verified } = input.acceptance
+    if (total === 0) {
+      blockers.push('No acceptance criteria defined; nothing has been established to verify.')
+    } else if (verified < total) {
+      blockers.push(`Acceptance criteria not all verified (${verified}/${total}).`)
     }
   }
 
