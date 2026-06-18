@@ -1,0 +1,11 @@
+{
+  "name": "team-invitations",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Forge eval fixture — multi-domain team-invitation feature. Mirrors the sample-saas pattern but pre-declares the schema, route stubs, and test surface the agent must fill in for the 'Add team invitations' task.",
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  }
+}

@@ -1,0 +1,223 @@
+{
+  "task": {
+    "id": "auth-org-admin-invite",
+    "cls": "auth_permission_bug",
+    "title": "Restore org-admin invite after SSO migration",
+    "risk": "high",
+    "prompt": "After the recent SSO migration, org admins cannot invite new users to their organization. Diagnose the auth layer (src/auth/**), fix the broken invite path so an admin (whether original owner or SSO-provisioned admin) can invite users again, and add regression tests covering: (a) admin invite succeeds, (b) non-admin invite is forbidden, (c) SSO-provisioned admin invite succeeds. Use the existing permission helpers and the role-mapping layer — do not special-case the invite route. Verify your work by running the test suite before finishing.",
+    "acceptance": [
+      {
+        "id": "auth-invite-test-passes",
+        "description": "Invite permission test passes",
+        "command": "pnpm test -- --run --reporter=basic auth tests/auth tests/permissions",
+        "tags": [
+          "test",
+          "permission"
+        ]
+      },
+      {
+        "id": "auth-permission-helper-untouched",
+        "description": "Auth permission helper signature preserved",
+        "expectGitChanges": false,
+        "tags": [
+          "contract"
+        ]
+      }
+    ],
+    "weights": {
+      "verified_completion_rate": 0.4,
+      "cost_per_completed_task": 0.15,
+      "runtime_per_completed_task": 0.1,
+      "irrelevant_files_edited": 0.15,
+      "repeated_failed_attempts": 0.15,
+      "human_interventions": 0.1,
+      "resume_success_rate": 0.1
+    }
+  },
+  "forge": {
+    "label": "forge (full harness)",
+    "task": {
+      "id": "auth-org-admin-invite",
+      "cls": "auth_permission_bug",
+      "title": "Restore org-admin invite after SSO migration",
+      "risk": "high",
+      "prompt": "After the recent SSO migration, org admins cannot invite new users to their organization. Diagnose the auth layer (src/auth/**), fix the broken invite path so an admin (whether original owner or SSO-provisioned admin) can invite users again, and add regression tests covering: (a) admin invite succeeds, (b) non-admin invite is forbidden, (c) SSO-provisioned admin invite succeeds. Use the existing permission helpers and the role-mapping layer — do not special-case the invite route. Verify your work by running the test suite before finishing.",
+      "acceptance": [
+        {
+          "id": "auth-invite-test-passes",
+          "description": "Invite permission test passes",
+          "command": "pnpm test -- --run --reporter=basic auth tests/auth tests/permissions",
+          "tags": [
+            "test",
+            "permission"
+          ]
+        },
+        {
+          "id": "auth-permission-helper-untouched",
+          "description": "Auth permission helper signature preserved",
+          "expectGitChanges": false,
+          "tags": [
+            "contract"
+          ]
+        }
+      ],
+      "weights": {
+        "verified_completion_rate": 0.4,
+        "cost_per_completed_task": 0.15,
+        "runtime_per_completed_task": 0.1,
+        "irrelevant_files_edited": 0.15,
+        "repeated_failed_attempts": 0.15,
+        "human_interventions": 0.1,
+        "resume_success_rate": 0.1
+      }
+    },
+    "workDir": "/Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/forge-eval-baseline-forge-aEzDdR",
+    "runtimeMs": 4000,
+    "result": {
+      "taskId": "synthetic-auth-org-admin-invite",
+      "status": "verified_complete",
+      "summary": "Synthetic forge (full harness) result for auth-org-admin-invite",
+      "iterations": 12,
+      "filesTouched": [
+        "src/auth/permissions.ts",
+        "src/api/invites.ts",
+        "tests/auth/invite.test.ts"
+      ],
+      "commandsRun": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm lint"
+      ],
+      "evidenceCount": 4,
+      "failureCount": 1,
+      "decisionCount": 2,
+      "verificationPassed": true,
+      "acceptancePassed": true,
+      "riskLevel": "high"
+    },
+    "acceptanceResults": [
+      {
+        "id": "auth-invite-test-passes",
+        "description": "Invite permission test passes",
+        "status": "failed",
+        "durationMs": 254,
+        "exitCode": 1,
+        "stdoutTail": "\n> sample-saas@1.0.0 test /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/forge-eval-baseline-forge-aEzDdR\n> node --test -- --run --reporter=basic auth tests/auth tests/permissions\n\n ELIFECYCLE  Test failed. See above for more details.\n WARN   Local package.json exists, but node_modules missing, did you mean to install?\n",
+        "stderrTail": "Could not find '--run, --reporter=basic, auth, tests/auth, tests/permissions'\n",
+        "reason": "Command failed: sh -c pnpm test -- --run --reporter=basic auth tests/auth tests/permissions\nCould not find '--run, --reporter=basic, auth, tests/auth, tests/permissions'\n"
+      },
+      {
+        "id": "auth-permission-helper-untouched",
+        "description": "Auth permission helper signature preserved",
+        "status": "not_applicable",
+        "durationMs": 0,
+        "reason": "No command or expectedFiles set"
+      }
+    ],
+    "verifiedCompletion": false,
+    "verifiedFraction": 0,
+    "estimatedCostUsd": 0.063,
+    "irrelevantFilesEdited": [],
+    "repeatedFailedAttempts": 0,
+    "humanInterventions": 0,
+    "resumed": false
+  },
+  "flat": {
+    "label": "flat (baseline)",
+    "task": {
+      "id": "auth-org-admin-invite",
+      "cls": "auth_permission_bug",
+      "title": "Restore org-admin invite after SSO migration",
+      "risk": "high",
+      "prompt": "After the recent SSO migration, org admins cannot invite new users to their organization. Diagnose the auth layer (src/auth/**), fix the broken invite path so an admin (whether original owner or SSO-provisioned admin) can invite users again, and add regression tests covering: (a) admin invite succeeds, (b) non-admin invite is forbidden, (c) SSO-provisioned admin invite succeeds. Use the existing permission helpers and the role-mapping layer — do not special-case the invite route. Verify your work by running the test suite before finishing.",
+      "acceptance": [
+        {
+          "id": "auth-invite-test-passes",
+          "description": "Invite permission test passes",
+          "command": "pnpm test -- --run --reporter=basic auth tests/auth tests/permissions",
+          "tags": [
+            "test",
+            "permission"
+          ]
+        },
+        {
+          "id": "auth-permission-helper-untouched",
+          "description": "Auth permission helper signature preserved",
+          "expectGitChanges": false,
+          "tags": [
+            "contract"
+          ]
+        }
+      ],
+      "weights": {
+        "verified_completion_rate": 0.4,
+        "cost_per_completed_task": 0.15,
+        "runtime_per_completed_task": 0.1,
+        "irrelevant_files_edited": 0.15,
+        "repeated_failed_attempts": 0.15,
+        "human_interventions": 0.1,
+        "resume_success_rate": 0.1
+      }
+    },
+    "workDir": "/Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/forge-eval-baseline-flat-bRqJV3",
+    "runtimeMs": 9000,
+    "result": {
+      "taskId": "synthetic-auth-org-admin-invite",
+      "status": "incomplete",
+      "summary": "Synthetic flat (baseline) result for auth-org-admin-invite",
+      "iterations": 40,
+      "filesTouched": [
+        "README.md"
+      ],
+      "commandsRun": [
+        "pnpm test"
+      ],
+      "evidenceCount": 0,
+      "failureCount": 12,
+      "decisionCount": 0,
+      "verificationPassed": false,
+      "acceptancePassed": false,
+      "riskLevel": "high"
+    },
+    "acceptanceResults": [
+      {
+        "id": "auth-invite-test-passes",
+        "description": "Invite permission test passes",
+        "status": "failed",
+        "durationMs": 258,
+        "exitCode": 1,
+        "stdoutTail": "\n> sample-saas@1.0.0 test /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/forge-eval-baseline-flat-bRqJV3\n> node --test -- --run --reporter=basic auth tests/auth tests/permissions\n\n ELIFECYCLE  Test failed. See above for more details.\n WARN   Local package.json exists, but node_modules missing, did you mean to install?\n",
+        "stderrTail": "Could not find '--run, --reporter=basic, auth, tests/auth, tests/permissions'\n",
+        "reason": "Command failed: sh -c pnpm test -- --run --reporter=basic auth tests/auth tests/permissions\nCould not find '--run, --reporter=basic, auth, tests/auth, tests/permissions'\n"
+      },
+      {
+        "id": "auth-permission-helper-untouched",
+        "description": "Auth permission helper signature preserved",
+        "status": "not_applicable",
+        "durationMs": 0,
+        "reason": "No command or expectedFiles set"
+      }
+    ],
+    "verifiedCompletion": false,
+    "verifiedFraction": 0,
+    "estimatedCostUsd": 0.201,
+    "irrelevantFilesEdited": [],
+    "repeatedFailedAttempts": 11,
+    "humanInterventions": 0,
+    "resumed": false
+  },
+  "deltas": {
+    "verified_completion_rate": 0,
+    "cost_per_completed_task": 0.138,
+    "runtime_per_completed_task": 5000,
+    "irrelevant_files_edited": 0,
+    "repeated_failed_attempts": 11,
+    "human_interventions": 0,
+    "resume_success_rate": 0
+  },
+  "forgeScore": 0.6398833333333334,
+  "flatScore": 0.46834999999999993,
+  "improvement": 0.36625031137681957,
+  "generatedAt": "2026-06-17T16:06:19.956Z",
+  "reportPath": "/Users/coenhewes/Documents/Forge-code/Forge-coding/packages/forge-eval/forge-eval-auth-org-admin-invite.json"
+}

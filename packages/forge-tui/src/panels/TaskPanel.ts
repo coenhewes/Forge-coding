@@ -44,6 +44,7 @@ export class TaskPanel {
     const lines: string[] = []
     lines.push(`${statusIcon} ${truncate(f.taskId, w - 4)}`)
     lines.push(`status: ${truncate(f.status, w - 8)}`)
+    lines.push(`Next: ${truncate(f.nextAction, w - 7)}`)
     lines.push('')
     lines.push('Goal:')
     for (const chunk of wrap(f.originalRequest, w - 2)) lines.push(`  ${chunk}`)
@@ -51,7 +52,6 @@ export class TaskPanel {
     lines.push('Interpretation:')
     for (const chunk of wrap(f.currentInterpretation, w - 2)) lines.push(`  ${chunk}`)
     lines.push('')
-    lines.push(`Next: ${truncate(f.nextAction, w - 7)}`)
 
     const tail: string[] = []
     tail.push(`Files: ${f.filesTouched?.length ?? 0}  Cmds: ${f.commandsRun?.length ?? 0}  Tests: ${f.testsRun?.length ?? 0}`)

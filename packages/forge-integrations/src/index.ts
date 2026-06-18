@@ -142,4 +142,29 @@ export type {
   StdioMcpClientOptions,
 } from './mcp/client.js'
 
+/* ---------------------------------------------------------------- *
+ *  Section 4: Plugin registry (typed manifest + lifecycle hooks)
+ * ---------------------------------------------------------------- */
+
+export * as plugins from './plugins/index.js'
+
+// Top-level re-exports so callers (CLI, tests, downstream packages)
+// can pull plugin primitives without going through the namespace.
+export {
+  PluginRegistry,
+  pluginRegistry,
+  validatePluginManifest,
+  asSemver,
+  asCapabilityId,
+} from './plugins/registry.js'
+export type {
+  PluginManifest,
+  PluginLifecycleHook,
+  PluginPermission,
+  PluginHookContext,
+  PluginHookHandler,
+  SemverString,
+  PluginCapabilityId,
+} from './plugins/registry.js'
+
 export const INTEGRATIONS_VERSION = '0.1.0'

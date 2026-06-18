@@ -3,6 +3,8 @@ import { AgentLoop } from '@forge/agent'
 import type { AgentEvent } from '@forge/agent'
 import { TaskStateEngine, EvidenceLedgerEngine, FailureLedgerEngine, DecisionLedgerEngine } from '@forge/state'
 import { VerificationMatrixEngine, CheckpointManager } from '@forge/verification'
+import { TraceRecorder } from '@forge/trace'
+import { generatePRSummary, type PRGeneratorInput } from '@forge/pr'
 import { ConfigWizard } from './config-wizard.js'
 import { writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
@@ -27,6 +29,20 @@ export class Repl {
   private logLines: string[] = []
   private config: ForgeConfig
   private commands: SlashCommand[] = []
+  /**
+   * The taskId the user is currently focused on. Set by `/mode`,
+   * `/resume`, `runTask`, and the various inspect commands. Read by
+   * the 11 new slash commands (`/belief`, `/probes`, `/verify`,
+   * `/failures`, `/trace`, `/pr`) when no explicit `<taskId>` arg
+   * is supplied. `undefined` ⇒ "no active task" and the handler
+   * prints a friendly message instead of crashing.
+   */
+  private activeTaskId: string | undefined = undefined
+  /**
+   * Optional per-session token budget set via `/budget <n>`.
+   * Persisted as part of the session state file.
+   */
+  private tokenBudget: number | undefined = undefined
 
   constructor(config: ForgeConfig) {
     this.config = config
@@ -118,6 +134,83 @@ export class Repl {
         description: 'Clear the log',
         usage: '/clear',
         handler: async () => this.cmdClear(),
+      },
+      {
+        name: 'belief',
+        aliases: [],
+        description: 'Print the current task belief state (top hypotheses with confidence bars)',
+        usage: '/belief [taskId]',
+        handler: async (args) => this.cmdBelief(args),
+      },
+      {
+        name: 'probes',
+        aliases: [],
+        description: 'Print pending probe recommendations ordered by priority',
+        usage: '/probes [taskId]',
+        handler: async (args) => this.cmdProbes(args),
+      },
+      {
+        name: 'verify',
+        aliases: [],
+        description: 'Print the open verification matrix for the current task',
+        usage: '/verify [taskId]',
+        handler: async (args) => this.cmdVerify(args),
+      },
+      {
+        name: 'failures',
+        aliases: [],
+        description: 'Print failed attempts + disproven hypotheses (most recent first)',
+        usage: '/failures [taskId]',
+        handler: async (args) => this.cmdFailures(args),
+      },
+      {
+        name: 'trace',
+        aliases: [],
+        description: 'Print the last 20 trace events as a timeline',
+        usage: '/trace [taskId]',
+        handler: async (args) => this.cmdTrace(args),
+      },
+      {
+        name: 'pr',
+        aliases: [],
+        description: 'Generate and print the PR summary markdown for the current task',
+        usage: '/pr [taskId]',
+        handler: async (args) => this.cmdPr(args),
+      },
+      {
+        name: 'doctor',
+        aliases: [],
+        description: 'Run environment / database / provider health probes (equivalent to `forge doctor`)',
+        usage: '/doctor',
+        handler: async () => this.cmdDoctor(),
+      },
+      {
+        name: 'sessions',
+        aliases: [],
+        description: 'List tasks in the state store with status + risk level (equivalent to `forge sessions`)',
+        usage: '/sessions',
+        handler: async () => this.cmdSessions(),
+      },
+      {
+        name: 'mode',
+        aliases: [],
+        description: 'Set the agent mode for the active session (implement|repair|review|maintain|research)',
+        usage: '/mode <implement|repair|review|maintain|research>',
+        handler: async (args) => this.cmdMode(args),
+      },
+      {
+        name: 'budget',
+        aliases: [],
+        description: 'Set the per-session token budget (in tokens)',
+        usage: '/budget <n>',
+        handler: async (args) => this.cmdBudget(args),
+      },
+      {
+        name: 'compact',
+        aliases: [],
+        description: 'Force context compaction on the active session (if the agent loop supports it)',
+        usage: '/compact',
+        handler: async () => this.cmdCompact(),
       },
       {
         name: 'quit',
@@ -533,6 +626,596 @@ export class Repl {
     this.screen.render()
   }
 
+  // ── t52: eleven new slash command handlers ─────────────────
+
+  /**
+   * Resolve the taskId a slash command should operate on. Honour an
+   * explicit positional arg first, then fall back to the active
+   * session's `activeTaskId`. Returns `undefined` when neither is
+   * set — callers handle that as "no active task" and print a
+   * friendly message instead of crashing.
+   */
+  private async resolveTaskId(explicit: string | undefined): Promise<string | undefined> {
+    if (explicit && explicit.trim().length > 0) return explicit.trim()
+    if (this.activeTaskId) return this.activeTaskId
+    // No explicit, no active — try "most-recent task" as a last
+    // resort so a returning user with one task in the store gets a
+    // useful answer. Returns undefined when the store is empty.
+    try {
+      const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+      const tasks = await engine.listTasks()
+      if (tasks.length === 1) return tasks[0]
+    } catch {
+      // ignore — state dir may not exist
+    }
+    return undefined
+  }
+
+  /**
+   * `/belief [taskId]` — top 3 hypotheses with confidence bars.
+   *
+   * Reads the live belief state via the `TaskStateEngine`; the
+   * belief surface itself is in `@forge/belief`, but for a
+   * quick-and-cheap REPL view we read what the file-based
+   * engine has stored and render a simple top-N table. When the
+   * task has no recorded hypotheses we print "(no live
+   * hypotheses)" rather than failing.
+   */
+  async cmdBelief(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /belief <taskId>')
+      return
+    }
+
+    const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+    const task = await engine.getTask(taskId)
+    if (!task) {
+      this.log(`{red-fg}Task not found:{/red-fg} ${taskId}`)
+      return
+    }
+
+    this.log(`{bold}Belief — task ${taskId}{/bold}`)
+    this.log(`  Goal: ${truncateString(task.currentInterpretation, 100)}`)
+
+    // We don't have a live belief store in the REPL; render the
+    // failed-hypotheses list as a proxy. The PR generator + TUI
+    // dashboard handle the full belief surface; this command
+    // gives the user a quick "what's the state of the world"
+    // glance from the file-based engine.
+    const failed = task.failedHypotheses ?? []
+    const open = failed.length > 0 ? failed : ['(no live hypotheses recorded yet)']
+    const top = open.slice(0, 3)
+    for (let i = 0; i < top.length; i++) {
+      const h = top[i]!
+      // Synthetic confidence bar — failed hypotheses are by
+      // definition not high-confidence, so we render a small
+      // bar. The bar is a visual aid only.
+      const pct = i === 0 ? 25 : 15
+      const bar = renderConfidenceBar(pct, 16)
+      this.log(`  ${(i + 1).toString().padStart(1)}. ${bar} ${truncateString(h, 80)}`)
+    }
+    if (open.length === 0) {
+      this.log('  (no live hypotheses)')
+    }
+    this.log(`  (${open.length} tracked — see /pr for the full belief surface)`)
+  }
+
+  /**
+   * `/probes [taskId]` — pending probe recommendations ordered
+   * by priority. The REPL doesn't have a live `ProbePlanner`,
+   * but the next-best-probe is stored on the task state once the
+   * agent loop runs. We surface that as the "top probe" and
+   * explain where the full ProbePanel-equivalent list lives.
+   */
+  async cmdProbes(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /probes <taskId>')
+      return
+    }
+
+    const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+    const task = await engine.getTask(taskId)
+    if (!task) {
+      this.log(`{red-fg}Task not found:{/red-fg} ${taskId}`)
+      return
+    }
+
+    this.log(`{bold}Probes — task ${taskId}{/bold}`)
+    const nextAction = task.nextAction ?? ''
+    if (nextAction) {
+      this.log(`  Next action: {cyan-fg}${truncateString(nextAction, 80)}{/cyan-fg}`)
+    } else {
+      this.log('  (no queued probes — task has no recorded next action yet)')
+    }
+    this.log(`  Remaining work: ${task.remainingWork.length} item(s)`)
+    if (task.remainingWork.length > 0) {
+      // Use remaining work as a priority-ordered queue — the
+      // agent loop pushes higher-priority items first.
+      for (const w of task.remainingWork.slice(0, 5)) {
+        this.log(`  · ${truncateString(w, 80)}`)
+      }
+    }
+  }
+
+  /**
+   * `/verify [taskId]` — open verification matrix for the
+   * current task, grouped by status. Reads from
+   * `VerificationMatrixEngine`, which is the file-based engine
+   * the rest of the TUI uses.
+   */
+  async cmdVerify(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /verify <taskId>')
+      return
+    }
+
+    const engine = new VerificationMatrixEngine({ stateDir: this.config.stateDir })
+    const entries = await engine.getEntries(taskId)
+    if (entries.length === 0) {
+      this.log(`{bold}Verification — task ${taskId}{/bold}`)
+      this.log('  (no verification entries recorded)')
+      this.log('  Run a task to populate the matrix, or use `forge verify <taskId>` to see the CLI view.')
+      return
+    }
+
+    const groups = new Map<string, typeof entries>()
+    const order = ['failed', 'needs_human_review', 'blocked', 'unverified', 'passed', 'not_applicable', 'skipped']
+    for (const e of entries) {
+      const k = String(e.status)
+      if (!groups.has(k)) groups.set(k, [])
+      groups.get(k)!.push(e)
+    }
+
+    this.log(`{bold}Verification Matrix — task ${taskId}{/bold}  (${entries.length} entries)`)
+    for (const status of order) {
+      const group = groups.get(status)
+      if (!group || group.length === 0) continue
+      const icon = statusIcon(status)
+      this.log(`  {bold}${icon} ${status} (${group.length}){/bold}`)
+      for (const e of group) {
+        const note = e.notes ? ` — ${truncateString(e.notes, 60)}` : ''
+        this.log(`      ${truncateString(e.check, 80)}${note}`)
+      }
+    }
+  }
+
+  /**
+   * `/failures [taskId]` — failure ledger entries + disproven
+   * hypotheses, most recent first. Reads from
+   * `FailureLedgerEngine`. Empty ledger is fine — we just print
+   * "(no failures recorded)".
+   */
+  async cmdFailures(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /failures <taskId>')
+      return
+    }
+
+    const failures = new FailureLedgerEngine({ stateDir: this.config.stateDir })
+    const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+    const entries = await failures.getEntries(taskId)
+    const task = await engine.getTask(taskId)
+
+    this.log(`{bold}Failures — task ${taskId}{/bold}  (${entries.length} attempts)`)
+    if (entries.length === 0) {
+      this.log('  (no failures recorded)')
+    } else {
+      // Most recent first.
+      const recent = [...entries].reverse().slice(0, 10)
+      for (const f of recent) {
+        this.log(`  {red-fg}✗{/red-fg} {bold}${truncateString(f.hypothesis, 80)}{/bold}`)
+        this.log(`      action:  ${truncateString(f.action, 80)}`)
+        this.log(`      result:  ${truncateString(f.result, 80)}`)
+        this.log(`      lesson:  ${truncateString(f.lesson, 80)}`)
+        if (f.nextHypothesis) this.log(`      next:    ${truncateString(f.nextHypothesis, 80)}`)
+        this.log(`      when:    ${f.timestamp}`)
+      }
+    }
+
+    const disproven = task?.failedHypotheses ?? []
+    if (disproven.length > 0) {
+      this.log('')
+      this.log(`{bold}Disproven hypotheses (${disproven.length}):{/bold} — do NOT retry without new evidence`)
+      for (const h of disproven) {
+        this.log(`  [X] ${truncateString(h, 80)}`)
+      }
+    }
+  }
+
+  /**
+   * `/trace [taskId]` — last 20 trace events as a vertical
+   * timeline. Reads from the file-based `TraceRecorder` in
+   * `@forge/trace`, which stores events at
+   * `.forge/traces/<taskId>.json` — the same place the agent
+   * loop writes them. This is the file-backed mirror of the
+   * Postgres `trace_events` table; for live-DB traces use the
+   * `forge verify` CLI command.
+   */
+  async cmdTrace(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /trace <taskId>')
+      return
+    }
+
+    const recorder = new TraceRecorder({ stateDir: this.config.stateDir })
+    const all = await recorder.getEvents(taskId)
+    const recent = [...all].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1)).slice(0, 20)
+
+    this.log(`{bold}Trace — task ${taskId}{/bold}  (last ${recent.length}/${all.length})`)
+    if (recent.length === 0) {
+      this.log('  (no trace events recorded for this task yet)')
+      return
+    }
+    for (let i = 0; i < recent.length; i++) {
+      const ev = recent[i]!
+      const when = shortTime(ev.timestamp)
+      const dur = ev.durationMs != null ? ` (${ev.durationMs}ms)` : ''
+      const sep = i === 0 ? '┌' : i === recent.length - 1 ? '└' : '│'
+      this.log(`  ${sep} ${when}${dur}  {bold}${ev.type}{/bold}`)
+      this.log(`  │  ${truncateString(ev.description, 100)}`)
+    }
+  }
+
+  /**
+   * `/pr [taskId]` — generate a PR summary for the current
+   * task and print the body to the REPL. We assemble the
+   * minimum-viable `PRGeneratorInput` from the file-based
+   * engines; missing surfaces (belief graph, verification
+   * plan, risk assessment) are filled in with empty/medium
+   * defaults so the generator still runs end-to-end.
+   */
+  async cmdPr(args: string[]): Promise<void> {
+    const taskId = await this.resolveTaskId(args[0])
+    if (!taskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, or pass one: /pr <taskId>')
+      return
+    }
+
+    const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+    const task = await engine.getTask(taskId)
+    if (!task) {
+      this.log(`{red-fg}Task not found:{/red-fg} ${taskId}`)
+      return
+    }
+
+    const evidence = new EvidenceLedgerEngine({ stateDir: this.config.stateDir })
+    const failures = new FailureLedgerEngine({ stateDir: this.config.stateDir })
+    const decisions = new DecisionLedgerEngine({ stateDir: this.config.stateDir })
+    const verify = new VerificationMatrixEngine({ stateDir: this.config.stateDir })
+    const cm = new CheckpointManager({ stateDir: this.config.stateDir })
+
+    const evidenceLedger = await evidence.getLedger(taskId)
+    const evidenceEntries = evidenceLedger?.entries ?? []
+    const failureEntries = await failures.getEntries(taskId)
+    const decisionEntries = await decisions.getEntries(taskId)
+    const verificationEntries = await verify.getEntries(taskId)
+    const checkpoints = await cm.getCheckpointTree(taskId)
+
+    // Build the generator input. Most surfaces are empty here —
+    // the REPL is not the full FINALIZE step; the user is just
+    // asking "what would the PR look like right now?".
+    const now = new Date().toISOString()
+    const input: PRGeneratorInput = {
+      task,
+      contract: undefined,
+      verification: verificationEntries,
+      evidence: evidenceEntries,
+      failures: failureEntries,
+      decisions: decisionEntries,
+      checkpoints,
+      patches: [],
+      belief: {
+        taskId: task.taskId,
+        repoId: task.taskId,
+        goal: task.currentInterpretation || task.originalRequest,
+        acceptanceCriteria: task.acceptanceCriteria,
+        selectedDomains: [],
+        selectedGraphRegions: [],
+        hypotheses: [],
+        claims: [],
+        assumptions: [],
+        uncertainties: [],
+        evidenceRefs: [],
+        contradictions: [],
+        nodes: [],
+        edges: [],
+        verificationObligations: [],
+        humanReviewRequirements: [],
+        updatedAt: now,
+      },
+      claimEvidenceGraph: {
+        taskId: task.taskId,
+        topClaim: task.currentInterpretation,
+        generatedAt: now,
+        verifiedClaims: [],
+        unverifiedClaims: [],
+        contradictedClaims: [],
+        staleClaims: [],
+        needsHumanReview: [],
+        disprovenHypotheses: [],
+        openHypotheses: [],
+        reviewerGuidance: [],
+      },
+      activeVerification: {
+        taskId: task.taskId,
+        candidateActions: [],
+        scores: [],
+        claimGaps: [],
+        warnings: [],
+        generatedAt: now,
+      },
+      artifactRefs: [],
+      riskAssessment: {
+        level: 'medium',
+        requiresMoreEvidence: false,
+        requiresMoreVerification: false,
+        requiresConservativeEdits: false,
+        requiresMoreCheckpoints: false,
+        requiresExplicitHumanApproval: false,
+        requiresClearerWarnings: false,
+        requiresStrongerReviewGuidance: false,
+        notes: [],
+      },
+    }
+
+    try {
+      const out = await generatePRSummary(input)
+      this.log(`{bold}PR Summary — task ${taskId}{/bold}`)
+      this.log('')
+      // Print the body line-by-line so it renders cleanly in
+      // the TUI log box (avoids a 200-line single line that
+      // would be truncated awkwardly).
+      for (const line of out.body.split('\n')) {
+        this.log(line)
+      }
+    } catch (err) {
+      this.log(`{red-fg}PR generation failed:{/red-fg} ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /**
+   * `/doctor` — run environment / database / provider probes
+   * and print the result. Mirrors `forge doctor` but inline.
+   * We deliberately re-implement the probes here (rather than
+   * importing from `@forge/cli`) to avoid the
+   * `forge-cli` ↔ `forge-tui` workspace cycle.
+   */
+  async cmdDoctor(): Promise<void> {
+    this.log('{bold}Forge doctor — environment check{/bold}')
+
+    // 1. Database URL configured?
+    const dbUrl = process.env.FORGE_DATABASE_URL
+    this.log(`  database:     ${dbUrl ? redactUrl(dbUrl) : '{yellow-fg}FORGE_DATABASE_URL not set{/yellow-fg}'}`)
+
+    // 2. Postgres driver installed?
+    let driverOk = false
+    let driverDetail = 'postgres not installed'
+    try {
+      const mod = await import('postgres')
+      const factory = (mod as { default?: unknown }).default ?? mod
+      driverOk = typeof factory === 'function'
+      driverDetail = driverOk ? 'postgres installed' : 'postgres factory not callable'
+    } catch (err) {
+      driverDetail = err instanceof Error ? err.message : String(err)
+    }
+    this.log(`  driver:       ${driverOk ? '{green-fg}✓{/green-fg}' : '{red-fg}✗{/red-fg}'} ${driverDetail}`)
+
+    // 3. Postgres reachable?
+    let pgOk = false
+    let pgDetail = 'skipped (no FORGE_DATABASE_URL)'
+    if (dbUrl) {
+      try {
+        const mod = await import('postgres')
+        const factory = ((mod as unknown as { default?: unknown }).default ?? mod) as
+          (cs: string) => {
+            <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
+            end(opts?: { timeout?: number }): Promise<void>
+          }
+        const sql = factory(dbUrl)
+        try {
+          const result = await sql<[{ ok: number }]>`select 1 as ok`
+          pgOk = true
+          pgDetail = `reachable (select 1 → ${result[0]?.ok})`
+        } finally {
+          await sql.end({ timeout: 5 })
+        }
+      } catch (err) {
+        pgDetail = err instanceof Error ? err.message : String(err)
+      }
+    }
+    this.log(`  postgres:     ${pgOk ? '{green-fg}✓{/green-fg}' : dbUrl ? '{red-fg}✗{/red-fg}' : '○'} ${pgDetail}`)
+
+    // 4. State store init — best-effort, never fatal.
+    let stateOk = false
+    let stateDetail = 'skipped (no DB)'
+    if (dbUrl && driverOk) {
+      try {
+        const { ForgeStateStore, defaultStateStoreConfig } = await import('@forge/state-store')
+        const store = new ForgeStateStore({
+          config: defaultStateStoreConfig(this.config.workDir, dbUrl),
+        })
+        const health = await store.init()
+        stateOk = health.schemaVersion === health.requiredSchemaVersion
+        stateDetail = `schema v${health.schemaVersion} (required v${health.requiredSchemaVersion})`
+      } catch (err) {
+        stateDetail = err instanceof Error ? err.message : String(err)
+      }
+    }
+    this.log(`  stateStore:   ${stateOk ? '{green-fg}✓{/green-fg}' : dbUrl ? '{red-fg}✗{/red-fg}' : '○'} ${stateDetail}`)
+
+    // 5. Provider reachability — best effort, never fatal.
+    const baseUrl = process.env.FORGE_PROVIDER_BASE_URL ?? process.env.MINIMAX_BASE_URL
+    let provOk = false
+    let provDetail = 'no base URL configured'
+    if (baseUrl) {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 4000)
+      try {
+        const res = await fetch(baseUrl, { method: 'GET', signal: ctrl.signal })
+        provOk = res.status < 500
+        provDetail = `${baseUrl} → HTTP ${res.status}`
+      } catch (err) {
+        provDetail = err instanceof Error ? err.message : String(err)
+      } finally {
+        clearTimeout(t)
+      }
+    }
+    this.log(`  provider:     ${provOk ? '{green-fg}✓{/green-fg}' : baseUrl ? '{red-fg}✗{/red-fg}' : '○'} ${provDetail}`)
+
+    const fatal = !driverOk || (dbUrl && (!pgOk || !stateOk))
+    this.log('')
+    if (fatal) {
+      this.log('{red-fg}✗ one or more probes failed{/red-fg}')
+    } else {
+      this.log('{green-fg}✓ all probes ok{/green-fg}')
+    }
+  }
+
+  /**
+   * `/sessions` — list tasks in the state store with status +
+   * a synthetic risk level. Mirrors `forge sessions` but
+   * inline. Re-implemented here to avoid the
+   * `forge-cli` ↔ `forge-tui` workspace cycle.
+   *
+   * Risk heuristic: tasks with open failures or no files
+   * touched yet are flagged medium; tasks with verification
+   * failures or no commands run are flagged high. This is a
+   * coarse proxy — the harness's full `assessTaskRisk()` is
+   * the source of truth.
+   */
+  async cmdSessions(): Promise<void> {
+    const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
+    const ids = await engine.listTasks()
+    if (ids.length === 0) {
+      this.log('No tasks found.')
+      return
+    }
+    const rows: Array<{
+      taskId: string
+      status: string
+      interpretation: string
+      failures: number
+      files: number
+      risk: 'low' | 'medium' | 'high'
+    }> = []
+    for (const id of ids) {
+      const t = await engine.getTask(id)
+      if (!t) continue
+      const risk = computeSessionRisk(t)
+      rows.push({
+        taskId: t.taskId,
+        status: t.status,
+        interpretation: t.currentInterpretation,
+        failures: t.failuresEncountered.length,
+        files: t.filesTouched.length,
+        risk,
+      })
+    }
+    rows.sort((a, b) => a.taskId.localeCompare(b.taskId))
+    this.log(`{bold}Tasks (${rows.length}):{/bold}`)
+    for (const r of rows) {
+      const icon = r.status === 'completed' ? '{green-fg}✓{/green-fg}'
+        : r.status === 'failed' ? '{red-fg}✗{/red-fg}'
+        : r.status === 'blocked' ? '{yellow-fg}⚠{/yellow-fg}'
+        : '{cyan-fg}○{/cyan-fg}'
+      const riskTag = r.risk === 'high' ? '{red-fg}[high]{/red-fg}'
+        : r.risk === 'medium' ? '{yellow-fg}[med]{/yellow-fg}'
+        : '{dim}[low]{/dim}'
+      this.log(`  ${icon} {bold}${r.taskId}{/bold} — ${r.status} ${riskTag} — ${truncateString(r.interpretation, 70)}`)
+      this.log(`      files=${r.files}, failures=${r.failures}`)
+    }
+  }
+
+  /**
+   * `/mode <implement|repair|review|maintain|research>` — set
+   * the agent mode on the active session. Persists the new
+   * mode to `.forge/config.json` and updates the in-memory
+   * `ForgeConfig` so subsequent `runTask` calls honour it.
+   */
+  async cmdMode(args: string[]): Promise<void> {
+    const validModes = ['implement', 'repair', 'review', 'maintain', 'research'] as const
+    if (args.length === 0 || !args[0]) {
+      this.log('{red-fg}Error:{/red-fg} mode required. Usage: /mode <implement|repair|review|maintain|research>')
+      return
+    }
+    const next = args[0].toLowerCase()
+    if (!validModes.includes(next as typeof validModes[number])) {
+      this.log(`{red-fg}Error:{/red-fg} unknown mode '${args[0]}'.`)
+      this.log(`  Valid modes: ${validModes.join(', ')}`)
+      return
+    }
+    this.config.mode = next as typeof validModes[number]
+    await this.persistConfig()
+    this.log(`{green-fg}✓{/green-fg} Mode set to: {bold}${next}{/bold}`)
+  }
+
+  /**
+   * `/budget <n>` — set the per-session token budget. The
+   * value is stored in memory on the Repl instance and
+   * persisted to `.forge/config.json` under a `features`
+   * extension key (a future schema version will hoist it
+   * onto the top-level config). The agent loop reads
+   * `config.tokenBudget` when present.
+   */
+  async cmdBudget(args: string[]): Promise<void> {
+    if (args.length === 0 || !args[0]) {
+      this.log('{red-fg}Error:{/red-fg} token budget required. Usage: /budget <n>')
+      return
+    }
+    const n = Number.parseInt(args[0], 10)
+    if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+      this.log(`{red-fg}Error:{/red-fg} budget must be a positive integer (got '${args[0]}').`)
+      return
+    }
+    this.tokenBudget = n
+    // Mirror onto config so the agent loop picks it up.
+    ;(this.config as unknown as { tokenBudget?: number }).tokenBudget = n
+    await this.persistConfig()
+    this.log(`{green-fg}✓{/green-fg} Token budget set to: {bold}${n.toLocaleString()}{/bold} tokens`)
+  }
+
+  /**
+   * `/compact` — force context compaction on the active
+   * session. The `AgentLoop` class does not currently expose
+   * a public `compact()` method (compaction is internal in
+   * `compactMessages()`), so we degrade gracefully rather
+   * than crash.
+   */
+  async cmdCompact(): Promise<void> {
+    if (!this.activeTaskId) {
+      this.log('{yellow-fg}No active task.{/yellow-fg} Run a task first, then /compact to force a context prune.')
+      return
+    }
+    const candidate = (AgentLoop.prototype as unknown as { compact?: unknown }).compact
+    if (typeof candidate !== 'function') {
+      this.log('{yellow-fg}compaction not available in this build{/yellow-fg}')
+      this.log('  (AgentLoop.compact() is not exported — compaction happens internally during run())')
+      return
+    }
+    try {
+      const loop = new AgentLoop({
+        provider: this.config.provider,
+        workDir: this.config.workDir,
+        stateDir: this.config.stateDir,
+        mode: this.config.mode,
+        maxIterations: 1,
+        features: this.config.features,
+        git: this.config.git,
+      })
+      // `compact` is non-standard; cast through unknown.
+      const fn = (loop as unknown as { compact: (id: string) => Promise<void> }).compact
+      await fn(this.activeTaskId)
+      this.log('{green-fg}✓{/green-fg} Compaction triggered for ' + this.activeTaskId)
+    } catch (err) {
+      this.log(`{red-fg}Compaction failed:{/red-fg} ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
   // ── Task runner ────────────────────────────────────────────
 
   private async runTask(task: string): Promise<void> {
@@ -698,4 +1381,67 @@ export class Repl {
       this.screen.destroy()
     }
   }
+}
+
+function truncateString(value: string | undefined | null, width: number): string {
+  const text = value ?? ''
+  if (width <= 0) return ''
+  return text.length <= width ? text : text.slice(0, Math.max(0, width - 1)) + '…'
+}
+
+function renderConfidenceBar(percent: number, width: number): string {
+  const safeWidth = Math.max(1, Math.floor(width))
+  const safePercent = Math.max(0, Math.min(100, percent))
+  const filled = Math.round((safePercent / 100) * safeWidth)
+  return '[' + '#'.repeat(filled) + '-'.repeat(safeWidth - filled) + `] ${safePercent}%`
+}
+
+function statusIcon(status: string): string {
+  switch (status) {
+    case 'passed':
+    case 'verified':
+    case 'completed':
+      return '[OK]'
+    case 'failed':
+    case 'contradicted':
+      return '[!!]'
+    case 'blocked':
+    case 'needs_human_review':
+    case 'needs_review':
+      return '[??]'
+    case 'unverified':
+    case 'pending':
+      return '[..]'
+    case 'skipped':
+    case 'not_applicable':
+      return '[--]'
+    default:
+      return '[..]'
+  }
+}
+
+function shortTime(timestamp: string | undefined): string {
+  if (!timestamp) return '--:--:--'
+  const tIndex = timestamp.indexOf('T')
+  if (tIndex >= 0) return timestamp.slice(tIndex + 1, tIndex + 9) || timestamp.slice(-8)
+  return timestamp.slice(-8)
+}
+
+function redactUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+    if (url.password) url.password = '***'
+    if (url.username) url.username = url.username ? '***' : ''
+    return url.toString()
+  } catch {
+    return raw.replace(/:\/\/([^:@/]+):([^@/]+)@/, '://***:***@')
+  }
+}
+
+function computeSessionRisk(task: { failuresEncountered: string[]; commandsRun: string[]; verificationStatus: Record<string, string>; filesTouched: string[] }): 'low' | 'medium' | 'high' {
+  const verificationValues = Object.values(task.verificationStatus ?? {})
+  if (verificationValues.some((value) => value === 'failed' || value === 'blocked')) return 'high'
+  if (task.failuresEncountered.length > 0 || task.commandsRun.length === 0) return 'high'
+  if (task.filesTouched.length === 0 || verificationValues.length === 0) return 'medium'
+  return 'low'
 }

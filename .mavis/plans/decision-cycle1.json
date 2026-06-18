@@ -1,0 +1,12 @@
+{
+  "last_cycle": [
+    {
+      "task_id": "t00-foundation",
+      "verdict": "manual_retry",
+      "reason": "Three specific fixes, same worktree. The migration-on-demand design is fine, but the persistent `forge` database has no tables yet — every later track will hit 'relation does not exist' until migrations are run there. Also two real smells the verifier caught.\n\nFixes (small, all in foundation scope):\n\n1. Run migrations once against the persistent FORGE_DATABASE_URL database so the `forge` schema is loaded. Add a one-shot bootstrap path: `node packages/forge-cli/dist/cli.js state migrate` (or `forge doctor --migrate`) that calls store.runMigrations() against FORGE_DATABASE_URL and is idempotent. Verify with `FORGE_DATABASE_URL=postgres://forge:forge@localhost:54329/forge psql -c '\\dt'` that all 30 tables now exist. Re-run `pnpm test` and confirm the 5 currently-skipped migration tests now pass (because the DB schema is real, not just isolated test schemas).\n\n2. Drop the redundant `create table if not exists schema_migrations` DDL in store.ts bootstrap. All DDL belongs in migrations/schema.ts only — single source of truth. The migration runner must create schema_migrations first via its own migration's SQL (already does) and not duplicate it in code.\n\n3. Add dotenv loading to vitest.config.ts (or a setupFile) so `.env` is auto-loaded for tests. Currently vitest doesn't read .env, which is why 5 tests are silently SKIPPED rather than passing. After this, `pnpm test` should show real passes (not skips) for the migration tests. Update the producer's stop-condition claim accordingly: 'pnpm test: 39 passed, 0 skipped' (or whatever the real count becomes after re-count).\n\nReport the new commit hash in deliverable.md and re-run the verifier's literal checks (psql \\dt must list tables, pnpm test must show no skipped tests). Same task_id — keep the worktree."
+    }
+  ],
+  "next_cycle": [],
+  "plan_complete": false,
+  "message_to_user": "Foundation came back with one real issue — the persistent Postgres database has the schema defined but not applied yet, so later tracks would hit 'table doesn't exist' on first query. Sending it back for a small fix; same session keeps the worktree."
+}

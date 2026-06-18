@@ -25,6 +25,28 @@ export type { TracePanelFixture } from './panels/TracePanel.js'
 export { FailurePanel } from './panels/FailurePanel.js'
 export type { FailurePanelFixture } from './panels/FailurePanel.js'
 
+// ── t51: 6 additional read-only TUI panels ───────────────────────────────
+// Type names match the contract t53 left on disk (Probe / Contradiction /
+// StaleClaim / Decision / PatchCandidate / PrChecklistItem / PrCheckStatus /
+// CostStage) so the dashboard host's import paths stay stable.
+export { ProbePanel } from './panels/ProbePanel.js'
+export type { ProbePanelFixture, Probe } from './panels/ProbePanel.js'
+
+export { ContradictionPanel } from './panels/ContradictionPanel.js'
+export type { ContradictionPanelFixture, Contradiction, StaleClaim } from './panels/ContradictionPanel.js'
+
+export { DecisionPanel } from './panels/DecisionPanel.js'
+export type { DecisionPanelFixture, Decision } from './panels/DecisionPanel.js'
+
+export { CheckpointPanel } from './panels/CheckpointPanel.js'
+export type { CheckpointPanelFixture, PatchCandidate } from './panels/CheckpointPanel.js'
+
+export { PrReadinessPanel } from './panels/PrReadinessPanel.js'
+export type { PrReadinessPanelFixture, PrChecklistItem, PrCheckStatus } from './panels/PrReadinessPanel.js'
+
+export { CostPanel } from './panels/CostPanel.js'
+export type { CostPanelFixture, CostStage, CostTotals } from './panels/CostPanel.js'
+
 export { PanelsDashboard } from './panels-dashboard.js'
 export type { PanelsDashboardOptions, PanelsDashboardFixtures } from './panels-dashboard.js'
 

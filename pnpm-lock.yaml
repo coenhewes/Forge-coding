@@ -35,6 +35,12 @@ importers:
       '@forge/provider':
         specifier: workspace:*
         version: link:packages/forge-provider
+      '@forge/repo-graph':
+        specifier: workspace:*
+        version: link:packages/forge-repo-graph
+      '@forge/repo-intel':
+        specifier: workspace:*
+        version: link:packages/forge-repo-intel
       '@forge/state':
         specifier: workspace:*
         version: link:packages/forge-state
@@ -71,6 +77,12 @@ importers:
 
   packages/forge-agent:
     dependencies:
+      '@forge/belief':
+        specifier: workspace:*
+        version: link:../forge-belief
+      '@forge/context-server':
+        specifier: workspace:*
+        version: link:../forge-context-server
       '@forge/harness':
         specifier: workspace:*
         version: link:../forge-harness
@@ -80,9 +92,18 @@ importers:
       '@forge/provider':
         specifier: workspace:*
         version: link:../forge-provider
+      '@forge/repo-graph':
+        specifier: workspace:*
+        version: link:../forge-repo-graph
+      '@forge/repo-intel':
+        specifier: workspace:*
+        version: link:../forge-repo-intel
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state
+      '@forge/state-store':
+        specifier: workspace:*
+        version: link:../forge-state-store
       '@forge/trace':
         specifier: workspace:*
         version: link:../forge-trace
@@ -92,6 +113,9 @@ importers:
       '@forge/verification':
         specifier: workspace:*
         version: link:../forge-verification
+      '@forge/verification-planner':
+        specifier: workspace:*
+        version: link:../forge-verification-planner
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -118,6 +142,12 @@ importers:
       '@forge/agent':
         specifier: workspace:*
         version: link:../forge-agent
+      '@forge/integrations':
+        specifier: workspace:*
+        version: link:../forge-integrations
+      '@forge/provider':
+        specifier: workspace:*
+        version: link:../forge-provider
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state
@@ -175,6 +205,12 @@ importers:
 
   packages/forge-harness:
     dependencies:
+      '@forge/repo-graph':
+        specifier: workspace:*
+        version: link:../forge-repo-graph
+      '@forge/repo-intel':
+        specifier: workspace:*
+        version: link:../forge-repo-intel
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types
@@ -188,6 +224,9 @@ importers:
 
   packages/forge-integrations:
     dependencies:
+      '@forge/belief':
+        specifier: workspace:*
+        version: link:../forge-belief
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types
@@ -201,6 +240,9 @@ importers:
 
   packages/forge-pr:
     dependencies:
+      '@forge/belief':
+        specifier: workspace:*
+        version: link:../forge-belief
       '@forge/harness':
         specifier: workspace:*
         version: link:../forge-harness
@@ -222,6 +264,32 @@ importers:
         version: 5.9.3
 
   packages/forge-provider:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-repo-graph:
+    dependencies:
+      '@forge/types':
+        specifier: workspace:*
+        version: link:../forge-types
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/forge-repo-intel:
     dependencies:
       '@forge/types':
         specifier: workspace:*
@@ -281,9 +349,18 @@ importers:
       '@forge/agent':
         specifier: workspace:*
         version: link:../forge-agent
+      '@forge/belief':
+        specifier: workspace:*
+        version: link:../forge-belief
+      '@forge/pr':
+        specifier: workspace:*
+        version: link:../forge-pr
       '@forge/state':
         specifier: workspace:*
         version: link:../forge-state
+      '@forge/trace':
+        specifier: workspace:*
+        version: link:../forge-trace
       '@forge/types':
         specifier: workspace:*
         version: link:../forge-types

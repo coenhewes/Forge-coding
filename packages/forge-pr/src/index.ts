@@ -3,7 +3,6 @@ export {
   generatePRSummary,
 } from './pr-generator.js'
 export type {
-  ArtifactRef,
   PRGeneratorOutput,
   PRGeneratorSection,
   PRGeneratorMeta,
@@ -11,6 +10,9 @@ export type {
 export type { PRGeneratorInput, PRGeneratorOptions } from './pr-generator.js'
 export { renderPRBody } from './templates/pr-body.js'
 export type { PRBodyInput } from './templates/pr-body.js'
+// ArtifactRef lives in @forge/types (promoted from here) — re-export for
+// back-compat with any code still importing it from @forge/pr.
+export type { ArtifactRef } from '@forge/types'
 
 // v1 — kept as a thin compatibility shim so existing callers/tests
 // (tests/harness-pr.test.ts) continue to work. New code should call
@@ -18,6 +20,7 @@ export type { PRBodyInput } from './templates/pr-body.js'
 import { generatePRSummary } from './pr-generator.js'
 import type {
   AcceptanceContract,
+  ArtifactRef,
   Checkpoint,
   DecisionEntry,
   DomainManifest,
@@ -31,7 +34,6 @@ import type {
 import type { ClaimEvidenceGraph } from '@forge/belief'
 import type { ActiveVerificationPlan, TaskBeliefState, TaskRiskAssessment } from '@forge/types'
 import { getDomainManifests } from '@forge/harness'
-import type { ArtifactRef } from './types.js'
 import type { PRGeneratorOptions } from './pr-generator.js'
 
 export interface PRSummary {

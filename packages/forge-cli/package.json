@@ -12,6 +12,14 @@
     ".": {
       "types": "./dist/cli.d.ts",
       "import": "./dist/cli.js"
+    },
+    "./commands": {
+      "types": "./dist/commands/index.d.ts",
+      "import": "./dist/commands/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
     }
   },
   "scripts": {
@@ -26,6 +34,7 @@
     "@forge/state-store": "workspace:*",
     "@forge/verification": "workspace:*",
     "@forge/integrations": "workspace:*",
+    "@forge/provider": "workspace:*",
     "@forge/tui": "workspace:*"
   },
   "devDependencies": {

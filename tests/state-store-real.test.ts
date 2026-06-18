@@ -95,7 +95,7 @@ describe.skipIf(!HAS_DB)('@forge/state-store real-DB facade', () => {
     const health = await store.health()
     expect(health.ok).toBe(true)
     expect(health.postgresReachable).toBe(true)
-    expect(health.requiredSchemaVersion).toBe(2)
+    expect(health.requiredSchemaVersion).toBe(3)
     expect(health.tableCounts).toBeDefined()
     const tables = Object.keys(health.tableCounts ?? {})
     // Spot-check a handful of the most important tables.

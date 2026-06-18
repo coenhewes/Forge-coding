@@ -13,6 +13,25 @@ export { AnthropicProvider } from './anthropic.js'
 export { MinimaxProvider } from './minimax.js'
 export { ProviderError } from './base.js'
 
+// Provider catalog — static metadata for routing and CLI tooling.
+export {
+  PROVIDER_CATALOG,
+  getProviderEntry,
+  requireProviderEntry,
+  listProviderNames,
+  selectProvider,
+  defaultProviderConfig,
+  probeProvider,
+} from './catalog.js'
+export type {
+  ProviderCapabilities,
+  CostTier,
+  ProviderCatalogEntry,
+  ProviderPolicy,
+  ProviderSelection,
+  ProviderProbeReport,
+} from './catalog.js'
+
 /**
  * Environment variables checked for each provider's API key, in order. The
  * config value always wins; env is the fallback so secrets need not be written

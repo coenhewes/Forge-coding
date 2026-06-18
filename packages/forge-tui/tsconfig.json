@@ -12,6 +12,8 @@
     { "path": "../forge-types" },
     { "path": "../forge-state" },
     { "path": "../forge-verification" },
-    { "path": "../forge-belief" }
+    { "path": "../forge-belief" },
+    { "path": "../forge-trace" },
+    { "path": "../forge-pr" }
   ]
 }
