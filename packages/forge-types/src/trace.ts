@@ -17,6 +17,7 @@ export type TraceEventType =
   | 'review_comment'
   | 'pr_update'
   | 'subtask_completed'
+  | 'local_model_invoked'
   | 'error'
 
 export interface TraceEvent {

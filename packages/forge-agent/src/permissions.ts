@@ -50,6 +50,13 @@ export interface PermissionContext {
   domains: DomainManifest[]
   /** True when the agent is in a read-only mode (plan/review/etc). */
   readOnly: boolean
+  /**
+   * Names of the read-only semantic capability tools (e.g. `repo.find_callers`,
+   * `tests.list_suites`). These are discovery-only and are allowed by default;
+   * without this the default-deny rule blocks the agent from using the very
+   * tools it is told to prefer for localization.
+   */
+  capabilityTools?: readonly string[]
 }
 
 const DESTRUCTIVE_COMMAND_PATTERNS = [
@@ -164,6 +171,38 @@ export class PermissionEngine {
       reason: 'Non-destructive shell command allowed',
     })
 
+    // 3b. Safe state/management tools mutate only Forge's own durable state
+    //     (or run scoped checks) — never the filesystem destructively. Allow
+    //     them by default; without these the agent cannot record evidence,
+    //     verify acceptance, or finish a task at all (default-deny below).
+    const SAFE_STATE_TOOLS = [
+      'finish_task',
+      'update_acceptance',
+      'add_acceptance_criterion',
+      'run_verification',
+      'update_task_status',
+      'record_evidence',
+      'record_failure',
+      'record_decision',
+      'get_failure_reflection',
+      'verify_check',
+      'run_tests',
+      'create_checkpoint',
+      'rollback_checkpoint',
+      'add_subtask',
+      'complete_subtask',
+      'ask_question',
+      'request_domain_expansion',
+    ]
+    for (const tool of SAFE_STATE_TOOLS) {
+      rules.push({ tool, pattern: '*', action: 'allow', reason: `${tool} manages task state` })
+    }
+
+    // 3c. Read-only semantic capability tools (repo.*, tests.*, db.*, …).
+    for (const tool of ctx.capabilityTools ?? []) {
+      rules.push({ tool, pattern: '*', action: 'allow', reason: 'read-only semantic capability' })
+    }
+
     // 4. Build allow rules from each active domain's `allowedWrites`.
     for (const domain of ctx.domains) {
       for (const allowed of domain.allowedWrites ?? []) {
@@ -182,6 +221,19 @@ export class PermissionEngine {
       }
     }
 
+    // 4b. Fallback writes (non-read-only modes only; read-only returned above).
+    //     Domain allowedWrites above grant writes to specific paths, but a
+    //     synthesized/partial domain set often won't cover the file the task
+    //     actually needs to edit — leaving the agent unable to make any change
+    //     (default-deny). So allow writes anywhere inside the repo as a
+    //     catch-all, while still denying path traversal outside it. Domain
+    //     rules are listed first, so they still take precedence for their
+    //     paths; this only backfills everything else.
+    for (const tool of ['write_file', 'edit_file'] as const) {
+      rules.push({ tool, pattern: '*..*', action: 'deny', reason: 'path traversal outside the repo is not allowed' })
+      rules.push({ tool, pattern: '*', action: 'allow', reason: 'writes allowed inside the repo' })
+    }
+
     // 5. Default-deny: anything that didn't match an allow rule above.
     //    We achieve this by leaving the unmatched request to the chain's
     //    terminal rule, set below. Order matters — the caller can override
@@ -191,11 +243,16 @@ export class PermissionEngine {
   }
 
   /**
-   * Evaluate a tool call against the rule chain. The first matching
-   * rule decides. If no rule matches, the default is `deny` (fail-closed).
+   * Evaluate a tool call against the rule chain.
    *
-   * Special-case: `run_command` always escalates to `ask` when the
-   * command looks destructive — even if an `allow` rule matched.
+   * Precedence (fail-closed):
+   *   1. `run_command` that looks destructive → always `ask`.
+   *   2. Any matching `deny` rule wins, regardless of position. Explicit
+   *      denies (read-only mode, path traversal, forbidden paths added via
+   *      `addRule`) must not be overridable by a broad `allow` that happens to
+   *      appear earlier in the chain.
+   *   3. Otherwise the first matching `allow`/`ask` rule decides.
+   *   4. No match → `deny`.
    */
   evaluate(toolName: string, input: Record<string, unknown>): PermissionDecision {
     const candidate = pickPatternValue(toolName, input)
@@ -206,10 +263,20 @@ export class PermissionEngine {
         matchedRule: null,
       }
     }
+    const matches = (rule: PermissionRule): boolean =>
+      (rule.tool === toolName || rule.tool === '*') &&
+      candidate !== undefined &&
+      matchPattern(rule.pattern, candidate)
+
+    // 2. Explicit deny wins regardless of order.
     for (const rule of this.rules) {
-      if (rule.tool !== toolName && rule.tool !== '*') continue
-      if (candidate === undefined) continue
-      if (matchPattern(rule.pattern, candidate)) {
+      if (rule.action === 'deny' && matches(rule)) {
+        return { action: 'deny', reason: rule.reason, matchedRule: rule }
+      }
+    }
+    // 3. First matching allow/ask.
+    for (const rule of this.rules) {
+      if (matches(rule)) {
         return { action: rule.action, reason: rule.reason, matchedRule: rule }
       }
     }

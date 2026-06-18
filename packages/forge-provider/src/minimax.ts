@@ -15,6 +15,7 @@ import {
   mapAnthropicTools,
   getSystemMessage,
   mergeChunks,
+  safeParseToolInput,
 } from './base.js'
 
 const DEFAULT_BASE_URL = 'https://api.minimax.io/anthropic/v1'
@@ -118,14 +119,21 @@ export class MinimaxProvider implements ModelProvider {
 
     if (this.pendingToolCalls.size > 0) {
       const toolCalls: ToolCall[] = []
+      let truncated = false
       for (const [id, tc] of this.pendingToolCalls) {
-        toolCalls.push({
-          id,
-          name: tc.name,
-          input: tc.input ? JSON.parse(tc.input) : {},
-        })
+        const parsed = safeParseToolInput(tc.input)
+        if (parsed === undefined) {
+          // Tool args were unparseable — almost always because the response
+          // hit max_tokens mid-string. Drop this call and signal truncation so
+          // the loop can ask the model to retry with smaller output, instead of
+          // throwing and killing the whole run.
+          truncated = true
+          continue
+        }
+        toolCalls.push({ id, name: tc.name, input: parsed })
       }
-      yield { toolCalls, finishReason: 'tool_calls' }
+      if (toolCalls.length > 0) yield { toolCalls, finishReason: 'tool_calls' }
+      if (truncated) yield { finishReason: 'length' }
     }
   }
 

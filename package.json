@@ -13,7 +13,10 @@
     "doctor:migrate": "node -r dotenv/config packages/forge-cli/dist/cli.js doctor --migrate",
     "pretest": "pnpm build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "docs": "node docs/serve.mjs",
+    "link:global": "pnpm build && cd packages/forge-cli && npm link",
+    "unlink:global": "cd packages/forge-cli && npm unlink -g @forge/cli"
   },
   "engines": {
     "node": ">=18"
@@ -29,6 +32,7 @@
     "@forge/tui": "workspace:*",
     "@forge/trace": "workspace:*",
     "@forge/provider": "workspace:*",
+    "@forge/local-model": "workspace:*",
     "@forge/harness": "workspace:*",
     "@forge/repo-graph": "workspace:*",
     "@forge/repo-intel": "workspace:*",
