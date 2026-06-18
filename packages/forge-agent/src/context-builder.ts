@@ -198,15 +198,26 @@ export class AgentContextBuilder {
 
     parts.push(
       '',
-      '## CRITICAL INSTRUCTION: Tool Usage',
-      'You MUST use the available tools to complete this task. You can read files, write code, search code, run commands, and record state.',
-      'Do NOT apologize for lacking access or capabilities. You have all the tools you need.',
-      'Localize first: use the semantic capabilities (find_definitions, find_callers, find_related_tests, get_table_schema, …) to understand the code, then read specific files, then make changes.',
-      'Always run the relevant build/test/lint commands after making changes to verify they work correctly.',
-      'When the task is complete and verified, call finish_task.',
+      '## Workflow (follow this loop)',
+      'Drive the task to completion yourself — do not stop to ask for confirmation when you can make progress.',
+      '1. PLAN: decompose the task into concrete, VERIFIABLE acceptance criteria with `add_acceptance_criterion` (set required_checks like ["test","typecheck","build","boot"]). Track in-flight steps with `add_subtask`. For a big task (e.g. a full app), create many criteria — one per feature/endpoint/page — and work them to verified one by one.',
+      '2. LOCALIZE: use the semantic capabilities (find_definitions, find_callers, find_related_tests, get_table_schema, …) and `read_file` to understand the relevant code before editing. For a blank/new project, just start creating the needed files.',
+      '3. IMPLEMENT: make the change with `edit_file`/`write_file`. Work one subtask at a time; mark it done with `complete_subtask` as soon as it is finished (do not batch).',
+      '4. VERIFY: run `run_verification` (it runs the project\'s test/typecheck/build/boot checks and records pass/fail evidence). Read the output. If any check fails, fix it and re-run — do not move on.',
+      '5. RECORD: attach evidence to important claims with `record_evidence`; if a hypothesis was wrong, `record_failure` so you do not repeat it.',
+      '6. CLOSE OUT: once a criterion\'s required checks PASS in run_verification, call `update_acceptance` to mark it `verified` (this is rejected if the checks have not passed — the gate is evidence-backed, not your say-so). When ALL acceptance criteria are verified, call `finish_task` (status "completed").',
+      '',
+      '## Persistence',
+      '- Keep going until every acceptance criterion is verified. Each turn, take the next concrete action; do not end your turn with only a description of what you will do — actually call the tool.',
+      '- `finish_task("completed")` is REJECTED while any acceptance criterion is unverified, so verify them before finishing.',
+      '- If a tool call is denied or errors, adapt (try a different tool/approach) and continue. Only stop (finish_task "blocked") if you are truly stuck on something only a human can resolve.',
+      '',
+      '## Output size (important)',
+      '- Create files one at a time. For a large file, write a smaller first version then extend it with `edit_file` — a single tool call whose arguments exceed the model output limit will be truncated and dropped.',
+      '- Keep responses concise; communicate through tool calls and short status text, not long prose.',
       '',
       '## Available Tools',
-      'Use these tools to explore, edit, verify, and track your work.',
+      'Use these tools to explore, edit, verify, and track your work. Prefer dedicated tools (read_file/edit_file/write_file) over shell equivalents (cat/sed/echo).',
     )
 
     return parts.join('\n')

@@ -19,6 +19,7 @@
   "dependencies": {
     "@forge/types": "workspace:*",
     "@forge/provider": "workspace:*",
+    "@forge/local-model": "workspace:*",
     "@forge/harness": "workspace:*",
     "@forge/repo-graph": "workspace:*",
     "@forge/repo-intel": "workspace:*",

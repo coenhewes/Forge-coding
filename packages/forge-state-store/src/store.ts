@@ -247,13 +247,29 @@ export class ForgeStateStore {
     // so the cast is safe.
     return (await this.sql.begin(async (txSql) => {
       const repos = new Repos(txSql as unknown as never)
+      // Per-transaction cache: task_id → repo_id, to backfill trace events
+      // whose caller omitted the repo id without re-querying every time.
+      const traceRepoCache = new Map<string, string>()
       const ctx: TxContext = {
         repos,
         trace: async (event) => {
+          // trace_events.repo_id is NOT NULL. Callers don't always have the
+          // repo id handy (e.g. the belief store emits events keyed only by
+          // task), so resolve it from the task row within this same
+          // transaction when it's missing. One lookup, cached per tx.
+          let repoId = event.repoId ?? null
+          if (!repoId && event.taskId) {
+            repoId = traceRepoCache.get(event.taskId) ?? null
+            if (!repoId) {
+              const task = await repos.tasks.get(event.taskId)
+              repoId = task?.repoId ?? null
+              if (repoId) traceRepoCache.set(event.taskId, repoId)
+            }
+          }
           const row = await repos.trace.insert({
             id: randomUUID(),
             taskId: event.taskId ?? null,
-            repoId: event.repoId ?? null,
+            repoId,
             eventType: event.type,
             actor: event.actor ?? 'system',
             summary: event.summary,

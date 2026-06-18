@@ -35,3 +35,6 @@ export type { DoctorReport, DoctorProbe } from './doctor.js'
 
 export { runProviders } from './providers.js'
 export type { ProvidersListData, ProvidersListRow, ProvidersTestData } from './providers.js'
+
+export { runLocal } from './local.js'
+export type { LocalStatusData, LocalTestData } from './local.js'

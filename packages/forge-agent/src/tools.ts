@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { execSync } from 'node:child_process'
-import type { ToolDefinition, ToolCall, EvidenceKind, TaskStatus } from '@forge/types'
+import type { ToolDefinition, ToolCall, EvidenceKind, TaskStatus, VerificationCheckKind } from '@forge/types'
 import type { TaskStateEngine } from '@forge/state'
 import type { AcceptanceContractEngine } from '@forge/state'
 import type { EvidenceLedgerEngine } from '@forge/state'
@@ -8,6 +8,7 @@ import type { FailureLedgerEngine } from '@forge/state'
 import type { DecisionLedgerEngine } from '@forge/state'
 import type { VerificationMatrixEngine } from '@forge/verification'
 import type { CheckpointManager } from '@forge/verification'
+import { runVerification, type RunnableCheck } from './verification-bar.js'
 
 export type ToolHandler = (
   input: Record<string, unknown>,
@@ -189,8 +190,24 @@ export function createToolDefinitions(): ToolDefinition[] {
       },
     },
     {
+      name: 'run_verification',
+      description:
+        'Run the project\'s objective checks (auto-detected: test, typecheck, build, boot) and record passing/failing evidence per check. Call this to back an acceptance criterion before marking it verified — `update_acceptance("verified")` requires passing check evidence and is rejected otherwise.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          checks: {
+            type: 'array',
+            items: { type: 'string', enum: ['test', 'typecheck', 'build', 'boot'] },
+            description: 'Subset of checks to run. Omit to run all detected checks.',
+          },
+        },
+      },
+    },
+    {
       name: 'update_acceptance',
-      description: 'Mark an acceptance criterion as verified, failed, or needs_review.',
+      description:
+        'Mark an acceptance criterion as verified, failed, or needs_review. NOTE: "verified" requires that the checks this criterion needs have recently PASSED via run_verification — it is rejected otherwise.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -237,6 +254,24 @@ export function createToolDefinitions(): ToolDefinition[] {
           depends_on: { type: 'array', items: { type: 'string' }, description: 'Subtask IDs this depends on' },
         },
         required: ['label', 'description'],
+      },
+    },
+    {
+      name: 'add_acceptance_criterion',
+      description:
+        'Add a verifiable acceptance criterion to the contract. Use this to decompose a large task into concrete, checkable units of "done". Specify required_checks so the done-gate knows what must pass (e.g. ["test","typecheck","build","boot"]).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          description: { type: 'string', description: 'A concrete, verifiable statement of done' },
+          required_checks: {
+            type: 'array',
+            items: { type: 'string', enum: ['test', 'typecheck', 'build', 'boot', 'e2e'] },
+            description: 'Checks that must pass before this criterion is verified',
+          },
+          risk_area: { type: 'string', description: 'Optional risk area (e.g. auth, database)' },
+        },
+        required: ['description'],
       },
     },
     {
@@ -337,10 +372,12 @@ export class ToolExecutor {
       get_failure_reflection: this.handleGetFailureReflection.bind(this),
       record_decision: this.handleRecordDecision.bind(this),
       run_tests: this.handleRunTests.bind(this),
+      run_verification: this.handleRunVerification.bind(this),
       update_acceptance: this.handleUpdateAcceptance.bind(this),
       update_task_status: this.handleUpdateTaskStatus.bind(this),
       ask_question: this.handleAskQuestion.bind(this),
       add_subtask: this.handleAddSubtask.bind(this),
+      add_acceptance_criterion: this.handleAddAcceptanceCriterion.bind(this),
       complete_subtask: this.handleCompleteSubtask.bind(this),
       verify_check: this.handleVerifyCheck.bind(this),
       rollback_checkpoint: this.handleRollbackCheckpoint.bind(this),
@@ -537,17 +574,90 @@ export class ToolExecutor {
     }
   }
 
+  private async handleRunVerification(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
+    const kinds = Array.isArray(input.checks) ? (input.checks as RunnableCheck[]) : undefined
+    const results = await runVerification(ctx.workDir, kinds)
+    if (results.length === 0) {
+      return { content: 'No runnable checks detected (no test/typecheck/build/start scripts in package.json).' }
+    }
+    // Record each check result as durable verification + evidence so the
+    // done-gate can later confirm a criterion is truly verified.
+    for (const r of results) {
+      const status = r.passed ? 'passed' : 'failed'
+      const existing = await ctx.verificationEngine.updateStatus(ctx.taskId, r.kind, status, { notes: r.output.slice(0, 500) })
+      if (!existing) {
+        await ctx.verificationEngine.addEntry(ctx.taskId, r.kind, { status, notes: r.output.slice(0, 500) })
+      }
+      await ctx.taskEngine.addTestRun(ctx.taskId, r.command)
+    }
+    const lines = results.map((r) => `${r.passed ? '✓' : '✗'} ${r.kind}: ${r.command}`)
+    const failed = results.filter((r) => !r.passed)
+    return {
+      content:
+        `Verification results:\n${lines.join('\n')}\n\n` +
+        (failed.length === 0
+          ? 'All checks passed. You may now update_acceptance for criteria backed by these checks.'
+          : `${failed.length} check(s) FAILED. Fix the issues and re-run run_verification. First failure output:\n${failed[0]!.output.slice(-1500)}`),
+    }
+  }
+
   private async handleUpdateAcceptance(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
     const contract = await ctx.acceptanceEngine.getContract(ctx.taskId)
     if (!contract) return { content: 'No acceptance contract found.' }
+    const criterionId = input.criterion_id as string
+    const status = input.status as 'verified' | 'failed' | 'needs_review' | 'skipped' | 'blocked'
+
+    // Evidence-backed gate: "verified" requires the criterion's required checks
+    // to have PASSED via run_verification. The model cannot self-declare done.
+    if (status === 'verified') {
+      const criterion = contract.criteria.find((c) => c.id === criterionId)
+      const entries = await ctx.verificationEngine.getEntries(ctx.taskId)
+      const passed = new Set(entries.filter((e) => e.status === 'passed').map((e) => e.check))
+      const required = criterion?.requiredChecks ?? []
+      const missing = required.filter((c) => !passed.has(c))
+      if (required.length > 0 && missing.length > 0) {
+        return {
+          content:
+            `Cannot verify ${criterionId}: required checks not passing: ${missing.join(', ')}. ` +
+            `Run run_verification (and fix failures) so these checks pass, then mark it verified.`,
+        }
+      }
+      if (required.length === 0 && passed.size === 0) {
+        return {
+          content:
+            `Cannot verify ${criterionId}: no passing verification evidence yet. ` +
+            `Run run_verification first (tests/typecheck/build), then mark it verified.`,
+        }
+      }
+    }
 
     await ctx.acceptanceEngine.updateCriterionStatus(
       ctx.taskId,
-      input.criterion_id as string,
-      input.status as 'verified' | 'failed' | 'needs_review' | 'skipped' | 'blocked',
+      criterionId,
+      status,
       input.evidence_ref as string,
     )
-    return { content: `Updated acceptance criterion ${input.criterion_id} → ${input.status}` }
+    return { content: `Updated acceptance criterion ${criterionId} → ${status}` }
+  }
+
+  private async handleAddAcceptanceCriterion(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
+    const description = (input.description as string)?.trim()
+    if (!description) return { content: 'add_acceptance_criterion requires a description.' }
+    const contract = await ctx.acceptanceEngine.getContract(ctx.taskId)
+    if (!contract) return { content: 'No acceptance contract found.' }
+    const id = `ac-${contract.criteria.length + 1}-${Math.random().toString(36).slice(2, 6)}`
+    const requiredChecks = Array.isArray(input.required_checks)
+      ? (input.required_checks as VerificationCheckKind[])
+      : undefined
+    await ctx.acceptanceEngine.addCriterion(ctx.taskId, {
+      id,
+      description,
+      status: 'needs_review',
+      evidenceRefs: [],
+      riskArea: input.risk_area as string | undefined,
+      requiredChecks,
+    })
+    return { content: `Added acceptance criterion ${id}: ${description}${requiredChecks ? ` [checks: ${requiredChecks.join(', ')}]` : ''}` }
   }
 
   private async handleUpdateTaskStatus(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
@@ -658,6 +768,23 @@ export class ToolExecutor {
   ): Promise<{ content: string; metadata?: Record<string, unknown> }> {
     const status = (input.status as string) || 'completed'
     const summary = (input.summary as string) ?? ''
+
+    // Gate: refuse a premature "completed" while acceptance criteria are not
+    // all verified. This keeps the run honest — the model cannot declare
+    // success without the supporting evidence. ('blocked'/'failed' are always
+    // allowed, since those are honest non-success terminal states.)
+    if (status === 'completed') {
+      const acc = await ctx.acceptanceEngine.getCompletionStatus(ctx.taskId)
+      if (!acc.allVerified) {
+        return {
+          content:
+            `finish_task rejected: only ${acc.verified}/${acc.total} acceptance criteria are verified. ` +
+            `Implement and verify the remaining criteria (edit_file, run_tests, then update_acceptance to mark ` +
+            `each one "verified" with evidence) before calling finish_task.`,
+        }
+      }
+    }
+
     await ctx.taskEngine.updateStatus(ctx.taskId, status as TaskStatus)
     if (summary) await ctx.taskEngine.setNextAction(ctx.taskId, summary)
     return {

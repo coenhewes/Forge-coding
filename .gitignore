@@ -4,3 +4,6 @@ dist/
 *.tsbuildinfo
 .env
 .local/
+
+# local agent test sandbox (own git repo)
+sandbox/
