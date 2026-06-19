@@ -24,6 +24,7 @@ import type { AgentResult, AgentConfig } from '@forge/agent'
 import type { CommandResult, ParsedArgs } from './output.js'
 import { getOption } from './output.js'
 import { createRunRenderer } from './run-renderer.js'
+import { longHorizonBudget, runPreflight } from '../preflight.js'
 
 export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentResult | { taskId: string; status: string; summary: string }>> {
   const filePath = getOption(parsed, 'file')
@@ -60,24 +61,30 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
     config = await initConfig()
   }
 
-  // Long-horizon budget from flags: --hours <n> and/or --max-iterations <n>.
-  const hours = Number(getOption(parsed, 'hours'))
-  const maxIters = Number(getOption(parsed, 'max-iterations'))
-  const budget: AgentConfig['budget'] = {
-    maxWallClockMs: Number.isFinite(hours) && hours > 0 ? Math.round(hours * 3600_000) : undefined,
-    maxIterations: Number.isFinite(maxIters) && maxIters > 0 ? maxIters : undefined,
+  const preflight = await runPreflight({ command: 'run', config, parsed, requireLocalApproval: true })
+  if (preflight.fatal) {
+    return {
+      ok: false,
+      exitCode: 1,
+      data: { taskId: 'unknown', status: 'preflight_failed', summary: preflight.errors.join(' ') },
+      message: 'forge run: preflight failed',
+      textLines: preflight.textLines,
+    }
   }
+
+  const budget = longHorizonBudget(parsed)
 
   const agentConfig: AgentConfig = {
     provider: config.provider,
     workDir: config.workDir,
     stateDir: config.stateDir,
     mode: config.mode,
-    // Default cap stays modest; --hours/--max-iterations raise it for long runs.
-    maxIterations: budget.maxIterations ?? 50,
-    budget: budget.maxWallClockMs || budget.maxIterations ? budget : undefined,
+    maxIterations: budget.maxIterations,
+    budget,
     features: config.features,
     git: config.git,
+    stateStore: preflight.stateStore,
+    stateStoreMode: preflight.stateMode,
     // Activate the non-authoritative local-model layer (compaction/triage)
     // when configured. Falls back to deterministic behavior if unavailable.
     localModel: config.localModel,
@@ -91,6 +98,8 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
     `Mode: ${config.mode}`,
     `Work dir: ${config.workDir}`,
     `State dir: ${config.stateDir}`,
+    '',
+    ...preflight.textLines,
     '',
     '[1/5] Scanning repository...',
     '[2/5] Routing task to domains...',
@@ -137,10 +146,10 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
   ]
 
   if (result.status === 'blocked') {
-    summaryLines.push('', `⚠ Task is blocked. Use: forge resume ${result.taskId}`)
+    summaryLines.push('', `⚠ Task is blocked waiting for a human decision. Open Forge with no args and select Continue/Answer for ${result.taskId}.`)
   }
   if (result.status === 'paused') {
-    summaryLines.push('', `⏸ Budget reached — task paused (resumable). Use: forge resume ${result.taskId}`)
+    summaryLines.push('', `⏸ Budget reached — task paused with durable state. Open Forge and choose Continue for ${result.taskId}.`)
   }
 
   return {

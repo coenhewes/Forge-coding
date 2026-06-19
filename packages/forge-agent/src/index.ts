@@ -11,7 +11,7 @@ export { PermissionEngine, matchPattern, isDestructiveCommand } from './permissi
 export type { PermissionAction, PermissionRule, PermissionDecision, PermissionContext } from './permissions.js'
 
 export { compactToolResult, DEFAULT_TOOL_RESULT_BUDGET } from './tool-output.js'
-export type { CompactedToolResult, CompactOptions } from './tool-output.js'
+export type { CompactedToolResult, CompactOptions, ToolCompressionStrategy, ToolCompressionSavings } from './tool-output.js'
 
 export { nextStage, topHypothesisFor, openClaimsFor, DEFAULT_EDIT_CONFIDENCE, DEFAULT_MAX_PROBES_PER_PASS } from './stages.js'
 export type { StageName, StageContext, StageDecision } from './stages.js'

@@ -99,6 +99,18 @@ describe('LocalModelService — happy paths', () => {
     expect(sinks.traces).toHaveLength(1)
   })
 
+  it('summarize accepts clean raw text from local models that ignore JSON formatting', async () => {
+    const { service } = makeService({
+      enabled: 'on',
+      provider: fakeProvider('Expired-token auth test fails at src/auth.ts:42.'),
+    })
+    const res = await service.summarize({ taskId: 't1', content: 'x'.repeat(5000), label: 'pnpm test' })
+
+    expect(res.provenance.fallbackUsed).toBe(false)
+    expect(res.summary).toContain('Expired-token auth test fails')
+    expect(res.authoritative).toBe(false)
+  })
+
   it('classify snaps to an allowed label with confidence', async () => {
     const { service } = makeService({
       enabled: 'on',
@@ -143,6 +155,25 @@ describe('LocalModelService — happy paths', () => {
     expect([...res.order].sort()).toEqual([0, 1, 2])
     expect(res.order[0]).toBe(2)
     expect(res.scores).toHaveLength(3)
+  })
+
+  it('draft returns advisory text that requires frontier review', async () => {
+    const { service, sinks } = makeService({
+      enabled: 'on',
+      provider: fakeProvider('export const answer = 42'),
+    })
+    const res = await service.draft({
+      taskId: 't1',
+      prompt: 'Draft a tiny TypeScript constant.',
+      kind: 'boilerplate',
+    })
+
+    expect(res.authoritative).toBe(false)
+    expect(res.requiresFrontierReview).toBe(true)
+    expect(res.kind).toBe('boilerplate')
+    expect(res.draft).toContain('answer')
+    expect(sinks.artifacts.length).toBeGreaterThanOrEqual(2)
+    expect(sinks.runs[0]?.taskKind).toBe('draft')
   })
 
   it('embed delegates to the embedding provider', async () => {

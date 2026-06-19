@@ -24,6 +24,9 @@ export type {
 export { CompactionPolicy } from './compaction.js'
 export type { CompactionPolicyConfig, CompactionResult } from './compaction.js'
 
+export { LocalContextIndex } from './context-index.js'
+export type { LocalContextIndexConfig } from './context-index.js'
+
 export { cosineSimilarity, rankBySimilarity } from './similarity.js'
 export type { RankedItem } from './similarity.js'
 

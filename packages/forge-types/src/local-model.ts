@@ -27,7 +27,7 @@
 import type { ProviderConfig } from './provider.js'
 
 /** The bounded sub-tasks the local layer can perform. */
-export type LocalTaskKind = 'summarize' | 'classify' | 'extract' | 'rerank' | 'embed'
+export type LocalTaskKind = 'summarize' | 'classify' | 'extract' | 'rerank' | 'embed' | 'retrieve' | 'draft'
 
 /**
  * How the local layer is enabled:
@@ -59,6 +59,24 @@ export interface LocalModelUsage {
   outputTokens?: number
 }
 
+export type LocalCompressionStrategy =
+  | 'none'
+  | 'head_tail'
+  | 'json_array'
+  | 'search_results'
+  | 'log'
+  | 'diff_or_code'
+  | 'semantic_summary'
+
+export interface LocalModelSavings {
+  originalBytes?: number
+  emittedBytes?: number
+  estimatedOriginalTokens?: number
+  estimatedEmittedTokens?: number
+  estimatedTokensSaved?: number
+  strategy?: LocalCompressionStrategy
+}
+
 /**
  * Provenance attached to every local-model result. The artifact ids are the
  * stable references through which the exact input and output are recoverable
@@ -75,6 +93,10 @@ export interface LocalModelProvenance {
   confidence?: number
   /** True when the deterministic fallback produced this result. */
   fallbackUsed: boolean
+  /** Machine-readable reason for deterministic fallback, if known. */
+  fallbackReason?: string
+  /** Estimated compression/cost impact; advisory observability only. */
+  savings?: LocalModelSavings
   /** Stable ref to the artifact holding the exact input. */
   sourceArtifactId?: string
   /** Stable ref to the artifact holding the model output. */
@@ -157,6 +179,61 @@ export interface EmbedResult extends LocalModelResultBase {
   dim: number
 }
 
+export type RetrieveTargetType =
+  | 'graph_node'
+  | 'evidence_artifact'
+  | 'claim'
+  | 'text'
+  | 'artifact'
+  | 'file'
+  | 'task_state'
+  | 'decision'
+  | 'failure'
+
+export interface RetrieveCandidate {
+  id: string
+  targetType: RetrieveTargetType
+  targetRef: string
+  content: string
+  lexicalScore?: number
+  semanticScore?: number
+  score: number
+  metadata?: Record<string, unknown>
+}
+
+export interface RetrieveRequest {
+  taskId?: string
+  repoId?: string
+  query: string
+  candidates?: Array<{
+    targetType: RetrieveCandidate['targetType']
+    targetRef: string
+    content: string
+    metadata?: Record<string, unknown>
+  }>
+  limit?: number
+}
+
+export interface RetrieveResult extends LocalModelResultBase {
+  query: string
+  results: RetrieveCandidate[]
+}
+
+export interface DraftRequest {
+  taskId: string
+  prompt: string
+  context?: string
+  kind?: 'boilerplate' | 'test_skeleton' | 'small_patch' | 'migration_template' | 'notes'
+  targetTokens?: number
+}
+
+export interface DraftResult extends LocalModelResultBase {
+  draft: string
+  kind: NonNullable<DraftRequest['kind']>
+  /** Drafts are patch candidates only; the frontier model must accept/rewrite. */
+  requiresFrontierReview: true
+}
+
 /* ---------------------------------------------------------------- *
  *  Embedding provider — kept separate from `ModelProvider` so the
  *  core chat interface is not bloated. Implemented by providers that
@@ -193,6 +270,8 @@ export interface LocalModelRun {
   inputTokens?: number
   outputTokens?: number
   confidence?: number
+  fallbackReason?: string
+  savings?: LocalModelSavings
   fallbackUsed: boolean
   createdAt: string
 }

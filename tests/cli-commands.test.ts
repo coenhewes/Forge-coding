@@ -227,31 +227,25 @@ describe('runRun', () => {
     expect(result.textLines?.[0]).toContain('cannot read --file')
   })
 
-  it('runs a task and returns an AgentResult-shaped payload', async () => {
+  it('blocks normal runs when Postgres is not configured', async () => {
     await withIsolatedStateDir()
-    // runRun builds an AgentLoop; the loop needs a workdir with a
-    // minimal repo. We point cwd at the existing repo (Forge-coding
-    // itself) so scanRepository finds something.
     process.chdir(originalWorkdir)
-    // Provide a real config so the agent loop uses known provider.
     const { initConfig } = await import('@forge/cli/config')
     await initConfig()
     const result = await runRun(parseArgs(['--json', 'summarize the repo']))
-    // The loop is short-circuited by the model in test envs only if
-    // we wire a fake provider; here we accept either a real run
-    // (provider may error) or a structured error. Either way the
-    // data shape must be present and exitCode must be 0/2, not 1.
+    expect(result.ok).toBe(false)
+    expect(result.exitCode).toBe(1)
+    expect(result.textLines?.join('\n')).toContain('Postgres is required')
+  })
+
+  it('allows explicit degraded file-mode runs', async () => {
+    await withIsolatedStateDir()
+    process.chdir(originalWorkdir)
+    const { initConfig } = await import('@forge/cli/config')
+    await initConfig()
+    const result = await runRun(parseArgs(['--state-mode=file', '--allow-no-local', '--json', 'summarize the repo']))
     expect([0, 2]).toContain(result.exitCode)
-    if (result.ok) {
-      expect(result.data).toBeDefined()
-      expect((result.data as { taskId: string }).taskId).toBeTruthy()
-    } else {
-      // Failure path: data is a minimal {taskId, status, summary}
-      const data = result.data as { taskId: string; status: string; summary: string }
-      expect(data.taskId).toBe('unknown')
-      expect(data.status).toBe('error')
-      expect(data.summary).toBeTruthy()
-    }
+    expect(result.data).toBeDefined()
   })
 })
 

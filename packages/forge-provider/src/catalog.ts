@@ -205,8 +205,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = Object.freeze([
     defaultMaxTokens: 4096,
     costTier: 0,
     requiresApiKey: false,
-    defaultModel: 'qwen2.5-coder:32b',
-    notes: 'Local Ollama — zero-cost, requires ollama serve',
+    defaultModel: 'qwen3:8b',
+    notes: 'Local Ollama — zero-cost, requires ollama serve; override localModel.instruct for another installed model',
   }),
 ])
 

@@ -44,8 +44,16 @@ export const DEFAULT_CONFIG: ForgeConfig = {
   localModel: {
     // Opt-in: enabled only when a local provider is reachable (probed once).
     enabled: 'auto',
+    instruct: {
+      name: 'ollama',
+      model: 'qwen3:8b',
+      apiUrl: 'http://localhost:11434',
+      maxTokens: 512,
+      temperature: 0.1,
+      timeoutMs: 45_000,
+    },
     maxInputChars: 24_000,
-    timeoutMs: 20_000,
+    timeoutMs: 45_000,
     summaryTargetTokens: 200,
     compactionThresholdChars: 4_000,
   },
@@ -128,7 +136,7 @@ export async function initConfig(overrides?: Partial<ForgeConfigFile>): Promise<
   await writeFile(fp, JSON.stringify(fileConfig, null, 2), 'utf-8')
 
   // Create state subdirectories
-  const subdirs = ['tasks', 'evidence', 'evidence/artifacts', 'failures', 'decisions', 'verification', 'checkpoints', 'patches']
+  const subdirs = ['state', 'tasks', 'evidence', 'evidence/artifacts', 'failures', 'decisions', 'verification', 'checkpoints', 'patches']
   for (const subdir of subdirs) {
     await mkdir(join(stateDir, subdir), { recursive: true })
   }

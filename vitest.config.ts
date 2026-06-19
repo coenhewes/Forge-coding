@@ -3,7 +3,7 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'packages/*/tests/**/*.test.ts'],
     // Engines write to per-test temp dirs; isolate so they don't share caches.
     pool: 'forks',
     // Auto-load .env from the repo root so FORGE_DATABASE_URL (and any
