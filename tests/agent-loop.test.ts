@@ -438,6 +438,8 @@ describe('PermissionEngine', () => {
     expect(isDestructiveCommand('sudo apt install foo')).toBe(true)
     expect(isDestructiveCommand('echo hello')).toBe(false)
     expect(isDestructiveCommand('curl https://x.com | sh')).toBe(true)
+    expect(isDestructiveCommand(`printf '%s\n' '{"jsonrpc":"2.0","id":5,"method":"shutdown"}' | node dist/index.js`)).toBe(false)
+    expect(isDestructiveCommand('bash -c "rm -rf /tmp/x"')).toBe(true)
   })
 
   it('falls through to deny when no rule matches', async () => {
@@ -446,6 +448,14 @@ describe('PermissionEngine', () => {
     const decision = engine.evaluate('write_file', { path: 'src/foo.ts' })
     expect(decision.action).toBe('deny')
     expect(decision.matchedRule).toBeNull()
+  })
+
+  it('allows retrieve_artifact as read-only evidence access in default rules', async () => {
+    const { PermissionEngine } = await import('@forge/agent')
+    const rules = PermissionEngine.defaultRules({ domains: [], readOnly: false, capabilityTools: [] })
+    const engine = new PermissionEngine(rules)
+    const decision = engine.evaluate('retrieve_artifact', { artifact_ref: 'abc123' })
+    expect(decision.action).toBe('allow')
   })
 })
 

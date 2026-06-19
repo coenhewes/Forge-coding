@@ -68,6 +68,7 @@ const DESTRUCTIVE_COMMAND_PATTERNS = [
   /\bchmod\s+777\b/,
   /\bchown\s+-R\b/,
   /\bkill\s+-9\b/,
+  /\b(?:sh|bash|zsh)\s+-c\b/,
   /\bshutdown\b/,
   /\breboot\b/,
   /\bcurl\s+[^|]*\|\s*(?:sh|bash)\b/,
@@ -87,7 +88,14 @@ export function matchPattern(pattern: string | undefined, value: string): boolea
 
 /** Test whether a shell command looks destructive. */
 export function isDestructiveCommand(command: string): boolean {
-  return DESTRUCTIVE_COMMAND_PATTERNS.some((re) => re.test(command))
+  const commandSurface = stripQuotedShellPayloads(command)
+  return DESTRUCTIVE_COMMAND_PATTERNS.some((re) => re.test(commandSurface))
+}
+
+function stripQuotedShellPayloads(command: string): string {
+  return command
+    .replace(/'([^'\\]|\\.)*'/g, "''")
+    .replace(/"([^"\\]|\\.)*"/g, '""')
 }
 
 export class PermissionEngine {
@@ -160,6 +168,12 @@ export class PermissionEngine {
       pattern: '*',
       action: 'allow',
       reason: 'glob_files is always allowed',
+    })
+    rules.push({
+      tool: 'retrieve_artifact',
+      pattern: '*',
+      action: 'allow',
+      reason: 'retrieve_artifact is read-only evidence access',
     })
 
     // 3. Non-destructive shell commands are allowed by default.

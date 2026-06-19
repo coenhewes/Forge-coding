@@ -17,6 +17,7 @@
  */
 import { loadConfig, initConfig } from '../config.js'
 import { TaskStateEngine } from '@forge/state'
+import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { CommandResult, ParsedArgs } from './output.js'
 
 export interface SessionRow {
@@ -33,6 +34,9 @@ export async function runSessions(_parsed: ParsedArgs): Promise<CommandResult<{ 
   void _parsed
   let config = await loadConfig()
   if (!config) config = await initConfig()
+
+  const pg = await listPostgresSessions(config).catch(() => undefined)
+  if (pg) return pg
 
   const engine = new TaskStateEngine({ stateDir: config.stateDir })
   const fileIds = await engine.listTasks()
@@ -68,7 +72,41 @@ export async function runSessions(_parsed: ParsedArgs): Promise<CommandResult<{ 
     ok: true,
     exitCode: 0,
     data: { count: tasks.length, tasks },
-    message: tasks.length === 0 ? 'No tasks found.' : `${tasks.length} task(s) in state store`,
+    message: tasks.length === 0 ? 'No tasks found.' : `${tasks.length} task(s) in degraded file state`,
+    textLines,
+  }
+}
+
+async function listPostgresSessions(config: Awaited<ReturnType<typeof loadConfig>>): Promise<CommandResult<{ count: number; tasks: SessionRow[] }> | undefined> {
+  if (!config || !process.env.FORGE_DATABASE_URL) return undefined
+  const store = new ForgeStateStore({ config: defaultStateStoreConfig(config.workDir, process.env.FORGE_DATABASE_URL) })
+  await store.init()
+  const repo = await store.repos.repos.getByRootPath(config.workDir)
+  if (!repo) return { ok: true, exitCode: 0, data: { count: 0, tasks: [] }, message: 'No tasks found in Postgres state store.', textLines: ['No tasks found in Postgres state store.'] }
+  const rows = await store.repos.tasks.listByRepo(repo.id)
+  const tasks: SessionRow[] = rows.map((t) => ({
+    taskId: t.id,
+    status: t.status,
+    currentInterpretation: t.interpretedGoal ?? t.originalRequest,
+    subtaskProgress: '',
+    updatedAt: t.updatedAt,
+    filesTouched: Array.isArray(t.payload.filesTouched) ? t.payload.filesTouched.length : 0,
+    failuresEncountered: 0,
+  }))
+  const textLines = tasks.length === 0
+    ? ['No tasks found in Postgres state store.']
+    : [
+        `Tasks (${tasks.length}) — Postgres:`,
+        ...tasks.map((t) => {
+          const icon = t.status === 'completed' ? '✓' : t.status === 'failed' ? '✗' : t.status === 'blocked' ? '⚠' : '○'
+          return `  ${icon} ${t.taskId} — ${t.status} — ${t.currentInterpretation.slice(0, 80)}`
+        }),
+      ]
+  return {
+    ok: true,
+    exitCode: 0,
+    data: { count: tasks.length, tasks },
+    message: tasks.length === 0 ? 'No tasks found in Postgres state store.' : `${tasks.length} task(s) in Postgres state store`,
     textLines,
   }
 }

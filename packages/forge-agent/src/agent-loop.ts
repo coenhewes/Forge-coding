@@ -62,7 +62,8 @@ import { ToolExecutor, createToolDefinitions } from './tools.js'
 import type { ToolExecutionContext } from './tools.js'
 import { PermissionEngine } from './permissions.js'
 import type { PermissionDecision, PermissionRule } from './permissions.js'
-import { compactToolResult } from './tool-output.js'
+import { compactToolResult, DEFAULT_TOOL_RESULT_BUDGET } from './tool-output.js'
+import type { ToolCompressionSavings } from './tool-output.js'
 import { nextStage, topHypothesisFor, openClaimsFor } from './stages.js'
 import type { StageContext, StageName } from './stages.js'
 
@@ -504,9 +505,28 @@ export class AgentLoop {
    * continues from where it left off.
    */
   async resume(taskId: string): Promise<AgentResult> {
-    const state = await this.taskEngine.getTask(taskId)
+    let state = await this.taskEngine.getTask(taskId)
     if (!state) {
-      throw new Error(`Cannot resume: task ${taskId} not found in file state`)
+      const store = this.config.stateStore ?? (
+        this.config.stateStoreMode === 'postgres' || (this.config.stateStoreMode !== 'file' && process.env.FORGE_DATABASE_URL)
+          ? new ForgeStateStore({ config: defaultStateStoreConfig(this.config.workDir, process.env.FORGE_DATABASE_URL) })
+          : undefined
+      )
+      if (store) {
+        await store.init()
+        this.stateStore = store
+        const durableTask = await store.repos.tasks.get(taskId)
+        if (durableTask) {
+          state = await this.taskEngine.createTask(taskId, durableTask.originalRequest, {
+            status: 'pending',
+            currentInterpretation: durableTask.interpretedGoal ?? durableTask.originalRequest,
+            nextAction: durableTask.nextAction ?? 'Resume from durable Postgres state',
+          })
+        }
+      }
+    }
+    if (!state) {
+      throw new Error(`Cannot resume: task ${taskId} not found in durable state`)
     }
     return this.runWithId(state.originalRequest, taskId, { resumed: true })
   }
@@ -604,7 +624,7 @@ export class AgentLoop {
       taskId,
       task,
       iteration: 0,
-      messages: options.resumed ? this.resumeMessages(task, taskId) : [],
+      messages: options.resumed ? await this.resumeMessages(task, taskId) : [],
       stage: 'LOCALIZE',
       probesThisPass: 0,
       passId: 0,
@@ -946,14 +966,35 @@ export class AgentLoop {
       toolCallId: probeToolCall.id,
     })
 
-    // Persist probe outcome to belief store.
-    await this.beliefStore.addProbe(internal.taskId, internal.topProbe)
-    await this.beliefStore.recordProbeResult(
-      internal.taskId,
-      internal.topProbe.id,
-      'inconclusive',
-      `Probe result (${compacted.totalBytes} bytes) captured.`,
-    )
+    // Persist probe outcome to belief store. Planner ids are semantic strings
+    // (`probe:<task>:<capability>:...`), while Postgres probe ids are UUIDs.
+    // Keep the semantic id in payload/input and use a stable UUID as the row id.
+    const durableProbeId = stableUuid(internal.topProbe.id)
+    try {
+      await this.beliefStore.addProbe(internal.taskId, {
+        ...internal.topProbe,
+        id: durableProbeId,
+        input: {
+          ...(internal.topProbe.input ?? {}),
+          plannerProbeId: internal.topProbe.id,
+        },
+      })
+      await this.beliefStore.recordProbeResult(
+        internal.taskId,
+        durableProbeId,
+        result.content.startsWith('Error:') ? 'contradicts' : 'inconclusive',
+        `Probe result (${compacted.totalBytes} bytes) captured.`,
+      )
+    } catch (err) {
+      await this.failureEngine.addEntry(
+        internal.taskId,
+        `Persist probe result ${internal.topProbe.id}`,
+        internal.topProbe.capability,
+        err instanceof Error ? err.message : String(err),
+        'Probe persistence failed; continue with file-backed trace and avoid crashing the run.',
+        { nextHypothesis: 'Use primitive tools or a corrected probe input instead of relying on this probe row.' },
+      )
+    }
 
     return {}
   }
@@ -1309,15 +1350,41 @@ export class AgentLoop {
       }
       if (result.metadata?.type === 'question') {
         const question = String(result.metadata?.question ?? 'Needs human input')
-        await this.taskEngine.addQuestion(internal.taskId, {
-          question,
-          options: result.metadata?.options as { label: string; description: string }[] | undefined,
-          resolved: false,
-          timestamp: new Date().toISOString(),
+        const options = result.metadata?.options as { label: string; description: string }[] | undefined
+        const recommendation = String(result.metadata?.recommendation ?? options?.[0]?.label ?? 'Use Forge recommended default')
+        const riskLevel = String(result.metadata?.riskLevel ?? result.metadata?.risk_level ?? 'low')
+        const requiresHuman = Boolean(result.metadata?.requiresHuman ?? result.metadata?.requires_human) || riskLevel === 'high' || riskLevel === 'critical'
+        if (requiresHuman) {
+          await this.taskEngine.addQuestion(internal.taskId, {
+            question,
+            options,
+            resolved: false,
+            timestamp: new Date().toISOString(),
+          })
+          await this.taskEngine.setNextAction(internal.taskId, `Waiting for human input: ${question}`)
+          terminalSignal = { status: 'blocked', summary: result.content }
+          break
+        }
+
+        const rejected = (options ?? [])
+          .map((option) => option.label)
+          .filter((label) => label !== recommendation)
+        const decision = `Auto-selected default: ${recommendation}`
+        await this.decisionEngine.addEntry(
+          internal.taskId,
+          decision,
+          `Forge continued autonomously because ask_question was marked low/medium risk. Question: ${question}`,
+          rejected,
+          { domain: `autonomy:${riskLevel}` },
+        )
+        await this.taskEngine.addDecision(internal.taskId, decision)
+        await this.taskEngine.setNextAction(internal.taskId, `Continuing with default decision: ${recommendation}`)
+        toolMessages.push({
+          role: 'user',
+          content:
+            `Autonomy policy: this question is ${riskLevel} risk and does not require human approval. ` +
+            `Proceed with the recommended default: ${recommendation}. Record assumptions and keep working.`,
         })
-        await this.taskEngine.setNextAction(internal.taskId, `Waiting for human input: ${question}`)
-        terminalSignal = { status: 'blocked', summary: result.content }
-        break
       }
     }
 
@@ -1364,6 +1431,7 @@ export class AgentLoop {
   ): Promise<{ content: string; metadata?: Record<string, unknown> }> {
     const toolContext: ToolExecutionContext = {
       workDir: this.config.workDir,
+      stateDir: this.config.stateDir,
       repoMap: this.repoMap,
       repoGraph: this.repoGraph,
       domainManifests: this.domainManifests,
@@ -1375,6 +1443,7 @@ export class AgentLoop {
       decisionEngine: this.decisionEngine,
       verificationEngine: this.verificationEngine,
       checkpointManager: this.checkpointManager,
+      evidenceMemory: this.evidenceMemory,
     }
 
     // Persist a `commands` row before invoking the tool when one is
@@ -1514,7 +1583,20 @@ export class AgentLoop {
     // window of recent turns (not the whole transcript). Orphan tool blocks
     // from the window cut are scrubbed by the provider message mapper.
     const situation = await this.buildSituationReport(taskId)
-    const recentWindow = history.slice(-AgentLoop.RECENT_WINDOW)
+    let recentWindow = history.slice(-AgentLoop.RECENT_WINDOW)
+    if (this.compactionPolicy) {
+      const compacted = await this.compactionPolicy.compactToolOutputs(taskId, recentWindow)
+      recentWindow = compacted.messages
+      if (compacted.compacted > 0) {
+        this.pendingTrace.push({
+          type: 'local_model_invoked',
+          taskId,
+          actor: 'agent',
+          summary: `Compacted ${compacted.compacted} historical tool output(s) before frontier call`,
+          payload: { refs: compacted.refs, localModel: true, authoritative: false },
+        })
+      }
+    }
     const assembled: Message[] = situation
       ? [...baseMessages, situation, ...recentWindow]
       : [...baseMessages, ...recentWindow]
@@ -1579,8 +1661,8 @@ export class AgentLoop {
     result: { content: string; metadata?: Record<string, unknown> },
     taskId: string,
     toolName: string,
-  ): Promise<{ content: string; totalBytes: number; truncated: boolean; artifactRef?: string }> {
-    const budget = this.config.toolOutputBudget ?? 0
+  ): Promise<{ content: string; totalBytes: number; truncated: boolean; artifactRef?: string; strategy?: string; savings?: ToolCompressionSavings }> {
+    const budget = this.config.toolOutputBudget ?? DEFAULT_TOOL_RESULT_BUDGET
     if (budget <= 0) {
       return { content: result.content, totalBytes: Buffer.byteLength(result.content, 'utf-8'), truncated: false }
     }
@@ -1591,6 +1673,23 @@ export class AgentLoop {
       artifactsDir,
       toolName,
     })
+    if (compacted.truncated) {
+      this.pendingTrace.push({
+        type: 'local_model_invoked',
+        taskId,
+        actor: 'agent',
+        summary: `Compressed tool output from ${toolName}`,
+        payload: {
+          toolName,
+          strategy: compacted.strategy,
+          artifactRef: compacted.artifactRef,
+          savings: compacted.savings,
+          localModel: false,
+          deterministic: true,
+          authoritative: false,
+        },
+      })
+    }
     return compacted
   }
 
@@ -1637,11 +1736,20 @@ export class AgentLoop {
   }
 
   /** Resumption: re-admit the prior prompt with a 'resumed' marker. */
-  private resumeMessages(task: string, taskId: string): Message[] {
+  private async resumeMessages(task: string, taskId: string): Promise<Message[]> {
+    let durable = ''
+    if (this.contextServer) {
+      const slice = await this.contextServer.read('task.resume', { taskId, limit: 8 }).catch(() => undefined)
+      if (slice?.data) {
+        durable =
+          '\n\nDurable resume state from Forge Context Server (authoritative):\n' +
+          JSON.stringify(slice.data, null, 2).slice(0, 12_000)
+      }
+    }
     return [
       {
         role: 'user',
-        content: `[Resumed session ${taskId}]\n\nThe previous run was interrupted. Continuing task: ${task}`,
+        content: `[Resumed session ${taskId}]\n\nThe previous run was interrupted. Continuing task: ${task}${durable}`,
       },
     ]
   }
