@@ -27,6 +27,7 @@ import { join } from 'node:path'
 import { initConfig, loadConfig, resolveConfig, isInitialized, DEFAULT_STATE_DIR } from '../config.js'
 import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { CommandResult, ParsedArgs } from './output.js'
+import { writeConnectionMetadata } from '../preflight.js'
 
 const DEFAULT_DB_URL = 'postgres://forge:forge@localhost:54329/forge'
 
@@ -43,10 +44,15 @@ export interface InitData {
   stateDir: string
   envPath: string
   gitignorePath: string
+  connectionPath?: string
   envCreated: boolean
   envAlreadyPresent: boolean
   gitignorePatched: boolean
   configExisted: boolean
+  importedFileState?: {
+    imported: number
+    repoId: string
+  }
   postgres: {
     reachable: boolean
     schemaVersion?: number
@@ -113,7 +119,7 @@ export async function runInit(_parsed: ParsedArgs): Promise<CommandResult<InitDa
       if (existing) {
         // Touch state subdirs in case any were removed.
         const { mkdir } = await import('node:fs/promises')
-        const subdirs = ['tasks', 'evidence', 'evidence/artifacts', 'failures', 'decisions', 'verification', 'checkpoints', 'patches']
+        const subdirs = ['state', 'tasks', 'evidence', 'evidence/artifacts', 'failures', 'decisions', 'verification', 'checkpoints', 'patches']
         for (const subdir of subdirs) {
           await mkdir(join(stateDir, subdir), { recursive: true })
         }
@@ -126,9 +132,12 @@ export async function runInit(_parsed: ParsedArgs): Promise<CommandResult<InitDa
 
     const envResult = await ensureEnv(envPath)
     const gitignorePatched = await ensureGitignore(gitignorePath)
+    const config = await loadConfig(stateDir)
+    const connectionPath = config ? await writeConnectionMetadata(config, process.env.FORGE_DATABASE_URL) : undefined
 
     // Optional: open Postgres if URL is set.
     const postgresResult: InitData['postgres'] = { reachable: false, applied: [] }
+    let importedFileState: InitData['importedFileState'] | undefined
     const dbUrl = process.env.FORGE_DATABASE_URL
     if (dbUrl) {
       const store = new ForgeStateStore({
@@ -140,6 +149,15 @@ export async function runInit(_parsed: ParsedArgs): Promise<CommandResult<InitDa
         postgresResult.schemaVersion = health.schemaVersion
         postgresResult.requiredSchemaVersion = health.requiredSchemaVersion
         postgresResult.applied = []
+        if (health.ok) {
+          const imported = await store.importFromFileState(stateDir, 'system').catch(() => undefined)
+          if (imported) {
+            importedFileState = {
+              imported: imported.imported,
+              repoId: imported.repoId,
+            }
+          }
+        }
       } catch (err) {
         postgresResult.error = err instanceof Error ? err.message : String(err)
       }
@@ -149,10 +167,12 @@ export async function runInit(_parsed: ParsedArgs): Promise<CommandResult<InitDa
       stateDir,
       envPath,
       gitignorePath,
+      connectionPath,
       envCreated: envResult.created,
       envAlreadyPresent: envResult.hadValue,
       gitignorePatched,
       configExisted,
+      importedFileState,
       postgres: postgresResult,
     }
 
@@ -165,13 +185,15 @@ export async function runInit(_parsed: ParsedArgs): Promise<CommandResult<InitDa
         `Initialized Forge at ${stateDir}`,
         `Provider: ${(await loadConfig(stateDir))?.provider.name ?? 'openrouter'}`,
         `Mode: ${(await loadConfig(stateDir))?.mode ?? 'implement'}`,
+        connectionPath ? `Wrote state connection metadata: ${connectionPath}` : 'State connection metadata not written',
         envResult.created ? `Wrote .env (FORGE_DATABASE_URL=local default)` : '.env already present',
         gitignorePatched ? '.gitignore patched' : '.gitignore already up to date',
         postgresResult.reachable
           ? `Postgres reachable (schema v${postgresResult.schemaVersion})`
           : dbUrl
             ? `Postgres unreachable: ${postgresResult.error ?? 'unknown'}`
-            : 'FORGE_DATABASE_URL not set — skipped Postgres init',
+            : 'FORGE_DATABASE_URL not set — normal runs will be blocked until Postgres is configured',
+        importedFileState ? `Imported file state: ${importedFileState.imported} task(s) into repo ${importedFileState.repoId}` : 'File-state import skipped or empty',
       ],
     }
   } catch (err) {
