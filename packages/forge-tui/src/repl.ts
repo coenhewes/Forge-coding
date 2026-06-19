@@ -1167,7 +1167,13 @@ export class Repl {
       this.log('{red-fg}Error:{/red-fg} token budget required. Usage: /budget <n>')
       return
     }
-    const n = Number.parseInt(args[0], 10)
+    // `Number('1.5')` → 1.5, `Number('abc')` → NaN, `Number('1e2')`
+    // → 100. We want a strict positive integer literal.
+    if (!/^\d+$/.test(args[0])) {
+      this.log(`{red-fg}Error:{/red-fg} budget must be a positive integer (got '${args[0]}').`)
+      return
+    }
+    const n = Number(args[0])
     if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
       this.log(`{red-fg}Error:{/red-fg} budget must be a positive integer (got '${args[0]}').`)
       return
@@ -1441,7 +1447,14 @@ function redactUrl(raw: string): string {
 function computeSessionRisk(task: { failuresEncountered: string[]; commandsRun: string[]; verificationStatus: Record<string, string>; filesTouched: string[] }): 'low' | 'medium' | 'high' {
   const verificationValues = Object.values(task.verificationStatus ?? {})
   if (verificationValues.some((value) => value === 'failed' || value === 'blocked')) return 'high'
-  if (task.failuresEncountered.length > 0 || task.commandsRun.length === 0) return 'high'
-  if (task.filesTouched.length === 0 || verificationValues.length === 0) return 'medium'
+  // Real high risk: commands have been run AND produced failures,
+  // or the task has accumulated many failures with no progress.
+  if (task.failuresEncountered.length >= 3) return 'high'
+  // A task with some commands run + at least one failure is medium
+  // at least — keeps the UX signal visible without spamming red.
+  if (task.failuresEncountered.length > 0) return 'medium'
+  // A task that has run commands and touched files is "low" — the
+  // task is making progress and nothing has failed.
+  if (task.filesTouched.length === 0 && task.commandsRun.length === 0) return 'medium'
   return 'low'
 }
