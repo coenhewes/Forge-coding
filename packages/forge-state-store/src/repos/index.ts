@@ -17,6 +17,7 @@ export * from './verification.js'
 export * from './commands.js'
 export * from './trace.js'
 export * from './sessions.js'
+export * from './embeddings.js'
 
 import type { Db } from './base.js'
 import { RepoRepo, RepoNodeRepo, RepoEdgeRepo } from './repos.js'
@@ -37,6 +38,7 @@ import {
 import { CommandRepo, ArtifactRepo } from './commands.js'
 import { TraceEventRepo } from './trace.js'
 import { SessionRepo, PromptRepo } from './sessions.js'
+import { EmbeddingRepo } from './embeddings.js'
 
 /**
  * One bag of every typed repository, constructed against a single
@@ -70,6 +72,7 @@ export class Repos {
   readonly trace: TraceEventRepo
   readonly sessions: SessionRepo
   readonly prompts: PromptRepo
+  readonly embeddings: EmbeddingRepo
 
   constructor(sql: Db) {
     this.repos = new RepoRepo(sql)
@@ -97,5 +100,6 @@ export class Repos {
     this.trace = new TraceEventRepo(sql)
     this.sessions = new SessionRepo(sql)
     this.prompts = new PromptRepo(sql)
+    this.embeddings = new EmbeddingRepo(sql)
   }
 }

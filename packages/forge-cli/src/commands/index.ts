@@ -14,6 +14,7 @@ export { runInit } from './init.js'
 export type { InitData } from './init.js'
 
 export { runRun } from './run.js'
+export { runResume } from './resume.js'
 
 export { runSessions } from './sessions.js'
 export type { SessionRow } from './sessions.js'

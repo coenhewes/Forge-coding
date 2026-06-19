@@ -25,6 +25,8 @@ cost tier 0) and a capability router (`selectProvider`); what was missing was an
 | `extract` — structured fields from logs/test output | Author code edits |
 | `rerank` — relevance ranking of retrieval candidates | Decide completion / resolve contradictions |
 | `embed` — embeddings for semantic retrieval | Review / approve |
+| `retrieve` — hybrid lexical/vector ranking over prepared candidates | Expose raw database/filesystem internals |
+| `draft` — boilerplate/test skeleton/patch-candidate text | Apply patches without frontier review |
 
 ### Hard boundaries (enforced in types & flow)
 - **Never the source of truth.** Every result is `authoritative: false`.
@@ -64,8 +66,37 @@ agent-loop ──► CompactionPolicy ──► LocalModelService ──► Loca
 - **`CompactionPolicy`** — threshold-triggered rewrite of oversized `tool`
   messages into `summary + ref`. Adapted from opencode's
   `session/{overflow,compaction,summary}.ts` (MIT, see [NOTICE](../NOTICE)).
+- **`ToolResultCompressor`** — deterministic, Headroom-inspired compression
+  before tool output reaches the model. JSON arrays preserve schema/boundaries/
+  notable rows, search output is grouped by file, logs preserve failures and
+  stack traces, and code/diffs stay conservative. Every lossy rewrite includes
+  a stable `retrieve_artifact` ref.
+- **`LocalContextIndex`** — hybrid retrieval over caller-provided Forge context
+  candidates. It combines exact lexical scoring with optional local embeddings
+  and returns non-authoritative rankings.
+- **`EmbeddingRepo`** — typed state-store access to the existing `embeddings`
+  table. V1 stores JSONB vectors and ranks in process; pgvector/sqlite-vec can
+  replace the storage/index later without exposing raw SQL to model-facing APIs.
 - **`similarity.ts`** — in-process cosine ranking for embeddings (no pgvector
   dependency).
+
+## Reversible artifact retrieval
+
+Compressed tool results include a marker like:
+
+```
+[forge compression: strategy=log; ref=<sha256>; retrieve with retrieve_artifact artifact_ref="<sha256>" query="<optional search>"]
+```
+
+The model-facing `retrieve_artifact` tool accepts only stable refs and optional
+queries. It can recover:
+
+- raw tool-output blobs stored under `.forge/artifacts/<taskId>/<sha>.bin`;
+- evidence/local-model artifacts stored through `EvidenceMemory` (`art-*` ids).
+
+It does not expose filesystem paths, database table names, or artifact-store
+internals. Query mode returns matching lines with nearby context; exact mode is
+bounded by `max_bytes` to preserve context discipline.
 
 ## Configuration
 
@@ -113,8 +144,10 @@ forge local test     # round-trip a tiny summarize + embed (shows fallback if do
 - **Caveats:** short tasks, CPU-only/slow local, or no Ollama → fallback path
   with bounded (timeout-capped) overhead. This is exactly why the default is
   opt-in/`auto`.
-- **Measurement:** `local_model_runs` records latency + token deltas; compare
-  `forge-eval` runs with the layer on/off.
+- **Measurement:** compression trace payloads record before/after byte and token
+  estimates, strategy, artifact refs, retrieval count potential, and fallback
+  use. `local_model_runs` records local latency and model usage where available;
+  compare `forge-eval` runs with the layer on/off.
 
 ## Later extensions
 
@@ -123,3 +156,7 @@ forge local test     # round-trip a tiny summarize + embed (shows fallback if do
 - Speculative drafting (local drafts, frontier verifies).
 - Fine-tuned specialist local models per task kind.
 - Content-hash caching of local outputs.
+- Persistent `LocalContextIndex` fed from repo graph/evidence/failure/decision
+  tables, using pgvector or sqlite-vec when available.
+- Local draft promotion workflow: store drafts as patch candidates, then require
+  frontier acceptance/rewrite before mutation.

@@ -18,6 +18,7 @@
 import { loadConfig, initConfig } from '../config.js'
 import { TaskStateEngine } from '@forge/state'
 import type { TaskState } from '@forge/types'
+import { ForgeStateStore, defaultStateStoreConfig } from '@forge/state-store'
 import type { CommandResult, ParsedArgs } from './output.js'
 
 export interface StatusData {
@@ -51,6 +52,9 @@ export async function runStatus(parsed: ParsedArgs): Promise<CommandResult<Statu
   if (!config) config = await initConfig()
   const engine = new TaskStateEngine({ stateDir: config.stateDir })
   const requested = parsed.positional[0]
+
+  const pg = await getPostgresStatus(config, requested).catch(() => undefined)
+  if (pg) return pg
 
   let task: TaskState | undefined
   if (requested) {
@@ -107,5 +111,54 @@ export async function runStatus(parsed: ParsedArgs): Promise<CommandResult<Statu
     data,
     message: `Task ${data.taskId}: ${data.status}`,
     textLines,
+  }
+}
+
+async function getPostgresStatus(config: Awaited<ReturnType<typeof loadConfig>>, requested?: string): Promise<CommandResult<StatusData> | undefined> {
+  if (!config || !process.env.FORGE_DATABASE_URL) return undefined
+  const store = new ForgeStateStore({ config: defaultStateStoreConfig(config.workDir, process.env.FORGE_DATABASE_URL) })
+  await store.init()
+  const repo = await store.repos.repos.getByRootPath(config.workDir)
+  if (!repo) return undefined
+  let row = requested ? await store.repos.tasks.get(requested) : undefined
+  if (!requested) {
+    const rows = await store.repos.tasks.listByRepo(repo.id)
+    row = rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+  }
+  if (!row || row.repoId !== repo.id) {
+    return {
+      ok: false,
+      exitCode: 1,
+      message: requested ? `Task not found in Postgres state store: ${requested}` : 'No tasks found in Postgres state store.',
+      textLines: [requested ? `Task not found in Postgres state store: ${requested}` : 'No tasks found in Postgres state store.'],
+    }
+  }
+  const data: StatusData = {
+    taskId: row.id,
+    status: row.status,
+    currentInterpretation: row.interpretedGoal ?? row.originalRequest,
+    nextAction: row.nextAction ?? 'No next action recorded',
+    subtasks: [],
+    filesTouched: Array.isArray(row.payload.filesTouched) ? row.payload.filesTouched as string[] : [],
+    commandsRun: typeof row.payload.commandsRun === 'number' ? row.payload.commandsRun : 0,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+  return {
+    ok: true,
+    exitCode: 0,
+    data,
+    message: `Task ${data.taskId}: ${data.status}`,
+    textLines: [
+      `Task: ${data.taskId}`,
+      `Status: ${data.status}`,
+      `Source: Postgres`,
+      `Interpretation: ${data.currentInterpretation}`,
+      `Next action: ${data.nextAction}`,
+      '',
+      `Commands run: ${data.commandsRun}`,
+      `Created: ${data.createdAt}`,
+      `Updated: ${data.updatedAt}`,
+    ],
   }
 }

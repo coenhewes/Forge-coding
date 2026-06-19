@@ -21,6 +21,8 @@
 import type {
   ClassifyRequest,
   ClassifyResult,
+  DraftRequest,
+  DraftResult,
   EmbedRequest,
   EmbedResult,
   ExtractRequest,
@@ -93,7 +95,7 @@ export interface ServiceDeps {
 }
 
 const DEFAULT_MAX_INPUT_CHARS = 24_000
-const DEFAULT_TIMEOUT_MS = 20_000
+const DEFAULT_TIMEOUT_MS = 45_000
 const DEFAULT_SUMMARY_TARGET_TOKENS = 200
 /** Rough chars-per-token for budgeting summary output truncation in fallback. */
 const CHARS_PER_TOKEN = 4
@@ -275,6 +277,67 @@ export class LocalModelService {
     }
   }
 
+  /* ----------------------------------- draft -------------------------------- */
+
+  async draft(req: DraftRequest): Promise<DraftResult> {
+    const started = this.deps.now()
+    const kind = req.kind ?? 'notes'
+    const sourceArtifactId = await this.persistInput(
+      req.taskId,
+      'draft',
+      [req.prompt, req.context ? `\n\nContext:\n${req.context}` : ''].join(''),
+      kind,
+    )
+
+    const fallback = (): DraftResult => ({
+      authoritative: false,
+      draft: fallbackSummary(`${req.prompt}\n${req.context ?? ''}`, (req.targetTokens ?? 240) * CHARS_PER_TOKEN),
+      kind,
+      requiresFrontierReview: true,
+      provenance: this.provenance('draft', started, {
+        fallbackUsed: true,
+        fallbackReason: 'local draft model unavailable',
+        sourceArtifactId,
+      }),
+    })
+
+    if (!(await this.router.available())) return this.finalizeFallback(fallback())
+
+    try {
+      const targetTokens = req.targetTokens ?? 500
+      const text = await this.invokeInstruct([
+        {
+          role: 'system',
+          content:
+            'You draft low-risk coding artifacts for Forge. Return only the draft. ' +
+            'Your output is advisory and must be reviewed by a frontier model before any file mutation.',
+        },
+        {
+          role: 'user',
+          content: [
+            `Draft kind: ${kind}`,
+            `Target tokens: ${targetTokens}`,
+            '',
+            req.prompt,
+            req.context ? `\nContext:\n${this.bound(req.context)}` : '',
+          ].join('\n'),
+        },
+      ])
+      const draft = text.trim()
+      if (!draft) return this.finalizeFallback(fallback())
+      const outputArtifactId = await this.persistOutput(req.taskId, 'draft', draft)
+      const provenance = this.provenance('draft', started, {
+        fallbackUsed: false,
+        sourceArtifactId,
+        outputArtifactId,
+      })
+      await this.record(req.taskId, provenance, { kind, chars: draft.length, requiresFrontierReview: true })
+      return { authoritative: false, draft, kind, requiresFrontierReview: true, provenance }
+    } catch {
+      return this.finalizeFallback(fallback())
+    }
+  }
+
   /* ----------------------------------- embed -------------------------------- */
 
   async embed(req: EmbedRequest): Promise<EmbedResult> {
@@ -359,10 +422,12 @@ export class LocalModelService {
       latencyMs: this.deps.now() - started,
       createdAt: new Date(this.deps.now()).toISOString(),
       fallbackUsed: extra.fallbackUsed ?? false,
+      fallbackReason: extra.fallbackReason,
       sourceArtifactId: extra.sourceArtifactId,
       outputArtifactId: extra.outputArtifactId,
       confidence: extra.confidence,
       usage: extra.usage,
+      savings: extra.savings,
     }
   }
 
@@ -422,6 +487,8 @@ export class LocalModelService {
       inputTokens: provenance.usage?.inputTokens,
       outputTokens: provenance.usage?.outputTokens,
       confidence: provenance.confidence,
+      fallbackReason: provenance.fallbackReason,
+      savings: provenance.savings,
       fallbackUsed: provenance.fallbackUsed,
       createdAt: provenance.createdAt,
     }
@@ -442,6 +509,8 @@ export class LocalModelService {
           model: provenance.model,
           latencyMs: provenance.latencyMs,
           fallbackUsed: provenance.fallbackUsed,
+          fallbackReason: provenance.fallbackReason,
+          savings: provenance.savings,
           sourceArtifactId: provenance.sourceArtifactId,
           outputArtifactId: provenance.outputArtifactId,
           authoritative: false,
@@ -468,6 +537,8 @@ export class LocalModelService {
           outputArtifactId: result.provenance.outputArtifactId,
           latencyMs: result.provenance.latencyMs,
           confidence: result.provenance.confidence,
+          fallbackReason: result.provenance.fallbackReason,
+          savings: result.provenance.savings,
           fallbackUsed: true,
           createdAt: result.provenance.createdAt,
         })

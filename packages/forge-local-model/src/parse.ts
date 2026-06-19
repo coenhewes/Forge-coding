@@ -51,7 +51,12 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 export function parseSummary(text: string): string | null {
   const obj = asRecord(extractJson(text))
   const summary = obj?.summary
-  return typeof summary === 'string' && summary.trim().length > 0 ? summary.trim() : null
+  if (typeof summary === 'string' && summary.trim().length > 0) return summary.trim()
+  const cleaned = text
+    .replace(/```(?:json|text|md|markdown)?/gi, '')
+    .replace(/```/g, '')
+    .trim()
+  return cleaned.length > 0 ? truncateMiddle(cleaned, 2000) : null
 }
 
 export function parseClassify(

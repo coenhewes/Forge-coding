@@ -3,6 +3,7 @@
 import {
   runInit,
   runRun,
+  runResume,
   runSessions,
   runStatus,
   runVerify,
@@ -32,6 +33,7 @@ import { join } from 'node:path'
 const COMMANDS: Record<string, (parsed: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>> = {
   init: runInit as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   run: runRun as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
+  resume: runResume as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   sessions: runSessions as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   status: runStatus as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
   verify: runVerify as (p: import('./commands/output.js').ParsedArgs) => Promise<import('./commands/output.js').CommandResult<unknown>>,
@@ -50,6 +52,7 @@ async function main() {
   switch (command) {
     case 'init':
     case 'run':
+    case 'resume':
     case 'sessions':
     case 'status':
     case 'verify':
@@ -74,9 +77,6 @@ async function main() {
     // for what the brief now calls `sessions`.
     case 'tasks':
       await cmdTasks(rest)
-      return
-    case 'resume':
-      await cmdResume(rest)
       return
     case 'dashboard':
       await cmdDashboard(rest)

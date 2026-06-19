@@ -11,6 +11,8 @@ import { join, dirname } from 'node:path'
 import type { ForgeConfig, ForgeConfigFile } from '@forge/types'
 
 const DEFAULT_STATE_DIR = '.forge'
+const LONG_HORIZON_MAX_WALL_CLOCK_MS = 8 * 60 * 60 * 1000
+const LONG_HORIZON_MAX_ITERATIONS = 10_000
 
 interface SlashCommand {
   name: string
@@ -245,6 +247,7 @@ export class Repl {
     this.log('Welcome to Forge — long-horizon software engineering agent')
     this.log(`Provider: {bold}${this.config.provider.name}{/bold} ({bold}${this.config.provider.model}{/bold})`)
     this.log(`Mode: {bold}${this.config.mode}{/bold}`)
+    this.log(`State: {bold}${process.env.FORGE_DATABASE_URL ? 'Postgres' : 'file fallback (degraded; configure FORGE_DATABASE_URL)'}{/bold}`)
     this.log('Type a task and press Enter, or type {bold}/help{/bold} for commands.')
     this.log('')
   }
@@ -508,17 +511,16 @@ export class Repl {
     const engine = new TaskStateEngine({ stateDir: this.config.stateDir })
     const task = await engine.getTask(taskId)
     if (!task) {
-      this.log(`{red-fg}Task not found:{/red-fg} ${taskId}`)
-      return
+      this.log(`No file-state task found for {bold}${taskId}{/bold}; trying durable Postgres resume.`)
     }
 
-    this.log(`Resuming task: {bold}${taskId}{/bold}`)
-    this.log(`Previous status: ${task.status}`)
+    this.log(`Continuing task: {bold}${taskId}{/bold}`)
+    this.log(`Previous status: ${task?.status ?? 'durable state'}`)
 
-    await engine.resumeTask(taskId)
+    if (task) await engine.resumeTask(taskId)
 
     this.log('')
-    this.log(`{bold}─── Running: /resume ${taskId}{/bold}`)
+    this.log(`{bold}─── Continuing ${taskId}{/bold}`)
     this.log('')
 
     const startTime = Date.now()
@@ -528,13 +530,19 @@ export class Repl {
         workDir: this.config.workDir,
         stateDir: this.config.stateDir,
         mode: this.config.mode,
-        maxIterations: 50,
+        maxIterations: LONG_HORIZON_MAX_ITERATIONS,
+        budget: {
+          maxWallClockMs: LONG_HORIZON_MAX_WALL_CLOCK_MS,
+          maxIterations: LONG_HORIZON_MAX_ITERATIONS,
+        },
         features: this.config.features,
         git: this.config.git,
+        localModel: this.config.localModel,
+        stateStoreMode: process.env.FORGE_DATABASE_URL ? 'postgres' : 'file',
       })
 
       await agent.buildRepoIntelligence()
-      const result = await agent.run(task.originalRequest)
+      const result = await agent.resume(taskId)
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
       this.log(`{bold}─── Resume Result (${elapsed}s) ───{/bold}`)
@@ -1167,7 +1175,13 @@ export class Repl {
       this.log('{red-fg}Error:{/red-fg} token budget required. Usage: /budget <n>')
       return
     }
-    const n = Number.parseInt(args[0], 10)
+    // `Number('1.5')` → 1.5, `Number('abc')` → NaN, `Number('1e2')`
+    // → 100. We want a strict positive integer literal.
+    if (!/^\d+$/.test(args[0])) {
+      this.log(`{red-fg}Error:{/red-fg} budget must be a positive integer (got '${args[0]}').`)
+      return
+    }
+    const n = Number(args[0])
     if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
       this.log(`{red-fg}Error:{/red-fg} budget must be a positive integer (got '${args[0]}').`)
       return
@@ -1270,9 +1284,15 @@ export class Repl {
         workDir: this.config.workDir,
         stateDir: this.config.stateDir,
         mode: this.config.mode,
-        maxIterations: 50,
+        maxIterations: LONG_HORIZON_MAX_ITERATIONS,
+        budget: {
+          maxWallClockMs: LONG_HORIZON_MAX_WALL_CLOCK_MS,
+          maxIterations: LONG_HORIZON_MAX_ITERATIONS,
+        },
         features: this.config.features,
         git: this.config.git,
+        localModel: this.config.localModel,
+        stateStoreMode: process.env.FORGE_DATABASE_URL ? 'postgres' : 'file',
         onEvent,
       })
 
@@ -1312,8 +1332,16 @@ export class Repl {
 
       if (result.status === 'blocked') {
         this.log('')
-        this.log('{yellow-fg}⚠ Task is blocked waiting for input.{/yellow-fg}')
-        this.log('  Use: /resume ' + result.taskId + ' to continue')
+        this.activeTaskId = result.taskId
+        this.log('{yellow-fg}⚠ Task is waiting for a human decision.{/yellow-fg}')
+        this.log('  Select it from /tasks, type an answer into this prompt, or use /resume as a shortcut.')
+      }
+
+      if (result.status === 'paused') {
+        this.log('')
+        this.activeTaskId = result.taskId
+        this.log('{yellow-fg}⏸ Task paused with durable state.{/yellow-fg}')
+        this.log('  Select it from /tasks and continue when ready.')
       }
 
       this.log('')
@@ -1441,7 +1469,14 @@ function redactUrl(raw: string): string {
 function computeSessionRisk(task: { failuresEncountered: string[]; commandsRun: string[]; verificationStatus: Record<string, string>; filesTouched: string[] }): 'low' | 'medium' | 'high' {
   const verificationValues = Object.values(task.verificationStatus ?? {})
   if (verificationValues.some((value) => value === 'failed' || value === 'blocked')) return 'high'
-  if (task.failuresEncountered.length > 0 || task.commandsRun.length === 0) return 'high'
-  if (task.filesTouched.length === 0 || verificationValues.length === 0) return 'medium'
+  // Real high risk: commands have been run AND produced failures,
+  // or the task has accumulated many failures with no progress.
+  if (task.failuresEncountered.length >= 3) return 'high'
+  // A task with some commands run + at least one failure is medium
+  // at least — keeps the UX signal visible without spamming red.
+  if (task.failuresEncountered.length > 0) return 'medium'
+  // A task that has run commands and touched files is "low" — the
+  // task is making progress and nothing has failed.
+  if (task.filesTouched.length === 0 && task.commandsRun.length === 0) return 'medium'
   return 'low'
 }

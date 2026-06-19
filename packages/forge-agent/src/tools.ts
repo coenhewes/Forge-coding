@@ -1,7 +1,9 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { execSync } from 'node:child_process'
+import { dirname, join } from 'node:path'
 import type { ToolDefinition, ToolCall, EvidenceKind, TaskStatus, VerificationCheckKind } from '@forge/types'
 import type { TaskStateEngine } from '@forge/state'
+import type { EvidenceMemory } from '@forge/state'
 import type { AcceptanceContractEngine } from '@forge/state'
 import type { EvidenceLedgerEngine } from '@forge/state'
 import type { FailureLedgerEngine } from '@forge/state'
@@ -17,6 +19,7 @@ export type ToolHandler = (
 
 export interface ToolExecutionContext {
   workDir: string
+  stateDir: string
   repoMap?: import('@forge/types').RepoMap
   repoGraph?: import('@forge/types').RepoGraph
   domainManifests?: import('@forge/types').DomainManifest[]
@@ -28,6 +31,7 @@ export interface ToolExecutionContext {
   decisionEngine: DecisionLedgerEngine
   verificationEngine: VerificationMatrixEngine
   checkpointManager: CheckpointManager
+  evidenceMemory?: EvidenceMemory
 }
 
 export function createToolDefinitions(): ToolDefinition[] {
@@ -106,6 +110,20 @@ export function createToolDefinitions(): ToolDefinition[] {
           timeout_ms: { type: 'number', description: 'Timeout in milliseconds', default: 60000 },
         },
         required: ['command', 'description'],
+      },
+    },
+    {
+      name: 'retrieve_artifact',
+      description:
+        'Retrieve exact or query-filtered content from a compacted Forge artifact. Use when a compressed tool result says exact evidence is available by ref.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          artifact_ref: { type: 'string', description: 'Stable artifact ref from a Forge compression marker or evidence artifact id.' },
+          query: { type: 'string', description: 'Optional search query to return only matching lines with context.' },
+          max_bytes: { type: 'number', description: 'Maximum bytes to return. Defaults to 12000.' },
+        },
+        required: ['artifact_ref'],
       },
     },
     {
@@ -239,6 +257,15 @@ export function createToolDefinitions(): ToolDefinition[] {
           question: { type: 'string', description: 'The question' },
           options: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, description: { type: 'string' } } }, description: 'Suggested options' },
           recommendation: { type: 'string', description: 'Your recommended option' },
+          requires_human: {
+            type: 'boolean',
+            description: 'Set true only for destructive, irreversible, security-sensitive, migration-risk, billing/external, or genuinely product-owner decisions. Routine scope defaults must leave this false so the run can continue.',
+          },
+          risk_level: {
+            type: 'string',
+            enum: ['low', 'medium', 'high', 'critical'],
+            description: 'Risk if Forge chooses the recommended default autonomously.',
+          },
         },
         required: ['question'],
       },
@@ -366,6 +393,7 @@ export class ToolExecutor {
       search_code: this.handleSearchCode.bind(this),
       glob_files: this.handleGlobFiles.bind(this),
       run_command: this.handleRunCommand.bind(this),
+      retrieve_artifact: this.handleRetrieveArtifact.bind(this),
       create_checkpoint: this.handleCreateCheckpoint.bind(this),
       record_evidence: this.handleRecordEvidence.bind(this),
       record_failure: this.handleRecordFailure.bind(this),
@@ -404,6 +432,7 @@ export class ToolExecutor {
     const path = input.path as string
     const content = input.content as string
     const fullPath = `${ctx.workDir}/${path}`
+    await mkdir(dirname(fullPath), { recursive: true })
     await writeFile(fullPath, content, 'utf-8')
     await ctx.taskEngine.addFileTouched(ctx.taskId, path)
     return { content: `Wrote ${path} (${content.length} bytes)` }
@@ -470,6 +499,54 @@ export class ToolExecutor {
       const output = error.stderr || error.stdout || String(err)
       return { content: (output as string).trim() || String(err) }
     }
+  }
+
+  private async handleRetrieveArtifact(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string; metadata?: Record<string, unknown> }> {
+    const artifactRef = String(input.artifact_ref ?? '').trim()
+    const query = typeof input.query === 'string' ? input.query.trim() : ''
+    const maxBytes = Math.max(1000, Math.min((input.max_bytes as number) ?? 12000, 100_000))
+    if (!artifactRef) return { content: 'retrieve_artifact requires artifact_ref.' }
+
+    const loaded = await this.loadArtifactText(ctx, artifactRef)
+    if (!loaded) {
+      return { content: `Artifact not found or not readable: ${artifactRef}` }
+    }
+
+    const selected = query ? filterArtifactText(loaded.content, query) : loaded.content
+    const bounded = Buffer.byteLength(selected, 'utf-8') > maxBytes
+      ? `${selected.slice(0, maxBytes)}\n...[retrieve_artifact bounded at ${maxBytes} bytes; narrow query or raise max_bytes for more]`
+      : selected
+
+    return {
+      content: [
+        `[artifact ${artifactRef}; source=${loaded.source}; bytes=${Buffer.byteLength(loaded.content, 'utf-8')}${query ? `; query=${query}` : ''}]`,
+        bounded || '(artifact matched no content)',
+      ].join('\n'),
+      metadata: { type: 'artifact_retrieval', artifactRef, query, source: loaded.source, totalBytes: Buffer.byteLength(loaded.content, 'utf-8') },
+    }
+  }
+
+  private async loadArtifactText(ctx: ToolExecutionContext, artifactRef: string): Promise<{ content: string; source: string } | null> {
+    if (artifactRef.startsWith('art-') && ctx.evidenceMemory) {
+      const artifact = await ctx.evidenceMemory.get(artifactRef)
+      if (artifact) return { content: artifact.content, source: 'evidence_memory' }
+    }
+
+    if (/^[a-f0-9]{64}$/i.test(artifactRef)) {
+      try {
+        const content = await readFile(join(ctx.stateDir, '.forge', 'artifacts', ctx.taskId, `${artifactRef}.bin`), 'utf-8')
+        return { content, source: 'tool_output_blob' }
+      } catch {
+        return null
+      }
+    }
+
+    if (ctx.evidenceMemory) {
+      const artifact = await ctx.evidenceMemory.get(artifactRef)
+      if (artifact) return { content: artifact.content, source: 'evidence_memory' }
+    }
+
+    return null
   }
 
   private async handleCreateCheckpoint(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
@@ -672,6 +749,8 @@ export class ToolExecutor {
     const question = input.question as string
     const options = input.options as Array<{ label: string; description: string }> | undefined
     const recommendation = input.recommendation as string | undefined
+    const requiresHuman = Boolean(input.requires_human ?? input.requiresHuman ?? false)
+    const riskLevel = String(input.risk_level ?? input.riskLevel ?? 'low')
 
     const lines = ['[QUESTION]', `Q: ${question}`]
     if (options) {
@@ -683,7 +762,7 @@ export class ToolExecutor {
     if (recommendation) lines.push(`Recommendation: ${recommendation}`)
     lines.push('[/QUESTION]')
 
-    return { content: lines.join('\n'), metadata: { type: 'question', question, options, recommendation } }
+    return { content: lines.join('\n'), metadata: { type: 'question', question, options, recommendation, requiresHuman, riskLevel } }
   }
 
   private async handleAddSubtask(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
@@ -792,4 +871,26 @@ export class ToolExecutor {
       metadata: { type: 'finish', status, summary },
     }
   }
+}
+
+function filterArtifactText(content: string, query: string): string {
+  const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 0)
+  if (terms.length === 0) return content
+  const lines = content.split('\n')
+  const keep = new Set<number>()
+  for (let i = 0; i < lines.length; i++) {
+    const lower = lines[i]!.toLowerCase()
+    if (terms.every((term) => lower.includes(term)) || terms.some((term) => lower.includes(term))) {
+      for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 2); j++) keep.add(j)
+    }
+  }
+  if (keep.size === 0) return ''
+  const out: string[] = []
+  let previous = -1
+  for (const idx of [...keep].sort((a, b) => a - b)) {
+    if (previous >= 0 && idx > previous + 1) out.push(`... ${idx - previous - 1} line(s) omitted ...`)
+    out.push(`${idx + 1}: ${lines[idx]}`)
+    previous = idx
+  }
+  return out.join('\n')
 }

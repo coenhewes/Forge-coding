@@ -122,7 +122,7 @@ export async function runDoctor(parsed: ParsedArgs): Promise<CommandResult<Docto
         detail: `schema v${health.schemaVersion} (required v${health.requiredSchemaVersion})${health.warnings.length > 0 ? `, ${health.warnings.length} warning(s)` : ''}`,
       }
       const tableNames = Object.keys(detailed.tableCounts ?? {})
-      const required = ['tasks', 'evidence_entries', 'artifacts', 'checkpoints', 'patches']
+      const required = ['repos', 'tasks', 'task_snapshots', 'acceptance_criteria', 'artifacts', 'evidence', 'decisions', 'failures', 'patch_candidates', 'checkpoints', 'verification_checks', 'commands', 'trace_events', 'local_model_runs', 'embeddings']
       const missing = required.filter((r) => !tableNames.includes(r))
       if (missing.length > 0) {
         warnings.push(`missing tables: ${missing.join(', ')}`)
