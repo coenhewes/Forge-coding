@@ -44,6 +44,11 @@ export interface CompletionChunk {
   content?: string
   toolCalls?: ToolCall[]
   finishReason?: 'stop' | 'length' | 'tool_calls' | 'error'
+  /** Token usage, emitted on the final chunk(s) when the provider reports it. */
+  usage?: {
+    inputTokens?: number
+    outputTokens?: number
+  }
 }
 
 export interface CompletionResult {

@@ -69,8 +69,13 @@ function isJsonRpcRequest(v: unknown): v is JsonRpcRequest {
 // Method handlers
 // ---------------------------------------------------------------------------
 
+interface MethodContext {
+  writeLine: (line: string) => void;
+}
+
 async function handleRequest(
-  req: JsonRpcRequest
+  req: JsonRpcRequest,
+  ctx: MethodContext
 ): Promise<JsonRpcResponse | null> {
   const id = req.id ?? null;
 
@@ -149,10 +154,10 @@ async function handleRequest(
     }
 
     case "shutdown": {
-      // Return the response like any other method. The serialized request
-      // queue guarantees this handler only runs after every earlier request
-      // has fully resolved and its response has been written, so the dispatch
-      // loop can safely flush this response and then exit the process.
+      // The response is returned and written by the queue. The queue's
+      // exit logic (triggered when the method is "shutdown") ensures the
+      // process only exits after every prior response has been flushed,
+      // even when the client pipelines several requests in one burst.
       return { jsonrpc: "2.0", id, result: { shutdown: true } };
     }
 
@@ -170,21 +175,56 @@ async function handleRequest(
 // Server bootstrap
 // ---------------------------------------------------------------------------
 
-/**
- * Write one framed JSON-RPC line to stdout and resolve once the chunk has been
- * accepted by the underlying stream (the write callback fires after the data is
- * handed to the OS, or buffered). Awaiting this is what lets the queue flush a
- * response before moving on — and, crucially, before the process exits on
- * `shutdown`.
- */
-function writeLine(line: string): Promise<void> {
-  return new Promise((resolve) => {
-    process.stdout.write(line + "\n", () => resolve());
-  });
+function writeLine(line: string): void {
+  process.stdout.write(line + "\n");
 }
 
 function log(msg: string): void {
   process.stderr.write(`[${SERVER_NAME}] ${msg}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Serial request queue
+//
+// readline fires a "line" event for every newline-terminated JSON request
+// on stdin. If the client pipelines several requests in a single burst
+// (write-all-then-read), the async handlers for each line start
+// concurrently. That is fine for synchronous methods, but for an async
+// method like `tools/call` (which spawns a child process) the in-flight
+// tool call can still be pending when a later `shutdown` line causes the
+// process to exit, dropping the tool-call response on the floor.
+//
+// The fix is a serialized queue: every parsed line is appended to a
+// promise chain. Each task only begins after the previous one has fully
+// settled (including writing its response line), so requests are
+// processed strictly in arrival order. `shutdown` is just another task
+// in the chain; once it has written its response, `scheduleExit` waits
+// for the chain to drain and then flushes stdout before exiting.
+// ---------------------------------------------------------------------------
+let processingChain: Promise<void> = Promise.resolve();
+let exited = false;
+
+function enqueue(task: () => Promise<void> | void): void {
+  // `then(task, task)` runs the task whether the previous promise
+  // resolved or rejected, so a single failing task does not stall the
+  // queue. The trailing `void next.catch(...)` marks the rejection as
+  // handled so Node.js does not emit an unhandled-rejection warning
+  // when no further task is enqueued to consume it.
+  const next = processingChain.then(task, task);
+  void next.catch(() => undefined);
+  processingChain = next;
+}
+
+function scheduleExit(): void {
+  if (exited) return;
+  exited = true;
+  // Wait for every queued task (including the shutdown response itself)
+  // to settle, then give stdout one more tick to flush before exiting.
+  const chain = processingChain;
+  chain.then(
+    () => setImmediate(() => process.exit(0)),
+    () => setImmediate(() => process.exit(0))
+  );
 }
 
 function startServer(): void {
@@ -195,91 +235,63 @@ function startServer(): void {
 
   log(`${SERVER_NAME} v${SERVER_VERSION} ready on stdio`);
 
-  // Serialized request queue.
-  //
-  // readline emits one `line` event per request, in arrival order, even when a
-  // client pipelines several requests in a single write burst. Handling each
-  // line in its own un-awaited async callback let a later request (notably
-  // `shutdown`, which calls process.exit) race ahead of an earlier, still
-  // pending async tool call — so responses 3 and 4 could be lost when 5 exited
-  // the process. We instead chain every request onto a single promise so they
-  // run strictly one-at-a-time, each fully resolved and flushed before the
-  // next begins.
-  let tail: Promise<void> = Promise.resolve();
-  let closed = false;
-
-  function enqueue(trimmed: string): void {
-    tail = tail.then(() => processLine(trimmed));
-  }
-
-  async function processLine(trimmed: string): Promise<void> {
-    if (closed) return;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch (err) {
-      await writeLine(
-        JSON.stringify(
-          makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
-        )
-      );
-      return;
-    }
-
-    if (!isJsonRpcRequest(parsed)) {
-      await writeLine(
-        JSON.stringify(
-          makeError(
-            (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
-            JSON_RPC_ERRORS.INVALID_REQUEST,
-            "Invalid JSON-RPC 2.0 request"
-          )
-        )
-      );
-      return;
-    }
-
-    const isShutdown = parsed.method === "shutdown";
-    try {
-      const resp = await handleRequest(parsed);
-      if (resp !== null) await writeLine(JSON.stringify(resp));
-    } catch (err) {
-      await writeLine(
-        JSON.stringify(
-          makeError(
-            parsed.id ?? null,
-            JSON_RPC_ERRORS.INTERNAL_ERROR,
-            (err as Error).message
-          )
-        )
-      );
-    }
-
-    if (isShutdown) {
-      // Every earlier request resolved and flushed before we got here (the
-      // queue is serial) and the shutdown response above is flushed too, so it
-      // is now safe to exit.
-      closed = true;
-      log("shutdown requested, exiting");
-      process.exit(0);
-    }
-  }
-
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    enqueue(trimmed);
+
+    enqueue(async () => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (err) {
+        writeLine(
+          JSON.stringify(
+            makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
+          )
+        );
+        return;
+      }
+
+      if (!isJsonRpcRequest(parsed)) {
+        writeLine(
+          JSON.stringify(
+            makeError(
+              (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
+              JSON_RPC_ERRORS.INVALID_REQUEST,
+              "Invalid JSON-RPC 2.0 request"
+            )
+          )
+        );
+        return;
+      }
+
+      try {
+        const resp = await handleRequest(parsed, { writeLine });
+        if (resp !== null) writeLine(JSON.stringify(resp));
+        if (parsed.method === "shutdown") {
+          scheduleExit();
+        }
+      } catch (err) {
+        writeLine(
+          JSON.stringify(
+            makeError(
+              parsed.id ?? null,
+              JSON_RPC_ERRORS.INTERNAL_ERROR,
+              (err as Error).message
+            )
+          )
+        );
+      }
+    });
   });
 
   rl.on("close", () => {
-    // Drain any queued work, then exit once stdin is fully consumed.
-    tail = tail.then(() => {
-      if (closed) return;
-      closed = true;
-      log("stdin closed, exiting");
-      process.exit(0);
-    });
+    log("stdin closed, exiting");
+    if (!exited) {
+      // Make sure any in-flight queued work finishes and its responses
+      // are flushed before the process goes away.
+      scheduleExit();
+    }
   });
 }
 

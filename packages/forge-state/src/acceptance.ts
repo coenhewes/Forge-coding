@@ -141,7 +141,12 @@ export class AcceptanceContractEngine {
       blocked,
       skipped,
       percentComplete,
-      allVerified: total > 0 && verified === total,
+      // Completion-ready when every criterion is RESOLVED: either verified, or
+      // legitimately marked `skipped` (not applicable to this task — e.g. a
+      // database criterion on a pure logic fix). A `skipped` criterion is done,
+      // not pending, so it must not block completion forever. `failed`,
+      // `blocked`, and `needs_review` still block (they need attention).
+      allVerified: total > 0 && verified + skipped === total,
     }
   }
 

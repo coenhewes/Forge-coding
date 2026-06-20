@@ -350,72 +350,6 @@ test("server returns PARSE_ERROR for non-JSON input", async () => {
   }
 });
 
-test("pipelined burst: all responses (ids 1-5) are emitted in order before shutdown exits", async () => {
-  // Regression test for the request-ordering bug: when initialize, tools/list,
-  // two tools/call requests, and shutdown are written to stdin in a single
-  // burst without awaiting, the server must emit responses for every id (1..5)
-  // strictly in order before the process exits on shutdown. Previously shutdown
-  // could race ahead and exit while the async tool calls (ids 3 and 4) were
-  // still pending, dropping their responses.
-  const client = await startClient();
-
-  const received: Array<{ id: number; obj: unknown }> = [];
-  const sawId5 = new Promise<void>((resolve) => {
-    client.onNotification((resp) => {
-      const obj = resp as { id?: number };
-      if (typeof obj.id === "number") {
-        received.push({ id: obj.id, obj: resp });
-        if (obj.id === 5) resolve();
-      }
-    });
-  });
-
-  const exited = new Promise<void>((resolve) => {
-    const iv = setInterval(() => {
-      if (client.isExited) {
-        clearInterval(iv);
-        resolve();
-      }
-    }, 20);
-  });
-
-  // Write all five requests in one burst, without awaiting any response.
-  const burst =
-    [
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
-      '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
-      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inspect_tree","arguments":{"path":".","maxDepth":1}}}',
-      '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command_safe","arguments":{"command":"node","args":["-e","process.stdout.write(\\"hello\\")"]}}}',
-      '{"jsonrpc":"2.0","id":5,"method":"shutdown"}',
-    ].join("\n") + "\n";
-  client.rawStdin.write(burst);
-
-  await Promise.race([
-    Promise.all([sawId5, exited]),
-    new Promise((_r, reject) =>
-      setTimeout(() => reject(new Error("timed out waiting for pipelined responses")), 5000)
-    ),
-  ]);
-
-  const order = received.map((r) => r.id);
-  assert.deepEqual(
-    order,
-    [1, 2, 3, 4, 5],
-    `expected responses for ids 1..5 in order before exit, got [${order.join(", ")}]`
-  );
-
-  // Spot-check the shape of the racy middle responses that used to be dropped.
-  const r3 = received.find((r) => r.id === 3)!.obj as { result?: { ok?: boolean } };
-  assert.equal(r3.result?.ok, true, "id 3 (inspect_tree) should have a successful result");
-  const r4 = received.find((r) => r.id === 4)!.obj as { result?: { data?: { stdout?: string } } };
-  assert.equal(r4.result?.data?.stdout, "hello", "id 4 (run_command_safe) should return its stdout");
-  const r5 = received.find((r) => r.id === 5)!.obj as { result?: { shutdown?: boolean } };
-  assert.equal(r5.result?.shutdown, true, "id 5 should be the shutdown response");
-
-  assert.ok(client.isExited, "server should have exited after the burst");
-  await client.shutdown();
-});
-
 test("shutdown method exits the server", async () => {
   const client = await startClient();
   const resp = (await client.call("shutdown", {}, 3000)) as { result?: { shutdown?: boolean } };
@@ -424,4 +358,145 @@ test("shutdown method exits the server", async () => {
   await new Promise((r) => setTimeout(r, 300));
   assert.ok(client.isExited, "server should have exited after shutdown");
   await client.shutdown();
+});
+
+test("pipelined burst of five requests all get responses in order before shutdown exits", async () => {
+  // Regression test: when initialize, tools/list, tools/call, run_command_safe,
+  // and shutdown are written to stdin in one burst (no awaiting between writes),
+  // the server must process them strictly in arrival order, write every
+  // response, and only then exit. Previously the shutdown handler could
+  // schedule `process.exit(0)` before the in-flight `run_command_safe`
+  // tool call had a chance to write its response, dropping id=4 on the
+  // floor. This test uses a raw spawn + raw stdio so we can observe the
+  // exact arrival order of response lines on stdout.
+  const child = spawn("node", [SERVER_ENTRY], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  // Write all five requests in a single burst. None of these writes is
+  // awaited individually; the OS pipe just gets every newline-terminated
+  // line at once. The readline interface on the server side will see them
+  // in order and fire five "line" events back-to-back.
+  const requests = [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "inspect_tree",
+        arguments: { path: PROJECT_ROOT, maxDepth: 1 },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "run_command_safe",
+        arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] },
+      },
+    },
+    { jsonrpc: "2.0", id: 5, method: "shutdown", params: {} },
+  ];
+  const burst = requests.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  child.stdin.write(burst);
+  // Signal EOF so a well-behaved server that reaches the end of the
+  // request stream will not block waiting for more input.
+  child.stdin.end();
+
+  // Wait for the process to exit (and the stdio streams to close) so all
+  // flushed responses are visible in `stdout`. Use the "close" event,
+  // which fires after stdout has been fully drained, rather than "exit".
+  const exitInfo: { code: number | null; signal: NodeJS.Signals | null } = {
+    code: null,
+    signal: null,
+  };
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    }, 10000);
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      exitInfo.code = code;
+      exitInfo.signal = signal;
+      resolve();
+    });
+  });
+
+  // Parse the response lines in arrival order.
+  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  assert.equal(
+    lines.length,
+    5,
+    `expected 5 responses in order before exit, got ${lines.length}\n` +
+      `stdout=${JSON.stringify(stdout)}\nstderr=${JSON.stringify(stderr)}`
+  );
+
+  const responses = lines.map((line) => JSON.parse(line));
+  for (let i = 0; i < 5; i++) {
+    assert.equal(
+      (responses[i] as { id: number }).id,
+      i + 1,
+      `response at position ${i} should have id ${i + 1}; ` +
+        `got ${JSON.stringify(responses[i])}`
+    );
+  }
+
+  // Sanity-check the shape of each response.
+  assert.ok(
+    (responses[0] as { result?: { serverInfo?: { name?: string } } }).result?.serverInfo?.name,
+    "initialize should return serverInfo.name"
+  );
+  assert.ok(
+    (responses[1] as { result?: { tools?: unknown[] } }).result?.tools,
+    "tools/list should return tools"
+  );
+  assert.equal(
+    (responses[2] as { result?: { ok?: boolean } }).result?.ok,
+    true,
+    "tools/call inspect_tree should return ok"
+  );
+  assert.equal(
+    (responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.ok,
+    true,
+    "tools/call run_command_safe should return ok"
+  );
+  assert.equal(
+    (responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.data?.stdout,
+    "ok",
+    "run_command_safe should have written 'ok' to stdout"
+  );
+  assert.equal(
+    (responses[4] as { result?: { shutdown?: boolean } }).result?.shutdown,
+    true,
+    "shutdown should be acknowledged"
+  );
+
+  // The server must have exited cleanly only after every prior response
+  // was flushed. If the queue is broken the process either times out
+  // (we kill it) or it would still pass the assertions above but the
+  // responses for the in-flight tool call would be missing.
+  assert.equal(
+    exitInfo.code,
+    0,
+    `server should exit with code 0; code=${exitInfo.code} signal=${exitInfo.signal}\n` +
+      `stderr=${JSON.stringify(stderr)}`
+  );
 });

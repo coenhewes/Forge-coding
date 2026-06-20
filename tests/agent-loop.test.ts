@@ -12,8 +12,153 @@ import type {
   ToolDefinition,
 } from '@forge/types'
 
-import { AgentLoop } from '@forge/agent'
+import { AgentLoop, isReadOnlyShellInspection, isBuildOrTestCommand, isFileMutatingCommand, readTargetKey, commandCheckKind, commandOutputLooksPassed } from '@forge/agent'
 import type { AgentEvent } from '@forge/agent'
+
+describe('run_command verification detection', () => {
+  it('classifies common build/test commands', () => {
+    expect(commandCheckKind('pnpm test 2>&1 | tail -40')).toBe('test')
+    expect(commandCheckKind('npx vitest run')).toBe('test')
+    expect(commandCheckKind('pnpm typecheck')).toBe('typecheck')
+    expect(commandCheckKind('npm run build')).toBe('build')
+    expect(commandCheckKind('grep -n foo src/index.ts')).toBeNull()
+  })
+
+  it('parses passing and failing test summaries without treating "no errors" as failure', () => {
+    expect(commandOutputLooksPassed('Test Files 339 passed (339)\nTests 3811 passed (3811)\nType Errors no errors')).toBe(true)
+    expect(commandOutputLooksPassed('Test Files 1 failed | 338 passed\nTests 2 failed | 3809 passed')).toBe(false)
+    expect(commandOutputLooksPassed('Error: command failed with exit code 1')).toBe(false)
+  })
+})
+
+describe('readTargetKey (localization novelty detection)', () => {
+  it('keys reads/searches by their target so new vs repeated can be told apart', () => {
+    // same file+offset → same key (a re-read)
+    expect(readTargetKey('read_file', { path: 'a.ts', offset: 0 }))
+      .toBe(readTargetKey('read_file', { path: 'a.ts', offset: 0 }))
+    // different file → different key (new-location read = progress)
+    expect(readTargetKey('read_file', { path: 'a.ts' }))
+      .not.toBe(readTargetKey('read_file', { path: 'b.ts' }))
+    // different offset of same file → different key (reading a new region)
+    expect(readTargetKey('read_file', { path: 'a.ts', offset: 0 }))
+      .not.toBe(readTargetKey('read_file', { path: 'a.ts', offset: 100 }))
+    // searches keyed by pattern
+    expect(readTargetKey('search_code', { pattern: 'foo' }))
+      .not.toBe(readTargetKey('search_code', { pattern: 'bar' }))
+  })
+
+  it('returns null for non-read tools and non-inspection shell', () => {
+    expect(readTargetKey('edit_file', { path: 'a.ts' })).toBeNull()
+    expect(readTargetKey('run_tests', { command: 'npm test' })).toBeNull()
+    expect(readTargetKey('run_command', { command: 'npm run build' })).toBeNull()
+    // read-only shell inspection IS a read target
+    expect(readTargetKey('run_command', { command: 'cat a.ts' })).toBe('sh:cat a.ts')
+  })
+})
+
+describe('isFileMutatingCommand (shell progress detection)', () => {
+  it('flags file-mutating commands as progress', () => {
+    for (const cmd of [
+      'git mv _lib/normalizeDates _lib/normalizeDateArguments',
+      'cd pkgs/core/src && git mv a b && sed -i "s/x/y/g" c.ts',
+      'sed -i "s/old/new/g" src/index.ts',
+      'mv tmp.ts src/index.ts',
+      'cp a.ts b.ts',
+      'git apply patch.diff',
+      'echo content > src/new.ts',
+      'cat header >> src/index.ts',
+    ]) {
+      expect(isFileMutatingCommand(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('does NOT flag pure inspection / build commands', () => {
+    for (const cmd of [
+      'cat src/index.ts',
+      'grep -n foo src/index.ts',
+      'ls -la',
+      'npm test',
+      'npm run build',
+      'node -e "console.log(6.1 > 6)"',
+      '',
+    ]) {
+      expect(isFileMutatingCommand(cmd), cmd).toBe(false)
+    }
+  })
+})
+
+describe('isBuildOrTestCommand (EDIT spin-cap progress detection)', () => {
+  it('flags build/test/verify commands as productive', () => {
+    for (const cmd of [
+      'npm run build',
+      'npm test',
+      'npm run test',
+      'pnpm -r typecheck',
+      'pnpm build',
+      'yarn test',
+      'tsc -p tsconfig.json',
+      'npx vitest run',
+      'node --test test/server.test.ts',
+      'npm test 2>&1 | tail -50',
+      'npm run lint',
+    ]) {
+      expect(isBuildOrTestCommand(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('does NOT flag plain inspection / unrelated commands', () => {
+    for (const cmd of [
+      'cat src/index.ts',
+      'ls -la',
+      'grep -n foo src/index.ts',
+      'git status',
+      'echo hi',
+      '',
+    ]) {
+      expect(isBuildOrTestCommand(cmd), cmd).toBe(false)
+    }
+  })
+})
+
+describe('isReadOnlyShellInspection (EDIT read-leak guard)', () => {
+  it('flags pure read-only inspection commands', () => {
+    for (const cmd of [
+      'cat src/index.ts',
+      'sed -n "1,140p" src/index.ts',
+      'grep -n writeLine src/index.ts',
+      'head -200 test/server.test.ts',
+      'wc -l src/index.ts && grep -n queue src/index.ts',
+      'cat src/index.ts | grep shutdown | head -5',
+      'ls -la src test',
+      'find . -name "*.ts"',
+    ]) {
+      expect(isReadOnlyShellInspection(cmd), cmd).toBe(true)
+    }
+  })
+
+  it('does NOT block build/test/edit commands or redirections', () => {
+    for (const cmd of [
+      'npm run build',
+      'npm test',
+      'node dist/index.js',
+      'tsc -p tsconfig.json',
+      'git diff',
+      'cat header.txt > out.ts',     // writes via redirection
+      'grep -n x src/index.ts > /tmp/o', // writes via redirection
+      'echo hi | tee file.ts',       // writes via tee
+      'rm -rf dist',
+      '',
+    ]) {
+      expect(isReadOnlyShellInspection(cmd), cmd).toBe(false)
+    }
+  })
+
+  it('treats unknown/non-string commands as not read-only (fail open)', () => {
+    expect(isReadOnlyShellInspection(undefined)).toBe(false)
+    expect(isReadOnlyShellInspection(42 as unknown)).toBe(false)
+    expect(isReadOnlyShellInspection('somecustomtool --read')).toBe(false)
+  })
+})
 
 /* ---------------------------------------------------------------- *
  *  FakeProvider — scripted responses

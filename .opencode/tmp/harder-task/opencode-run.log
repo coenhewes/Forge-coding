@@ -1,0 +1,2660 @@
+[0m
+> build · MiniMax-M3
+[0m
+<think>
+The user wants me to fix a bug in an MCP-style stdio server. Let me start by exploring the codebase to understand the structure.
+</think>
+[0m$ [0mls -la
+total 80
+drwxr-xr-x@ 10 coenhewes  staff    320 Jun 20 10:25 .
+drwxr-xr-x@  9 coenhewes  staff    288 Jun 20 10:25 ..
+-rw-r--r--@  1 coenhewes  staff     36 Jun 20 10:25 .gitignore
+-rw-r--r--@  1 coenhewes  staff   5297 Jun 20 10:25 README.md
+drwxr-xr-x@ 10 coenhewes  staff    320 Jun 20 10:25 node_modules
+-rw-r--r--@  1 coenhewes  staff  16861 Jun 20 10:25 package-lock.json
+-rw-r--r--@  1 coenhewes  staff    736 Jun 20 10:25 package.json
+drwxr-xr-x@  5 coenhewes  staff    160 Jun 20 10:25 src
+drwxr-xr-x@  3 coenhewes  staff     96 Jun 20 10:25 test
+-rw-r--r--@  1 coenhewes  staff    476 Jun 20 10:25 tsconfig.json
+[0m
+[0m→ [0mRead package.json
+[0m→ [0mRead README.md
+[0m→ [0mRead src/index.ts
+<think>
+Now I understand the structure. Let me also look at the existing test file and other source files to get more context.
+</think>
+[0m→ [0mRead test/server.test.ts
+[0m→ [0mRead src/types.ts
+[0m→ [0mRead src/tools.ts
+[0m→ [0mRead tsconfig.json
+[0m→ [0mRead .gitignore
+[0m
+[0m$ [0mls dist 2>/dev/null || echo "no dist yet"
+no dist yet
+[0m
+[0m# [0mTodos
+[•] Fix src/index.ts: add serialized request queue, make shutdown wait for prior responses
+[ ] Add pipelined burst test in test/server.test.ts
+[ ] Run npm run build and verify it passes
+[ ] Run npm test and verify all tests pass
+[ ] Run manual pipeline smoke test
+[0m
+<think>
+Now I have a clear understanding of the code. Let me plan the fix.
+
+## The bug
+
+In `src/index.ts`, the `readline.on("line", ...)` handler is `async` and dispatches each request independently. The `shutdown` handler does:
+
+```ts
+case "shutdown": {
+  ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+  setImmediate(() => process.exit(0));
+  return null;
+}
+```
+
+When the user writes all five requests in one burst (without waiting for responses), `readline` parses them in order and fires "line" events. Since the handler is async and each call to `await handleRequest` is independent, but the readline interface also queues line events. 
+
+Actually, looking more carefully: the `rl.on("line", ...)` handler is async. When a line event fires, Node's EventEmitter will only fire the next line event after the previous handler returns (well, sort of — since it's async, the synchronous part runs to completion, but awaits pause execution).
+
+Hmm, let me think again. The way readline works in Node.js: by default, `rl.on("line", ...)` allows multiple line events to be dispatched in the same tick, but if the listener is async, JavaScript's event loop will:
+- Fire event 1 → starts async handler → awaits → suspends
+- Fire event 2 → starts async handler → awaits → suspends
+- Fire event 3 → starts async handler → awaits → suspends
+- Fire event 4 → starts async handler → awaits → suspends
+- Fire event 5 → starts async handler → hits shutdown, calls `setImmediate(() => process.exit(0))`, returns null
+- After microtasks flush, `setImmediate` fires → `process.exit(0)` → process dies
+
+Meanwhile, events 1-4 are still awaiting their async handlers. The process is killed before they can write their responses.
+
+So yes — this is the bug. The shutdown is processed without waiting for earlier async tool calls to complete.
+
+## The fix
+
+I need to:
+1. Serialize request handling: each request is processed in arrival order, and the next one doesn't start until the current one has fully written its response.
+2. Make `shutdown` wait until all prior requests are done and their responses flushed, then exit.
+
+The cleanest approach is to use a chained promise queue (a "mutex" or "serial" wrapper).
+
+Let me design the fix:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+
+function enqueue(task: () => Promise<void>): void {
+  const next = processingChain.then(task, task);
+  // Swallow errors here so they don't poison the chain.
+  processingChain = next.catch(() => undefined);
+}
+```
+
+Each line handler enqueues a task that calls handleRequest and writes the response. Tasks run strictly in order.
+
+For shutdown specifically:
+- Don't call `process.exit` from within the handler.
+- Instead, return the response object (don't write it directly), and let the queue's normal completion path write it, then the chain has a chance to flush.
+
+Actually, the shutdown handler currently does:
+```ts
+ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+setImmediate(() => process.exit(0));
+return null;
+```
+
+This is problematic because:
+1. The write happens at the time shutdown is processed, but the queue might not have flushed prior async writes yet.
+2. The `setImmediate` doesn't wait for pending writes — and even if it did, the async tool calls in the queue haven't completed.
+
+So I need to:
+1. Process shutdown in the queue like everything else.
+2. After the queue fully drains (including the shutdown response being written), then exit.
+
+Approach:
+- Make the queue track whether it has work. When the queue is fully drained AND we've seen a shutdown request, exit.
+- Or, simpler: after each task in the chain runs, check if there are more pending tasks; if not, and shutdown was requested, exit.
+
+Let me think about this more carefully.
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+
+function enqueue(task: () => Promise<void>): void {
+  processingChain = processingChain.then(task, task);
+}
+
+// In line handler:
+enqueue(async () => {
+  // ... process and write response
+  if (shutdownRequested) {
+    // Wait for stdout to flush, then exit.
+    // Use setImmediate or write callback to ensure flush.
+  }
+});
+```
+
+Hmm, but `process.stdout.write` to a TTY/pipe — does it have a callback we can use? Yes, `process.stdout.write(data, callback)`. But we need to make sure the parent process has actually received the data.
+
+Actually, for stdio pipes, `process.stdout.write` returns a boolean indicating whether to continue writing, but doesn't directly tell us when the OS-level write to the pipe is complete. There's no easy cross-platform "flush" for process.stdout in Node.js.
+
+The standard pattern is:
+```ts
+process.stdout.write(line, () => {
+  process.exit(0);
+});
+```
+
+The callback fires when the data has been written to the OS's pipe buffer. For pipes, the parent process should have the data available at that point.
+
+So the design is:
+1. Each line enqueues a task.
+2. The task awaits handleRequest, writes the response.
+3. If shutdown is requested and this was the last task, schedule exit.
+
+But "last task" is hard to determine because the chain only knows about its current state, not about future tasks.
+
+Alternative: when shutdown is requested, wait until the chain is fully idle, then exit.
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+
+function enqueue(task: () => Promise<void>): void {
+  const previous = processingChain;
+  processingChain = previous.then(task, task);
+  // If shutdown is requested, we want to exit after this task (and any other
+  // enqueued tasks) have completed. We do this by adding a tail task that
+  // checks the shutdown state and exits.
+}
+```
+
+Hmm, let me think again. The cleanest pattern is:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+
+function enqueue(task: () => Promise<void>): void {
+  processingChain = processingChain.then(task, task).catch(err => {
+    log(`error in queue: ${err}`);
+  });
+}
+
+async function maybeExit(): Promise<void> {
+  if (shutdownRequested) {
+    // Wait for stdout to flush, then exit.
+    process.stdout.write("", () => {
+      process.exit(0);
+    });
+  }
+}
+```
+
+Wait, this won't quite work because the task that processes shutdown would also call maybeExit, and it would run before the task is added to the chain.
+
+Let me rethink. The shutdown task is enqueued just like any other task. After it's enqueued, no more tasks should come (since the parent is waiting for the shutdown response and then likely closing stdin). The enqueue function returns a chain promise — when all tasks have completed, we can check if shutdown was requested and exit.
+
+Actually, here's a clean approach:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+
+function enqueue(task: () => Promise<void>): void {
+  processingChain = processingChain.then(task, task);
+  // Don't catch here — let errors bubble so we don't accidentally swallow them.
+  // Actually, we should catch to prevent an unhandled rejection in the chain.
+}
+
+enqueue(/* initial sentinel */);
+```
+
+Wait, no. Let me think about the order of operations.
+
+When all five lines are written in one burst:
+1. readline emits "line" 5 times in rapid succession (synchronously, on the same tick, I believe — or queued microtasks).
+2. Each line handler synchronously calls `enqueue()`, which synchronously appends to `processingChain`.
+3. After all 5 line events are processed, we have a chain with 5 tasks.
+4. The first task starts running on the next microtask.
+5. ... task 1 completes, writes response. task 2 starts. ... task 5 (shutdown) runs, writes response.
+6. After task 5, the chain is complete (no more pending work).
+7. We can then exit.
+
+The challenge: how do we know the chain is complete? We can use the chain promise itself:
+
+```ts
+const currentChain = processingChain;
+currentChain.then(() => {
+  if (shutdownRequested) {
+    // Schedule exit after the current write flushes.
+    process.exit(0);
+  }
+});
+```
+
+But this needs to be done at the right time. We can do it at the end of each enqueue call: "after this enqueue completes, check if shutdown was requested and exit."
+
+Actually, the cleanest pattern: the shutdown task itself handles the exit logic. The shutdown task:
+1. Awaits its handler (which returns a response for the shutdown request).
+2. Writes the response.
+3. Schedules exit.
+
+But the response writing for the shutdown task might race with the responses for the previous tasks. Hmm, but since the chain is strictly ordered, the previous responses will have been written before the shutdown task starts.
+
+So the flow:
+1. enqueue(task1) — task1 does an async tool call, eventually writes response
+2. enqueue(task2) — task2 does an async tool call, eventually writes response
+3. enqueue(task3) — ... 
+4. enqueue(task4) — ...
+5. enqueue(task5: shutdown) — task5 writes the shutdown response, then schedules exit
+
+After task5 completes, all prior responses have been written (because the chain is sequential). The shutdown response is written last. Then we exit.
+
+The issue is: "schedule exit" — how do we know the write flushed? In Node.js, `process.stdout.write(data, callback)` invokes the callback when the data has been written to the underlying file descriptor. For pipes, the data will be in the pipe buffer at that point. Then we can safely exit.
+
+For shutdown, we want to make sure the shutdown RESPONSE itself is flushed too. So:
+
+```ts
+case "shutdown": {
+  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+}
+```
+
+This returns a response. The queue's normal flow writes it. Then the queue's tail checks if shutdown was requested and exits.
+
+Or: in the shutdown handler, set a flag, and have a separate watcher that exits when the queue is idle and the flag is set.
+
+Let me design this:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void>): void {
+  // Append to the chain. The chain runs tasks strictly in order.
+  processingChain = processingChain.then(task, task);
+  // Schedule a check: if shutdown was requested, and this is the last
+  // enqueued task, exit after it completes.
+  processingChain.then(() => {
+    if (shutdownRequested && !exited) {
+      exited = true;
+      // Give stdout a moment to flush, then exit.
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }
+  }).catch(() => undefined);
+}
+```
+
+Hmm, but every enqueue adds a "then" check. After all 5 enqueues, there will be 5 "then" callbacks scheduled, all of which would try to exit. The first one wins (sets exited = true), the rest no-op. But they all fire at slightly different times — actually, they all fire in order, but the chain has already settled by the time the first one fires.
+
+Wait no, the .then on processingChain only fires after processingChain resolves. The chain is the entire accumulated promise. If I add a .then to processingChain after each enqueue, each subsequent enqueue creates a new processingChain, and the old .then attached to the old processingChain still fires.
+
+This is getting complicated. Let me simplify:
+
+Approach 2: Use a single "tail" that runs after the entire chain settles.
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void>): void {
+  processingChain = processingChain.then(task, task);
+}
+
+// After enqueuing a task, attach a tail that exits if shutdown was requested.
+function enqueueWithExit(task: () => Promise<void>): void {
+  enqueue(task);
+  // Attach a tail to the current chain.
+  const tail = processingChain.then(() => undefined, () => undefined);
+  tail.then(() => {
+    if (shutdownRequested && !exited) {
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }
+  }).catch(() => undefined);
+}
+```
+
+Hmm, this is still not quite right. Let me think again.
+
+Simplest approach: when shutdown is received, after the current chain settles, exit. The shutdown handler itself enqueues a task that just sets the shutdown flag. Then a separate "watcher" runs after the entire chain settles.
+
+Actually, even simpler: make the shutdown task the last in the chain, and have it do the exit:
+
+```ts
+case "shutdown": {
+  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+}
+```
+
+The shutdown response is returned (not written directly). The queue's normal flow:
+1. Calls handleRequest — gets the response object.
+2. Writes the response via writeLine.
+3. If this is the last task AND shutdown was requested, schedule exit.
+
+But "is this the last task" is hard. The queue doesn't know.
+
+OK here's the cleanest design:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function processLine(line: string): void {
+  processingChain = processingChain.then(async () => {
+    // ... parse, dispatch, write response ...
+    // After all writes are done, the chain moves to the next task.
+  });
+}
+
+// When shutdown happens, we want to exit after the chain settles.
+// We can do this by tracking the current "tail" of the chain separately.
+
+function requestShutdown(): void {
+  shutdownRequested = true;
+  // Watch the chain; when it settles, exit.
+  const tail = processingChain;
+  tail.then(() => {
+    if (shutdownRequested && !exited) {
+      exited = true;
+      // Wait for stdout to flush, then exit.
+      process.stdout.write("", () => process.exit(0));
+    }
+  }, () => {
+    if (shutdownRequested && !exited) {
+      exited = true;
+      process.stdout.write("", () => process.exit(0));
+    }
+  });
+}
+```
+
+Hmm, but this has a race: if we call `requestShutdown` BEFORE enqueueing the shutdown task, the tail will resolve before the shutdown response is written. Wait, no — requestShutdown is called from within the shutdown task, so by the time we call it, the shutdown task's write has completed (because we wrote the response, then called requestShutdown).
+
+Wait, no. The shutdown task is in the chain. The chain runs the task. The task:
+1. Calls handleRequest → gets response.
+2. Writes response.
+3. Marks shutdownRequested = true.
+4. Returns.
+
+After the task returns, the chain moves to the next task. If there are no more tasks, the chain resolves.
+
+But I called requestShutdown from WITHIN the task, so at that point, processingChain already includes the next-task slot (or is at the end of the chain). The tail I capture then will be the current processingChain.
+
+Hmm wait, this is confusing. Let me re-think.
+
+OK here's a different approach: have the queue be a "current" promise that gets updated. Each enqueue creates a new task promise and replaces the current. The tail of the chain is whatever the current promise is at the time of the next enqueue. So when shutdown is processed:
+
+1. Tasks 1-4 are enqueued (synchronously, by the readline events).
+2. Task 5 (shutdown) is enqueued. processingChain = task1.then(task2).then(task3).then(task4).then(task5).
+3. The chain runs task1, task2, task3, task4, task5 in order.
+4. Task 5 writes the shutdown response, then signals shutdown.
+5. After the chain settles (which happens after task 5 completes), we check if shutdown was requested, and exit.
+
+To implement step 5, we need a "watcher" that runs after the chain settles. This watcher is itself a .then() on the chain.
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void>): void {
+  processingChain = processingChain.then(task, task);
+}
+
+// In line handler:
+enqueue(async () => {
+  // ... parse, dispatch, write response ...
+  if (req.method === "shutdown") {
+    shutdownRequested = true;
+    // Schedule exit after the current chain settles.
+    // Since this task is part of the chain, processingChain currently
+    // includes this task and any subsequent tasks. The chain will
+    // resolve after all of them complete.
+    processingChain.then(() => {
+      if (shutdownRequested && !exited) {
+        exited = true;
+        // Ensure stdout is flushed before exiting.
+        process.stdout.write("", () => {
+          process.exit(0);
+        });
+      }
+    }).catch(() => undefined);
+  }
+});
+```
+
+Wait, but the .then I add on processingChain inside the task body is scheduled to run after the CURRENT processingChain resolves. The current processingChain at that point includes the current task (which is in progress) and any subsequent tasks. So this .then fires after the entire chain resolves. Good.
+
+But there's still a race: what if a new task is enqueued AFTER the shutdown task's .then has been attached? The new task would update processingChain, but the .then is attached to the old processingChain (the snapshot at the time of the snapshot). So the .then still fires when the snapshot resolves, which might be before the new task completes.
+
+Hmm. In practice, this shouldn't happen because the parent process writes the shutdown request and then waits for the response (or doesn't, in which case the response is the last one). But to be safe, I should attach the .then to a reference that always points to the LATEST processingChain.
+
+Actually, the simplest approach: attach the .then to processingChain, but capture the value of processingChain at the time of attachment. The .then fires when that captured value resolves, which is after all tasks enqueued up to that point complete. If new tasks are enqueued later, they update processingChain to a new value, and the old .then might fire before those new tasks complete.
+
+This is the same issue as before. Let me think about whether this matters.
+
+In the bug scenario:
+- 5 lines written in one burst.
+- readline fires 5 "line" events synchronously (or in the same microtask phase).
+- Each handler synchronously calls enqueue, which synchronously updates processingChain.
+- After all 5 line events, processingChain is the full chain.
+- The chain runs task1 → task2 → task3 → task4 → task5.
+- Task 5 (shutdown) writes response, sets shutdownRequested = true, and attaches a .then to processingChain.
+- The .then fires after the entire chain resolves, then exits.
+
+This works! No race because there are no tasks enqueued after the shutdown task in the burst scenario.
+
+What if the parent writes shutdown, then writes another request after? That's a protocol violation (shutdown should be the last request), but let's handle it gracefully. In that case, processingChain gets a new task appended after the shutdown task. The .then attached inside the shutdown task is on the OLD processingChain, which resolves after the shutdown task completes. The new task runs after that, completing later. The exit would happen before the new task completes.
+
+To handle this correctly, I should keep a separate "exitWatcher" that always points to the current processingChain:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+let exitWatcherScheduled = false;
+
+function maybeScheduleExit(): void {
+  if (shutdownRequested && !exited && !exitWatcherScheduled) {
+    exitWatcherScheduled = true;
+    // Always attach to the current processingChain.
+    const chain = processingChain;
+    chain.then(() => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }, () => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    });
+  }
+}
+```
+
+And in the shutdown handler, set shutdownRequested = true and call maybeScheduleExit. But this is getting overly complex for a scenario that shouldn't happen.
+
+Let me step back. The minimum fix:
+1. Serialize request handling so each request is processed in order, with the previous response fully written before the next starts.
+2. Make shutdown exit only after all prior responses are flushed.
+
+For (1), I'll use a chained promise queue.
+
+For (2), the shutdown task itself should write its response (via the queue's normal write mechanism), and then schedule exit after the queue drains.
+
+Here's my plan:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+
+function enqueue(task: () => Promise<void> | void): void {
+  // Each task is appended to the chain so they run strictly in order.
+  // The next task only starts after the current one (and its async work) has
+  // settled. Errors in one task don't break the chain.
+  const next = processingChain.then(
+    () => Promise.resolve(task()).catch((err) => {
+      log(`task error: ${(err as Error).message}`);
+    }),
+    () => Promise.resolve(task()).catch((err) => {
+      log(`task error: ${(err as Error).message}`);
+    })
+  );
+  processingChain = next;
+}
+```
+
+Wait, this is a little redundant. Let me simplify:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+
+function enqueue(task: () => Promise<void> | void): void {
+  const next = processingChain.then(() => task());
+  // If task() throws, we want to catch it so the chain doesn't break,
+  // but we also want subsequent tasks to still run. We use .catch to
+  // swallow the error after logging.
+  processingChain = next.then(
+    () => undefined,
+    (err) => {
+      log(`queue task error: ${(err as Error).message}`);
+    }
+  );
+}
+```
+
+Hmm, but if the task returns a promise that rejects, the .then in `next` will pass that rejection through, and the .then in `processingChain` will catch it. That works.
+
+Actually, let me think about this differently. The pattern I want is:
+
+```ts
+processingChain = processingChain.then(task, task);
+```
+
+This means: run task regardless of whether the previous chain resolved or rejected. The result (resolve or reject) becomes the new processingChain. If task rejects, processingChain becomes a rejected promise, and the next enqueue will still chain off of it via `then(task, task)`.
+
+To prevent unhandled rejection warnings, I can add a default .catch at the end:
+
+```ts
+function enqueue(task: () => Promise<void> | void): void {
+  processingChain = processingChain.then(task, task);
+}
+```
+
+If task rejects, the resulting processingChain is rejected. The next enqueue will use `then(task, task)` which runs task on rejection too. So no unhandled rejection should occur unless processingChain is rejected and no more tasks are enqueued. To be safe, I can add a noop .catch:
+
+```ts
+function enqueue(task: () => Promise<void> | void): void {
+  const prev = processingChain;
+  processingChain = prev.then(task, task);
+  // Swallow any unhandled rejection in the tail.
+  processingChain.catch(() => undefined);
+}
+```
+
+Wait, but if I add a .catch to processingChain, it doesn't help — the original promise is still the same. The .catch creates a NEW promise that resolves. But the original is still rejected.
+
+Hmm. Actually, the .catch on processingChain creates a new promise that resolves successfully. The unhandled rejection of the original might still fire. Let me think...
+
+Actually, in Node.js, if you do `p.catch(() => {})`, the original `p` is still rejected, but the rejection is "handled" because there's a .catch on it. No unhandled rejection warning.
+
+OK so `processingChain.catch(() => undefined)` should prevent unhandled rejection warnings on the chain.
+
+But wait, this is a no-op since we don't use the result. Let me just not bother and use a different pattern:
+
+```ts
+function enqueue(task: () => Promise<void> | void): void {
+  processingChain = processingChain.then(
+    async () => {
+      try {
+        await task();
+      } catch (err) {
+        log(`queue task error: ${(err as Error).message}`);
+      }
+    }
+  );
+}
+```
+
+This way, each task's errors are caught and logged within the task wrapper. The chain only ever has resolved promises (except for the very first one which starts as resolved).
+
+Hmm, but if a task synchronously throws, the wrapper still catches it. And if it returns a rejected promise, await also catches. 
+
+Actually, I realize there's a simpler way:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+
+function enqueue(task: () => Promise<void> | void): void {
+  processingChain = processingChain.then(task, task);
+  // The chain might be rejected; add a noop .catch to avoid unhandled rejection.
+  void processingChain.catch(() => undefined);
+}
+```
+
+OK let me just go with this. Now for the shutdown:
+
+```ts
+case "shutdown": {
+  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+}
+```
+
+The shutdown returns a response. The queue's normal flow writes it. After the chain settles, we need to exit.
+
+How to know the chain has settled? We can attach a "tail" to the chain:
+
+```ts
+// After enqueueing the shutdown task, attach a tail that exits.
+```
+
+But the issue is: when do we attach the tail? Inside the shutdown task? Or after the shutdown response is written?
+
+Let me think. The cleanest design:
+
+1. Each line handler enqueues a task.
+2. The task does its async work, then writes the response via writeLine.
+3. After the response is written, the task returns.
+4. The chain moves to the next task.
+5. After all tasks in the chain are done, if shutdown was requested, exit.
+
+To know "shutdown was requested", I track it with a flag. The flag is set inside the shutdown task, BEFORE the task returns.
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void> | void): void {
+  processingChain = processingChain.then(task, task);
+}
+
+// At the end of each task, after writing the response, if shutdown was
+// requested and the task is "done", we need to wait for any subsequent
+// tasks to complete before exiting.
+
+// Actually, simpler: the shutdown task, after writing its response,
+// schedules an exit watcher on the current processingChain.
+```
+
+OK here's the cleanest design I can come up with:
+
+```ts
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void> | void): void {
+  processingChain = processingChain.then(task, task);
+}
+
+// Schedule exit after the current chain settles, if shutdown is requested.
+function scheduleExitIfShutdownRequested(): void {
+  if (shutdownRequested && !exited) {
+    const chain = processingChain;
+    chain.then(() => {
+      if (!exited) {
+        exited = true;
+        // Wait for stdout to flush, then exit.
+        process.stdout.write("", () => {
+          process.exit(0);
+        });
+      }
+    }, () => {
+      if (!exited) {
+        exited = true;
+        process.stdout.write("", () => {
+          process.exit(0);
+        });
+      }
+    });
+  }
+}
+```
+
+In the line handler:
+
+```ts
+enqueue(async () => {
+  // ... parse, dispatch ...
+  const resp = await handleRequest(parsed, ctx);
+  if (resp !== null) writeLine(JSON.stringify(resp));
+  if (parsed.method === "shutdown") {
+    shutdownRequested = true;
+    scheduleExitIfShutdownRequested();
+  }
+});
+```
+
+But the shutdown handler currently does:
+```ts
+case "shutdown": {
+  ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+  setImmediate(() => process.exit(0));
+  return null;
+}
+```
+
+I need to change this so that the shutdown response is written via the normal queue flow, and the exit is scheduled after the chain settles.
+
+Let me restructure:
+
+```ts
+case "shutdown": {
+  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+}
+```
+
+And in the line handler:
+```ts
+enqueue(async () => {
+  // ... parse, dispatch ...
+  const resp = await handleRequest(parsed, ctx);
+  if (resp !== null) writeLine(JSON.stringify(resp));
+  if (parsed.method === "shutdown") {
+    shutdownRequested = true;
+    // Wait for the entire chain to drain before exiting.
+    const chain = processingChain;
+    chain.then(() => {
+      if (!exited) {
+        exited = true;
+        process.stdout.write("", () => {
+          process.exit(0);
+        });
+      }
+    }).catch(() => undefined);
+  }
+});
+```
+
+Hmm wait, there's still the issue. The line handler does `enqueue(async () => {...})` which updates processingChain. Then inside the task, we capture `processingChain` AFTER the enqueue. But the enqueue is synchronous, so the captured value is the chain INCLUDING this task and any subsequent tasks. So the .then fires after all of them complete. Good.
+
+But what if the parent writes shutdown and then closes stdin (which triggers rl.on("close") which calls process.exit(0))? Then we'd have two process.exit(0) calls, but only one wins. The first one fires when its .then resolves, the second one is from rl.on("close") which fires when stdin closes.
+
+Actually, the rl.on("close") handler currently does:
+```ts
+rl.on("close", () => {
+  log("stdin closed, exiting");
+  process.exit(0);
+});
+```
+
+If shutdown was processed and the response written, the parent might close stdin. This would trigger rl.on("close"), which calls process.exit(0). But the parent has already received the shutdown response, so the exit happens cleanly.
+
+But the bug scenario: if shutdown is processed in the queue and the queue is still draining (other async tasks pending), then process.exit(0) from rl.on("close") would kill the process before those responses are written.
+
+Actually, wait — the rl.on("close") fires when stdin closes, which happens when the parent process closes its end of the pipe. In the bug scenario, the parent writes 5 messages and then waits for responses. It doesn't close stdin until it receives all responses (or it expects shutdown to be the last). So rl.on("close") wouldn't fire until after the parent has received the shutdown response and closed its end.
+
+But in the broken current code, shutdown exits the process before prior responses are written, so the parent might never see them. The fix is to ensure the queue drains first.
+
+OK let me also think: what about rl.on("close")? Should I remove it? Or keep it but only call process.exit if shutdown was already requested (meaning everything was processed)?
+
+I think the right behavior is:
+- If stdin closes, exit cleanly (after any in-flight queue tasks finish).
+- If shutdown is requested, exit after the queue drains.
+
+Both should respect the queue.
+
+So rl.on("close") should also wait for the chain to drain:
+
+```ts
+rl.on("close", () => {
+  log("stdin closed, exiting");
+  // Wait for the queue to drain before exiting.
+  processingChain.then(() => {
+    process.exit(0);
+  }).catch(() => {
+    process.exit(0);
+  });
+});
+```
+
+But there's still a subtle issue: if the queue is processing shutdown (which schedules its own exit), and meanwhile stdin closes (rl.on("close")), we'd have two .then on the chain, both trying to exit. The first one wins (exits), the second one is a no-op due to the exited flag.
+
+Actually, in the current bug scenario, the parent writes all 5 lines in one burst and then... well, the test we need to write will write all 5 lines in one burst and then read responses. The parent doesn't close stdin until after it sees the shutdown response. So rl.on("close") fires only after the queue is done.
+
+OK let me design the final solution:
+
+```ts
+// Module-level state
+let processingChain: Promise<void> = Promise.resolve();
+let shutdownRequested = false;
+let exited = false;
+
+function enqueue(task: () => Promise<void> | void): void {
+  // Append the task to the serial queue. Each task runs strictly after
+  // the previous one settles, so requests are processed in arrival order
+  // and each response is fully written before the next request begins.
+  const next = processingChain.then(task, task);
+  // Avoid unhandled-rejection warnings if a task throws.
+  void next.catch(() => undefined);
+  processingChain = next;
+}
+
+function scheduleExit(): void {
+  if (exited) return;
+  exited = true;
+  // Wait for the queue to fully drain, then flush stdout, then exit.
+  processingChain.then(
+    () => {
+      // Empty write + callback fires once stdout has drained to the OS.
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    },
+    () => {
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }
+  );
+}
+```
+
+And the line handler:
+
+```ts
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  enqueue(async () => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      writeLine(
+        JSON.stringify(
+          makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
+        )
+      );
+      return;
+    }
+
+    if (!isJsonRpcRequest(parsed)) {
+      writeLine(
+        JSON.stringify(
+          makeError(
+            (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
+            JSON_RPC_ERRORS.INVALID_REQUEST,
+            "Invalid JSON-RPC 2.0 request"
+          )
+        )
+      );
+      return;
+    }
+
+    try {
+      const resp = await handleRequest(parsed, { writeLine });
+      if (resp !== null) writeLine(JSON.stringify(resp));
+      if (parsed.method === "shutdown") {
+        shutdownRequested = true;
+        scheduleExit();
+      }
+    } catch (err) {
+      writeLine(
+        JSON.stringify(
+          makeError(
+            parsed.id ?? null,
+            JSON_RPC_ERRORS.INTERNAL_ERROR,
+            (err as Error).message
+          )
+        )
+      );
+    }
+  });
+});
+```
+
+And the shutdown handler becomes:
+
+```ts
+case "shutdown": {
+  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+}
+```
+
+And rl.on("close"):
+
+```ts
+rl.on("close", () => {
+  log("stdin closed, exiting");
+  if (!exited) {
+    scheduleExit();
+  }
+});
+```
+
+Wait, there's an issue with `scheduleExit` — I'm using `exited` as a guard, but it's set to true before the chain actually settles. So if scheduleExit is called twice (once from shutdown, once from rl.close), the second call is a no-op due to the `exited` flag. Good.
+
+But what if scheduleExit is called, then more tasks are enqueued (which would update processingChain to a new value)? The scheduleExit's .then is on the OLD processingChain. The old chain settles before the new tasks complete. The exit would happen before the new tasks complete.
+
+Hmm. To handle this, I should re-attach to the current processingChain whenever scheduleExit is called:
+
+```ts
+function scheduleExit(): void {
+  // Always attach to the current processingChain, not a stale one.
+  processingChain.then(
+    () => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    },
+    () => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }
+  );
+}
+```
+
+But this re-attaches every time. If scheduleExit is called multiple times, we get multiple .then handlers, all racing to set `exited = true` and exit. The first one wins.
+
+But each .then handler is attached to the current processingChain. If a new task is enqueued between two scheduleExit calls, the second call's .then is on a different (later) chain, so it fires after the new task. 
+
+Actually wait, I think I'm overcomplicating this. Let me re-examine the bug scenario:
+
+1. Parent writes 5 lines in a burst.
+2. readline fires 5 "line" events synchronously.
+3. Each line handler calls enqueue, which appends to processingChain.
+4. After all 5 events, processingChain is the full chain.
+5. The chain starts running task1.
+6. Task1 awaits handleRequest (async tool call), then writes response.
+7. Task1 done; chain runs task2.
+8. ... task2, task3, task4, task5 ...
+9. Task5 (shutdown) writes response, sets shutdownRequested = true, calls scheduleExit.
+10. scheduleExit attaches .then to processingChain (which is the full chain).
+11. The .then fires after the chain settles. All responses have been written.
+12. Exit.
+
+This works. The issue would only arise if a new task is enqueued AFTER step 9. But that shouldn't happen in the bug scenario because the parent doesn't write more after shutdown.
+
+But to be safe, I can use the "always current chain" pattern:
+
+```ts
+function scheduleExit(): void {
+  const chain = processingChain;
+  chain.then(
+    () => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    },
+    () => {
+      if (exited) return;
+      exited = true;
+      process.stdout.write("", () => {
+        process.exit(0);
+      });
+    }
+  );
+}
+```
+
+This captures the current processingChain at the time of the call. Subsequent enqueues update processingChain to a new value, but the captured chain still resolves after all the tasks it contains complete. The exit happens after those tasks complete.
+
+If a new task is enqueued after scheduleExit, the exit happens before that new task completes. But the new task might be in the queue and not yet written. The parent would not see its response.
+
+This is still a potential issue, but it's a rare edge case (the parent shouldn't write more after shutdown). And it's a behavior that exists in the broken code too (in fact, the broken code's shutdown exits immediately, dropping even more).
+
+OK let me just go with this. Let me also think about the `rl.on("close")` handler. If the parent closes stdin after writing the 5 lines, what happens?
+
+The "close" event fires when stdin is fully closed (no more data). The "line" events for all 5 lines should have already fired by the time "close" fires (assuming the parent wrote all lines and then closed).
+
+So the flow is:
+1. Parent writes 5 lines.
+2. readline parses them, fires 5 "line" events synchronously (or via the event loop, but quickly).
+3. Parent closes stdin.
+4. readline fires "close" event.
+5. By this time, all 5 line events have already enqueued tasks.
+6. The tasks run sequentially.
+7. The last task (shutdown) writes the response, schedules exit.
+8. rl.on("close") fires, calls scheduleExit.
+9. Both scheduleExit calls attach .then to processingChain (the current chain).
+10. After the chain settles, the first .then fires, sets exited = true, calls process.exit(0).
+11. The second .then fires later (or doesn't, since exited is already true), no-op.
+
+Wait, step 9: the two scheduleExit calls happen at different times. The first one (from shutdown task) captures processingChain at that point. The second one (from rl.close) captures processingChain at a later point. If no new tasks were enqueued between them, both capture the same processingChain.
+
+But the timing of step 9 matters: when does rl.on("close") fire relative to the shutdown task? If the parent closes stdin immediately after writing the 5 lines (before waiting for any responses), the "close" event fires before the tasks have even started running. So rl.on("close") fires when the queue is full of pending tasks, and scheduleExit attaches a .then to processingChain. The .then fires after the tasks complete, so the exit is correct.
+
+OK I think this design is sound. Let me code it up.
+
+One more thing: the existing `setImmediate(() => process.exit(0))` in the shutdown handler — I need to remove that. The new shutdown handler just returns the response, and the queue + scheduleExit handles the rest.
+
+Also, the `rl.on("close")` handler currently calls process.exit(0) directly. I need to make it use scheduleExit too.
+
+Let me also think about the test. The test needs to:
+1. Spawn the server.
+2. Write all 5 requests in one burst (without awaiting responses).
+3. Read all 5 responses in order.
+4. Verify they arrive in order (ids 1-5) before the process exits.
+
+The current test infrastructure has a JsonRpcClient with a `call` method that returns a promise. Each `call` writes a request and waits for a response. The "burst" scenario means writing all 5 requests without awaiting any responses.
+
+The test should:
+1. Write all 5 lines to the server's stdin in a single burst (using `client.rawStdin.write(...)` with all 5 lines joined by "\n").
+2. Then read all 5 responses in order from the server's stdout.
+3. Verify the ids are 1, 2, 3, 4, 5 in order.
+4. Verify the process exits.
+
+Let me look at the current client to see if it can handle this. The client's `onData` method parses each line and dispatches to pending or notifications. If I write all 5 lines at once, they'll be parsed and dispatched. But the client uses a pending map keyed by id. So each response is routed to the correct pending promise.
+
+For the burst test, I can:
+1. Use the client to write 5 calls, but don't await them. Collect the promises.
+2. Then await them all (Promise.all).
+3. Verify they resolve in order (or just check that all resolve and the ids are 1-5).
+
+Or, simpler:
+1. Use the client to call 5 methods, capturing the promises.
+2. Send all 5 requests in a burst (write to rawStdin).
+3. Await all 5 promises.
+4. Verify the responses.
+
+But the client's `call` method writes a request and sets up a pending. If I call `call()` 5 times in a row, it writes 5 requests and sets up 5 pendings. Then I await them. The responses come back in order and resolve the pendings.
+
+But wait, the `call` method is synchronous in writing — it writes the request immediately, sets up the pending, and returns a promise. The promise resolves when the response arrives. So calling `call()` 5 times without awaiting sends 5 requests in a burst.
+
+Let me check: yes, `call()` does `this.child.stdin.write(JSON.stringify(req) + "\n")` synchronously. The write is buffered/queued by the OS pipe. The parent process (the server) reads them all from stdin.
+
+So the test can be:
+```ts
+test("burst of 5 requests all get responses in order", async () => {
+  const client = await startClient();
+  try {
+    // Send all 5 requests in a burst without awaiting.
+    const promises = [
+      client.call("initialize", {}, 10000),
+      client.call("tools/list", {}, 10000),
+      client.call("tools/call", { name: "run_command_safe", arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] } }, 10000),
+      client.call("ping", {}, 10000),
+      client.call("shutdown", {}, 10000),
+    ];
+    const responses = await Promise.all(promises);
+    // Verify ids are 1-5 in order.
+    for (let i = 0; i < responses.length; i++) {
+      assert.equal((responses[i] as { id: number }).id, i + 1);
+    }
+  } finally {
+    await client.shutdown();
+  }
+});
+```
+
+Hmm, but the `call` method uses `this.nextId++` which starts at 1. So the first call gets id=1, second gets id=2, etc. The responses should have matching ids.
+
+The ids in the response are set by the server based on the request's id, so they should be 1, 2, 3, 4, 5 in order.
+
+Now, will the test actually fail with the current broken code? Let me think:
+
+Current code:
+1. Parent writes 5 requests in a burst.
+2. readline fires 5 "line" events.
+3. Each line handler is async, so they run concurrently (in the sense that they all start and then await).
+4. The shutdown handler writes its response and calls `setImmediate(() => process.exit(0))`.
+5. The setImmediate fires on the next tick, calling process.exit(0).
+6. Before that, the other 4 async handlers might or might not have completed.
+7. The process dies, potentially before all responses are written.
+
+In the test, after writing the 5 requests, we await all 5 promises. The 4 non-shutdown promises might reject (if the server exits before responding), or they might resolve (if the responses were written in time).
+
+With the current code, it's a race. The test might pass sometimes and fail other times. With the fix, it should always pass.
+
+Let me also think: do I need to add a delay or wait for the process to exit in the test? The test should verify that the process exits after all 5 responses. The `client.shutdown()` method at the end should handle that (it waits for the exit event).
+
+Actually, looking at the existing "shutdown" test:
+```ts
+test("shutdown method exits the server", async () => {
+  const client = await startClient();
+  const resp = (await client.call("shutdown", {}, 3000)) as { result?: { shutdown?: boolean } };
+  assert.equal(resp.result?.shutdown, true);
+  // Give the server a moment to exit.
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(client.isExited, "server should have exited after shutdown");
+  await client.shutdown();
+});
+```
+
+It sends a shutdown, awaits the response, waits 300ms, then checks isExited. So the existing pattern is to send shutdown and then verify exit.
+
+For my new test, I'll send all 5 in a burst, await all 5 responses, then verify the order and that the process exits.
+
+Now, the `client.call` method also has a timeout. The default is 5000ms. For 5 requests, we might need a longer timeout. Let me use 10000ms or pass an explicit timeout.
+
+OK let me also think about: when the parent writes 5 lines via `client.rawStdin.write`, is it guaranteed that the server's readline receives all 5 before processing any? Or does readline process line by line as data arrives?
+
+Actually, readline is line-buffered. It accumulates characters until it sees a newline, then emits a "line" event. If the parent writes 5 lines in one go (e.g., "line1\nline2\nline3\nline4\nline5\n"), the OS pipe delivers all the data at once to the server's stdin. readline reads it, splits by newlines, and emits 5 "line" events.
+
+In Node.js, the "line" events are emitted synchronously in a loop within the readline internal processing. So all 5 events are queued before any of the async handlers run.
+
+Wait, actually, let me think more carefully. readline uses internal buffering. When stdin emits "data" (or "readable"), readline processes the data and emits "line" events. The "line" events are emitted synchronously, but if the handler is async, the handler returns a promise immediately, and the next "line" event can be emitted.
+
+So the flow:
+1. stdin receives all 5 lines.
+2. readline processes them, emits "line" event 1.
+3. The line handler runs (synchronous part), which calls enqueue. enqueue synchronously appends to processingChain.
+4. The line handler's async part starts (the enqueued task), which begins executing the parse/dispatch logic. It hits an `await` and suspends.
+5. Control returns to readline, which emits "line" event 2.
+6. The line handler runs, calls enqueue, task starts, hits await, suspends.
+7. ... events 3, 4, 5 ...
+8. Event 5 is shutdown. The handler runs, enqueues the shutdown task. The task starts, writes the response, sets shutdownRequested, calls scheduleExit (or in the broken code, calls setImmediate exit).
+9. The microtask queue processes: task1's await resolves, task1 writes response. task2's await resolves, task2 writes response. ... task4 writes response. task5 (shutdown) was already done.
+10. In the broken code, setImmediate fires, process.exit(0) kills the process. Some of tasks 1-4 might not have written their responses yet.
+
+Wait, let me re-examine. The enqueue function appends to processingChain. The chain runs tasks sequentially. So task1 doesn't start until processingChain is at task1. But the line handler calls enqueue synchronously, which sets processingChain = processingChain.then(task1). So after all 5 line events, processingChain = Promise.resolve().then(task1).then(task2).then(task3).then(task4).then(task5).
+
+The chain starts running on the next microtask. task1 runs, hits await on handleRequest (which awaits the tool handler), suspends. The chain is paused waiting for task1 to resolve.
+
+Meanwhile, the other 4 line events have already fired and enqueued their tasks. But they haven't run yet — they're queued behind task1.
+
+So actually, with the current broken code, the tasks DO run sequentially! Because they're in a chain (implicitly, via the readline event handling + async).
+
+Wait, no. The current code doesn't use a chain. Each line handler is independent. Let me re-read:
+
+```ts
+rl.on("line", async (line) => {
+  // ... parse, dispatch ...
+  const resp = await handleRequest(parsed, { writeLine });
+  if (resp !== null) writeLine(JSON.stringify(resp));
+});
+```
+
+The `rl.on("line", ...)` handler is async. When readline fires "line" event 1, the handler starts. It parses synchronously, then calls `await handleRequest(...)`. The await suspends the handler, and control returns to readline.
+
+readline then fires "line" event 2. The handler starts, parses, awaits, suspends.
+
+This continues for all 5 events. All 5 handlers are now suspended, each at the `await handleRequest(...)` point.
+
+Now, the microtask queue processes. handleRequest for event 1 resolves (it's a sync handler like "initialize"), the handler resumes, writes the response. Then handleRequest for event 2 resolves, handler resumes, writes response. Etc.
+
+For shutdown (event 5), handleRequest returns a response (and in the broken code, the case "shutdown" handler does the write and setImmediate exit itself, not returning a response).
+
+Wait, let me re-read the current shutdown case:
+
+```ts
+case "shutdown": {
+  ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+  setImmediate(() => process.exit(0));
+  return null;
+}
+```
+
+So in handleRequest, the shutdown case writes the response and schedules exit, then returns null. The caller (`rl.on("line", async (line) => ...`) checks `if (resp !== null) writeLine(JSON.stringify(resp))` — since resp is null, it doesn't write again. Good.
+
+So the flow:
+1. Line events 1-5 fire. Handlers 1-4 are suspended at `await handleRequest`. Handler 5 (shutdown) is suspended at `await handleRequest` too.
+2. handleRequest for handler 5 (shutdown) runs: it writes the response, schedules setImmediate exit, returns null.
+3. Handler 5 resumes: resp is null, doesn't write again.
+4. Meanwhile, handlers 1-4 are still suspended. Their handleRequest calls are in progress (async tool calls).
+5. setImmediate fires: process.exit(0) kills the process.
+6. Handlers 1-4 never get to write their responses.
+
+So the bug is real. The shutdown handler completes (writes its response, schedules exit) before the other handlers complete. The setImmediate exit fires and kills the process.
+
+Even though the handlers are "suspended" at the await, the shutdown handler's handleRequest is a sync function (no awaits), so it completes immediately. The setImmediate is scheduled. The microtask queue processes handlers 1-4, but they might be doing async I/O (like run_command_safe which spawns a child process). The setImmediate fires before they complete.
+
+Wait, actually, setImmediate fires after I/O events, on the next "check" phase of the event loop. Microtasks (promise resolutions) fire before setImmediate. So:
+
+1. Handler 5's handleRequest completes (sync), returns null. Handler 5 resumes, does nothing.
+2. Microtask queue: handlers 1-4's handleRequest promises resolve (if they were sync) or are still pending (if async). For sync handlers (initialize, tools/list, ping), they resolve immediately. For async handlers (tools/call with run_command_safe), they're still pending.
+3. setImmediate fires: process.exit(0) kills the process.
+4. The async tool calls never complete.
+
+So the bug is that the sync handlers might complete and write responses, but the async tool call (run_command_safe) doesn't. The process exits before the tool call response is written.
+
+In the bug scenario with 5 requests: initialize, tools/list, tools/call (run_command_safe), shutdown. The shutdown kills the process before the run_command_safe response is written. The other 3 (initialize, tools/list, tools/call wait — wait, tools/call IS the run_command_safe) — hmm, the user said the 5 requests are: initialize, tools/list, tools/call, run_command_safe, shutdown. So 5 requests.
+
+Wait, "run_command_safe" is a tool name, not a JSON-RPC method. The JSON-RPC method is "tools/call" with params { name: "run_command_safe", arguments: {...} }. So the 5 requests are:
+1. initialize
+2. tools/list
+3. tools/call (with some tool, maybe inspect_tree or run_command_safe)
+4. tools/call (with run_command_safe, which is async)
+5. shutdown
+
+Actually, re-reading the user's request: "When initialize, tools/list, tools/call, run_command_safe, and shutdown are written to stdin in one burst". So they mean 5 JSON-RPC requests. The 4th one is a tools/call that invokes run_command_safe. The 5th is shutdown.
+
+So the 5 requests are:
+1. initialize (sync)
+2. tools/list (sync)
+3. tools/call (sync, e.g., inspect_tree which is async-ish but fast)
+4. tools/call with run_command_safe (async, spawns a child process)
+5. shutdown (sync, but exits)
+
+With the broken code, the shutdown exits before the run_command_safe response is written. So responses for ids 1, 2, 3, 5 arrive, but response for id 4 is dropped.
+
+With the fix, the queue serializes everything. The shutdown task is the last in the queue. After it writes its response, the queue drains, then the process exits. All 5 responses are written.
+
+OK my design is correct. Let me code it up.
+
+Actually, wait. Let me re-examine the "synchronous" nature. In the current code, the line handlers are async and start concurrently (suspended at await). The await on handleRequest for sync methods (initialize, tools/list) resolves immediately on the next microtask. The handler resumes and writes the response.
+
+For tools/call with inspect_tree, handleRequest awaits the tool handler (inspectTree), which does async fs operations. So it's pending.
+
+For tools/call with run_command_safe, handleRequest awaits the tool handler (runCommandSafe), which spawns a child process. So it's pending.
+
+For shutdown, handleRequest is sync (returns null after writing the response and scheduling exit).
+
+So in the broken code:
+1. All 5 line handlers are suspended at `await handleRequest`.
+2. handleRequest for shutdown runs (sync), writes shutdown response, schedules setImmediate, returns null.
+3. Microtask: handleRequest for initialize resolves, handler writes response. Similarly for tools/list and the first tools/call (if it was sync, but inspect_tree is async...).
+4. setImmediate fires, process.exit(0).
+5. The run_command_safe handler is still pending (child process running). Its response is never written.
+
+With the fix:
+1. All 5 line events enqueue tasks.
+2. processingChain = task1.then(task2).then(task3).then(task4).then(task5).
+3. task1 runs: handleRequest resolves (sync), writes response. task1 done.
+4. task2 runs: similar.
+5. task3 runs: handleRequest awaits inspect_tree, which does async fs. task3 suspends. After fs completes, task3 resumes, writes response.
+6. task4 runs: handleRequest awaits runCommandSafe, which spawns child. task4 suspends. After child exits, task4 resumes, writes response.
+7. task5 runs: handleRequest returns shutdown response, writes it, schedules exit.
+8. Chain settles. Exit watcher fires, process exits.
+
+All 5 responses written in order. Process exits after.
+
+Great, this is the correct fix.
+
+Now let me think about one more thing: the `client.call` method. When I call `client.call("initialize")` 5 times in a row, it writes 5 requests and sets up 5 pendings. The writes are synchronous (write to the pipe). The OS pipe buffers them. The server reads them all at once.
+
+But wait, does `child.stdin.write()` return true/false based on the high water mark? If the write returns false, we should wait for "drain" before writing more. But for small JSON messages, the pipe buffer is large enough, so writes return true and don't need to wait.
+
+Also, `child.stdin.write()` is asynchronous in the sense that it might queue the write. But for a pipe with available buffer, it writes immediately. The data is in the pipe buffer, available for the server to read.
+
+OK I think the test will work. Let me also think about timing: after writing 5 requests, the server processes them sequentially. The test awaits all 5 promises. The promises resolve as responses arrive. The total time is the sum of the tool call times (e.g., run_command_safe takes some time to spawn and run a process).
+
+For run_command_safe with `node -e "process.stdout.write('ok')"`, it should be fast (< 100ms). So the total test time is manageable.
+
+Let me also think about the `tools/call` for the 3rd request. The user said the 3rd request is "tools/call" (without specifying which tool). I'll use inspect_tree or summarize_package (both are async but fast). Actually, to make the test robust, I should use a tool that is reliably async. inspect_tree does fs.readdir which is async. summarize_package does fs.readFile which is async. run_command_safe spawns a process.
+
+Let me use:
+1. initialize (sync)
+2. tools/list (sync)
+3. tools/call with inspect_tree (async, fast)
+4. tools/call with run_command_safe (async, slower due to process spawn)
+5. shutdown
+
+This way, the 4th request is the slowest, and the test verifies it completes before shutdown exits.
+
+OK let me finalize the code.
+
+One more consideration: the existing test "shutdown method exits the server" calls `client.call("shutdown")` and awaits the response, then checks isExited. With my fix, the shutdown task is in the queue. The queue runs the shutdown task, writes the response, schedules exit. The response is written, so the client's pending resolves. Then the exit fires.
+
+But there's a timing issue: the client's pending resolves when the response is parsed. The exit fires shortly after (after stdout flushes). The test awaits the response, then waits 300ms, then checks isExited. By 300ms, the process should have exited.
+
+With the broken code, the same flow happens, but the process might exit before the shutdown response is written (actually, the broken code writes the shutdown response in handleRequest, which is sync, so it IS written before the setImmediate exit). So the existing shutdown test passes with the broken code.
+
+The new test is about the ORDER and COMPLETENESS of all 5 responses.
+
+OK let me code this up.
+
+Let me also double-check: in the current code, the shutdown case writes the response and schedules exit. The `ctx.writeLine` is `process.stdout.write(line + "\n")`. This is a sync write to stdout. The data is buffered in the stdout buffer. The setImmediate schedules process.exit(0) on the next tick. Between the write and the exit, the stdout buffer is flushed? Not necessarily — process.exit doesn't flush stdout.
+
+Hmm, actually, process.exit does an orderly shutdown which includes flushing stdio. But setImmediate exit is abrupt. Let me check... Actually, process.exit terminates the process immediately, without flushing. The data in the stdout buffer might be lost.
+
+But in practice, for pipes, the data is written to the OS pipe buffer, which is separate from the Node.js stdout buffer. process.stdout.write to a pipe writes to the OS pipe buffer. The OS pipe buffer is available to the reader even after the writer process exits.
+
+Wait, no. process.stdout.write returns a boolean. If it returns true, the data was written to the OS. If false, the buffer is full. For pipes, the OS pipe buffer is typically 64KB. For small messages, writes return true.
+
+Actually, `process.stdout.write` in Node.js is more nuanced. For TTY, it's sync. For pipes, it's async (uses libuv). The data goes into a Node.js internal buffer, then libuv writes it to the OS. The callback (if provided) fires when the OS write completes.
+
+But process.exit(0) terminates the process. If there are pending libuv writes, they might not complete. The data in the Node.js internal buffer is lost.
+
+Hmm, this is a real concern. The `setImmediate(() => process.exit(0))` in the current code might not flush stdout, so the shutdown response might not reach the parent.
+
+But the existing shutdown test passes, so apparently it does work in practice. Maybe libuv flushes on exit? Or maybe the writes are small enough that they're already in the OS buffer?
+
+For safety, in my fix, I'll use `process.stdout.write(data, callback)` and call process.exit(0) in the callback. This ensures the write is flushed before exit.
+
+Actually, let me use a different pattern: write an empty string with a callback. The callback fires when the stdout buffer is drained (i.e., all pending writes have been flushed to the OS).
+
+```ts
+process.stdout.write("", () => {
+  process.exit(0);
+});
+```
+
+Wait, does an empty write with a callback fire when the buffer is drained? Let me check Node.js docs...
+
+`stream.write(chunk[, encoding][, callback])`: "The callback will be called when the data is finally written out, which may not be immediate."
+
+For an empty chunk, the callback is called... hmm, I'm not sure. Let me think of another way.
+
+Alternative: track when the last response is written, then exit after a small delay (e.g., setImmediate or setTimeout 0).
+
+Actually, the simplest approach: after the queue drains, call process.stdout.write with a small chunk and a callback that calls process.exit. Or use process.exit when we're sure everything is written.
+
+Hmm, let me look at how the existing code handles this. The current shutdown does:
+```ts
+ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+setImmediate(() => process.exit(0));
+```
+
+`ctx.writeLine` is `process.stdout.write(line + "\n")` (no callback). `setImmediate` schedules exit on the next "check" phase. Between the write and the setImmediate, the event loop runs I/O, which includes the stdout write to the OS. By the time setImmediate fires, the stdout buffer should be drained (for small messages).
+
+But this is not guaranteed. For larger messages or backpressure, the buffer might not be drained.
+
+For the fix, I'll use a more explicit flush:
+
+```ts
+function flushAndExit(): void {
+  // Write an empty chunk with a callback. The callback fires when the
+  // stdout buffer is fully drained to the OS.
+  if (typeof process.stdout.write === "function") {
+    process.stdout.write("", () => {
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+}
+```
+
+Hmm, actually, I'm not sure the empty write callback fires on drain. Let me check...
+
+In Node.js, `writable.write(chunk, callback)`: "The return value is true if the internal buffer is less than the highWaterMark... The callback is called when the data is finally written out."
+
+For an empty chunk, the callback is called... I think it's called immediately, not on drain. Let me look this up.
+
+Actually, from the Node.js docs: "If the data to be written is empty, the callback will still be called." But it doesn't say when. I think it's called on the next tick, not on drain.
+
+To explicitly wait for drain, you can listen for the "drain" event:
+```ts
+if (process.stdout.writableNeedDrain) {
+  process.stdout.once("drain", () => process.exit(0));
+} else {
+  process.exit(0);
+}
+```
+
+Or, more commonly, use a callback on the last write:
+```ts
+process.stdout.write(lastResponse + "\n", () => {
+  process.exit(0);
+});
+```
+
+The callback fires when the write completes (data is in the OS buffer). For pipes, this means the parent can read it.
+
+Let me use this pattern in the shutdown task. But the shutdown task doesn't know if it's the "last" write. The queue handles the writes. Hmm.
+
+OK simpler approach: in scheduleExit, after the chain settles, do:
+```ts
+// Chain has settled. All responses have been written via process.stdout.write.
+// But we need to ensure the OS has received them before exiting.
+// Use a final write with a callback.
+process.stdout.write("", () => {
+  process.exit(0);
+});
+```
+
+But as I said, I'm not sure the empty write callback fires on drain. Let me just use setImmediate after the chain settles:
+```ts
+processingChain.then(() => {
+  setImmediate(() => process.exit(0));
+});
+```
+
+setImmediate runs after I/O, which includes stdout writes. So by the time setImmediate fires, the stdout buffer should be drained. This is the same pattern as the current broken code, but applied AFTER the chain settles (instead of immediately after the shutdown case).
+
+Actually, I think the safest pattern is:
+```ts
+processingChain.then(() => {
+  // Chain settled. All responses written. Give stdout a moment to flush.
+  // process.stdout.write to a pipe is async via libuv. We need to wait for
+  // the writes to reach the OS before exiting.
+  if (process.stdout.writableLength > 0) {
+    process.stdout.once("drain", () => process.exit(0));
+  } else {
+    setImmediate(() => process.exit(0));
+  }
+});
+```
+
+But `writableLength` might not be reliable. Let me just use setImmediate, which is what the current code does. If the existing shutdown test works, then setImmediate is sufficient.
+
+Actually, you know what, let me just match the current pattern: setImmediate(() => process.exit(0)) after the chain settles. The current code uses this pattern and it works (the shutdown test passes). So it should be fine for the fix too.
+
+Wait, but the current code calls setImmediate from within the shutdown handler, which runs before the chain settles. The setImmediate fires on the next tick, potentially before the chain settles. That's the bug.
+
+In the fix, I call setImmediate (or scheduleExit) AFTER the chain settles, via processingChain.then(...). This ensures the chain has settled before the exit fires.
+
+OK let me just use:
+```ts
+function scheduleExit(): void {
+  if (exited) return;
+  exited = true;
+  processingChain.then(
+    () => {
+      setImmediate(() => process.exit(0));
+    },
+    () => {
+      setImmediate(() => process.exit(0));
+    }
+  );
+}
+```
+
+This ensures the exit fires after the chain settles. setImmediate gives stdout a chance to flush. process.exit terminates the process.
+
+Hmm, but `exited = true` is set before the chain settles. If scheduleExit is called multiple times, only the first call sets exited = true and attaches a .then. Subsequent calls are no-ops. Good.
+
+But what if scheduleExit is called, then more tasks are enqueued, then scheduleExit is called again? The first call's .then is on the old processingChain. The old chain settles before the new tasks complete. The setImmediate fires before the new tasks complete. The new tasks might not get their responses written.
+
+To handle this, I should always attach to the CURRENT processingChain:
+
+```ts
+function scheduleExit(): void {
+  // Attach to the current processingChain. This ensures we wait for all
+  // tasks enqueued so far, including any added after this call.
+  processingChain.then(
+    () => {
+      if (exited) return;
+      exited = true;
+      setImmediate(() => process.exit(0));
+    },
+    () => {
+      if (exited) return;
+      exited = true;
+      setImmediate(() => process.exit(0));
+    }
+  );
+}
+```
+
+But this doesn't set exited = true immediately, so multiple scheduleExit calls each attach a .then. They'd all fire when the chain settles, but only the first one to set exited = true would actually exit. The others would no-op.
+
+But there's a race: if scheduleExit is called from task5 (shutdown), and then rl.on("close") also calls scheduleExit, both attach .then to the same processingChain (assuming no new tasks enqueued). Both .then fire when the chain settles. The first one sets exited = true and calls setImmediate(exit). The second one sees exited = true and no-ops. Good.
+
+If new tasks are enqueued after task5 but before rl.close fires, processingChain is updated. The first scheduleExit's .then is on the old chain, which settles before the new tasks complete. The second scheduleExit's .then is on the new chain, which settles after the new tasks complete. The first .then fires first, sets exited = true, calls setImmediate(exit). The process exits before the new tasks complete.
+
+This is still a problem. But it's an edge case (the parent shouldn't write more after shutdown). And it's no worse than the current broken code.
+
+To truly fix this, I'd need a more complex design. But for the bug at hand (the burst scenario), my fix is sufficient. Let me go with it.
+
+Actually, I just realized: in the burst scenario, the 5 line events fire synchronously (or in the same tick). All 5 enqueue calls happen before any task runs. So processingChain is the full chain from the start. The shutdown task is the last in the chain. When the shutdown task runs and calls scheduleExit, processingChain is the same chain (no new tasks enqueued). The .then fires after the chain settles, which is after the shutdown task. Good.
+
+The only way new tasks get enqueued after the shutdown task is if the parent writes more after shutdown, which is a protocol violation. So my fix is correct for the burst scenario.
+
+OK, final design. Let me code it.
+
+One more thing: I need to make sure the test is robust. The test writes 5 requests in a burst, awaits all 5 responses, and verifies the order. Let me also verify the process exits.
+
+Here's my plan for the test:
+
+```ts
+test("burst of pipelined requests all get responses in order", async () => {
+  const client = await startClient();
+  try {
+    // Write all 5 requests in a single burst without awaiting.
+    const p1 = client.call("initialize", {}, 10000);
+    const p2 = client.call("tools/list", {}, 10000);
+    const p3 = client.call("tools/call", {
+      name: "inspect_tree",
+      arguments: { path: PROJECT_ROOT, maxDepth: 1 },
+    }, 10000);
+    const p4 = client.call("tools/call", {
+      name: "run_command_safe",
+      arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] },
+    }, 10000);
+    const p5 = client.call("shutdown", {}, 10000);
+
+    const responses = await Promise.all([p1, p2, p3, p4, p5]);
+
+    // Verify ids are 1-5 in order.
+    for (let i = 0; i < responses.length; i++) {
+      assert.equal((responses[i] as { id: number }).id, i + 1,
+        `response ${i} should have id ${i + 1}`);
+    }
+
+    // Verify each response has a result (not an error).
+    assert.ok((responses[0] as { result?: { serverInfo?: { name?: string } } }).result?.serverInfo?.name, "initialize should have serverInfo");
+    assert.ok((responses[1] as { result?: { tools?: unknown[] } }).result?.tools, "tools/list should have tools");
+    assert.ok((responses[2] as { result?: { ok?: boolean; data?: unknown } }).result?.ok, "tools/call inspect_tree should be ok");
+    assert.ok((responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.ok, "tools/call run_command_safe should be ok");
+    assert.ok((responses[4] as { result?: { shutdown?: boolean } }).result?.shutdown, "shutdown should be acknowledged");
+
+    // Verify the process exits after all responses.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(client.isExited, "server should have exited after shutdown");
+  } finally {
+    await client.shutdown();
+  }
+});
+```
+
+This test:
+1. Sends 5 requests in a burst (no awaits between calls).
+2. Awaits all 5 responses.
+3. Verifies the ids are 1-5 in order.
+4. Verifies each response has the expected shape.
+5. Verifies the process exits.
+
+The timeout for each call is 10000ms (10 seconds), which should be plenty.
+
+Now let me implement the fix.
+
+Actually, let me re-examine the existing test to make sure my new test follows the same conventions.
+
+The existing tests use `assert.equal`, `assert.ok`, `assert.deepEqual` from `node:assert/strict`. The new test should do the same.
+
+The existing tests use `(await client.call("method"))` and cast the result. The new test uses `Promise.all` to await multiple calls.
+
+OK let me write the code.
+
+One more consideration: the `client.call` method uses `this.nextId++` which starts at 1. So the first call gets id=1, second id=2, etc. The responses should have matching ids. The test verifies this.
+
+But wait, in the burst scenario, the `client.call` calls are made in order: p1 (id=1), p2 (id=2), p3 (id=3), p4 (id=4), p5 (id=5). The server receives them in order (since they're written to the pipe in order). The server processes them in order (with the fix). The responses come back in order. The client receives them in order and resolves the pendings. So responses[0] corresponds to id=1, responses[1] to id=2, etc.
+
+But is it guaranteed that the server processes them in the same order they were sent? With the fix (serialized queue), yes. Without the fix, no — the async handlers might complete in a different order.
+
+Hmm, but the responses are written in the order the handlers complete. If the handlers complete out of order, the responses arrive out of order. The client's `onData` dispatches responses to pendings based on id. So even if responses arrive out of order, each pending resolves with its own response.
+
+But the test does `Promise.all([p1, p2, p3, p4, p5])` which waits for all to resolve. The order of the array is the order the promises were created, which corresponds to ids 1-5. So responses[0] is the response for id=1, regardless of when it arrived.
+
+The test verifies `responses[i].id === i + 1`. Since each pending is keyed by id, this should always be true (the response for id=1 has id=1, etc.). So this check doesn't verify ORDER, it just verifies CORRECTNESS.
+
+To verify ORDER, I need to check the order in which responses arrive. But `Promise.all` doesn't give me arrival order. I'd need to use a different pattern.
+
+Hmm. Let me re-read the user's requirement:
+
+"asserts responses for ids 1 through 5 all arrive in order before the process exits."
+
+"All arrive in order" — this could mean:
+(a) Each response has the correct id (1, 2, 3, 4, 5) — but this is trivially true if each pending resolves with its own response.
+(b) The responses arrive in the order 1, 2, 3, 4, 5 on the wire — this is the actual ordering guarantee.
+
+The fix ensures (b) — the server writes responses in order. But the test using `Promise.all` only verifies (a).
+
+To verify (b), I need to capture the order in which responses arrive on stdout. I can do this by recording each response as it arrives (in the onData callback) and checking the order.
+
+Let me modify the test to use the notification handler or a custom data handler to capture arrival order.
+
+Actually, the `JsonRpcClient` has a `pending` map and dispatches responses to pendings. But I can also use `onNotification` for unsolicited responses. But all 5 responses are solicited (they have matching ids), so they'd go to pendings, not notifications.
+
+To capture arrival order, I can add a custom mechanism. Or I can use the raw stdout to read responses manually.
+
+Alternative: use a simpler approach. Write all 5 requests to rawStdin in one go, then read all 5 responses from rawStdout manually, and verify the order.
+
+Let me design this:
+
+```ts
+test("burst of pipelined requests all get responses in order", async () => {
+  const child = spawn("node", [SERVER_ENTRY], { stdio: ["pipe", "pipe", "pipe"] });
+  const client = new JsonRpcClient(child);
+  try {
+    // Write all 5 requests in a single burst.
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "inspect_tree", arguments: { path: PROJECT_ROOT, maxDepth: 1 } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "run_command_safe", arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] } } },
+      { jsonrpc: "2.0", id: 5, method: "shutdown", params: {} },
+    ];
+    const burst = requests.map(r => JSON.stringify(r)).join("\n") + "\n";
+    client.rawStdin.write(burst);
+
+    // Read all 5 responses in order.
+    const responses: unknown[] = [];
+    const responsePromise = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timeout waiting for responses")), 10000);
+      const onData = (chunk: string) => {
+        // Parse lines from the chunk.
+        // ... (this is tricky because onData is already handled by the client)
+      };
+      // Hmm, this is getting complicated.
+    });
+  } finally {
+    await client.shutdown();
+  }
+});
+```
+
+This is getting complicated because the `JsonRpcClient` already handles data parsing. I need a way to capture the arrival order without interfering with the client's pending mechanism.
+
+Let me use a different approach: use the client's `call` method (which sets up pendings and writes requests), but also subscribe to notifications or add a custom hook to capture arrival order.
+
+Actually, the simplest approach: modify the test to NOT use the client's `call` method. Instead, write the raw burst to stdin and read raw responses from stdout, parsing them manually.
+
+Or: use the client's `call` method, but also track arrival order via a custom mechanism.
+
+Hmm, let me think. The `JsonRpcClient.onData` method parses each line and dispatches to pending or notification. If I add a `onResponse` callback (fired for every response, before dispatching to pending), I can track arrival order.
+
+But I don't want to modify the client class. Let me use a different pattern.
+
+Actually, I can use the `onNotification` handler, but that only fires for unsolicited responses. Solcited responses go to pendings.
+
+Alternative: I can monkey-patch the client's `onData` to also track order. But that's hacky.
+
+Better alternative: in the test, use the raw stdin/stdout. Spawn the process manually, write the burst, read responses, parse them, verify order.
+
+Let me do that. I'll spawn the process in the test (not via the client), write the burst, and read responses manually.
+
+```ts
+test("burst of pipelined requests all get responses in order", async () => {
+  const child = spawn("node", [SERVER_ENTRY], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  
+  // Write all 5 requests in a single burst.
+  const requests = [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "inspect_tree", arguments: { path: PROJECT_ROOT, maxDepth: 1 } } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "run_command_safe", arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] } } },
+    { jsonrpc: "2.0", id: 5, method: "shutdown", params: {} },
+  ];
+  child.stdin.write(requests.map(r => JSON.stringify(r)).join("\n") + "\n");
+
+  // Wait for the process to exit.
+  await new Promise<void>((resolve) => {
+    child.on("exit", () => resolve());
+    setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      resolve();
+    }, 10000);
+  });
+
+  // Parse responses from stdout.
+  const lines = stdout.trim().split("\n");
+  assert.equal(lines.length, 5, `expected 5 responses, got ${lines.length}: ${stdout}`);
+  const responses = lines.map(line => JSON.parse(line));
+  for (let i = 0; i < 5; i++) {
+    assert.equal(responses[i].id, i + 1, `response ${i} should have id ${i + 1}`);
+  }
+});
+```
+
+This is cleaner. I spawn the process, write the burst, wait for exit, parse responses, verify order.
+
+But wait, I need to make sure the process exits. With the fix, shutdown causes exit. So the process should exit after processing all 5 requests.
+
+Also, I should verify the responses have the expected content (e.g., initialize returns serverInfo, shutdown returns { shutdown: true }, etc.).
+
+Let me also add a check that the process actually exited (exit code 0).
+
+OK let me finalize the test and the fix.
+
+Let me also consider: should I use the `JsonRpcClient` for consistency with other tests, or write a custom spawn in the test? The user said "Add a node:test case in test/server.test.ts that writes all five requests in one burst without awaiting and asserts responses for ids 1 through 5 all arrive in order before the process exits."
+
+"writes all five requests in one burst without awaiting" — this means the test writes the requests in a burst and doesn't await between them. It doesn't necessarily mean the test doesn't use the client's `call` method. But to verify ORDER, I need to capture the raw arrival order, which is easier with a custom spawn.
+
+Let me use a custom spawn in the test. It's clearer and more direct.
+
+Actually, I can also use the `JsonRpcClient` but add a custom arrival-order tracker. Let me think...
+
+Hmm, the `JsonRpcClient.onData` dispatches to pendings. I can't easily hook into it without modifying the class.
+
+OK, custom spawn in the test. Let me write it.
+
+Actually, I just realized: I can use the `JsonRpcClient` for the setup, but write the burst manually via `rawStdin`, and then read the raw stdout. But the `JsonRpcClient` doesn't expose raw stdout reading.
+
+Easier: just do a custom spawn in the test. It's clear and direct.
+
+Let me finalize the code.
+
+Here's the updated `src/index.ts`:
+
+```ts
+#!/usr/bin/env node
+/**
+ * codex_project_inspector
+ * ... (existing comment) ...
+ */
+
+import * as readline from "node:readline";
+import {
+  JsonRpcRequest,
+  JsonRpcResponse,
+  JSON_RPC_ERRORS,
+} from "./types";
+import { TOOLS, listToolNames, ToolName } from "./tools";
+
+const SERVER_NAME = "codex_project_inspector";
+const SERVER_VERSION = "0.1.0";
+
+// ---------------------------------------------------------------------------
+// JSON-RPC helpers
+// ---------------------------------------------------------------------------
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function makeError(
+  id: JsonRpcRequest["id"] | null,
+  code: number,
+  message: string,
+  data?: unknown
+): JsonRpcResponse {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? null,
+    error: { code, message, ...(data !== undefined ? { data } : {}) },
+  };
+}
+
+function isJsonRpcRequest(v: unknown): v is JsonRpcRequest {
+  return (
+    isPlainObject(v) &&
+    v.jsonrpc === "2.0" &&
+    typeof v.method === "string" &&
+    (v.id === undefined ||
+      v.id === null ||
+      typeof v.id === "string" ||
+      typeof v.id === "number")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Method handlers
+// ---------------------------------------------------------------------------
+
+interface MethodContext {
+  writeLine: (line: string) => void;
+}
+
+async function handleRequest(
+  req: JsonRpcRequest,
+  ctx: MethodContext
+): Promise<JsonRpcResponse | null> {
+  const id = req.id ?? null;
+
+  switch (req.method) {
+    case "initialize": {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+          capabilities: { tools: {} },
+        },
+      };
+    }
+
+    case "ping": {
+      return { jsonrpc: "2.0", id, result: { pong: true } };
+    }
+
+    case "tools/list": {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: listToolNames().map((name) => {
+            const t = TOOLS[name as ToolName];
+            return {
+              name: t.name,
+              description: t.description,
+              inputSchema: t.inputSchema,
+            };
+          }),
+        },
+      };
+    }
+
+    case "tools/call": {
+      const params = req.params;
+      if (!isPlainObject(params)) {
+        return makeError(id, JSON_RPC_ERRORS.INVALID_PARAMS, "params must be an object");
+      }
+      const name = params.name;
+      const arguments_ = params.arguments ?? {};
+      if (typeof name !== "string") {
+        return makeError(id, JSON_RPC_ERRORS.INVALID_PARAMS, "params.name must be a string");
+      }
+      if (!(name in TOOLS)) {
+        return makeError(
+          id,
+          JSON_RPC_ERRORS.METHOD_NOT_FOUND,
+          `Unknown tool: '${name}'. Available tools: ${listToolNames().join(", ")}`
+        );
+      }
+      const tool = TOOLS[name as ToolName];
+      try {
+        const result = await tool.handler(arguments_ as never);
+        if (!result.ok) {
+          return makeError(
+            id,
+            JSON_RPC_ERRORS.INTERNAL_ERROR,
+            result.error.message,
+            { code: result.error.code }
+          );
+        }
+        return { jsonrpc: "2.0", id, result: { ok: true, data: result.data } };
+      } catch (err) {
+        return makeError(
+          id,
+          JSON_RPC_ERRORS.INTERNAL_ERROR,
+          (err as Error).message
+        );
+      }
+    }
+
+    case "shutdown": {
+      // The response is returned and written by the queue. The queue's
+      // exit logic (triggered when the method is "shutdown") ensures
+      // the process only exits after every prior response has been
+      // flushed.
+      return { jsonrpc: "2.0", id, result: { shutdown: true } };
+    }
+
+    default: {
+      return makeError(
+        id,
+        JSON_RPC_ERRORS.METHOD_NOT_FOUND,
+        `Unknown method: '${req.method}'`
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server bootstrap
+// ---------------------------------------------------------------------------
+
+function writeLine(line: string): void {
+  process.stdout.write(line + "\n");
+}
+
+function log(msg: string): void {
+  process.stderr.write(`[${SERVER_NAME}] ${msg}\n`);
+}
+
+// Serial request queue. Each enqueued task runs strictly after the previous
+// one has settled, so requests are processed in arrival order and each
+// response is fully written before the next request begins. Shutdown only
+// exits the process after every earlier response has been flushed.
+let processingChain: Promise<void> = Promise.resolve();
+let exited = false;
+
+function enqueue(task: () => Promise<void> | void): void {
+  // Append the task to the chain. `then(task, task)` runs the task whether
+  // the previous promise resolved or rejected, so a single failing task
+  // does not stall the queue. We attach a no-op `.catch` to the new tail
+  // to suppress any unhandled-rejection warning if the task itself throws.
+  const next = processingChain.then(task, task);
+  void next.catch(() => undefined);
+  processingChain = next;
+}
+
+function scheduleExit(): void {
+  if (exited) return;
+  exited = true;
+  // Wait for every queued task (including the shutdown response) to
+  // settle, then give stdout one more tick to flush before exiting.
+  const chain = processingChain;
+  chain.then(
+    () => setImmediate(() => process.exit(0)),
+    () => setImmediate(() => process.exit(0))
+  );
+}
+
+function startServer(): void {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+
+  log(`${SERVER_NAME} v${SERVER_VERSION} ready on stdio`);
+
+  rl.on("line", (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    enqueue(async () => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (err) {
+        writeLine(
+          JSON.stringify(
+            makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
+          )
+        );
+        return;
+      }
+
+      if (!isJsonRpcRequest(parsed)) {
+        writeLine(
+          JSON.stringify(
+            makeError(
+              (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
+              JSON_RPC_ERRORS.INVALID_REQUEST,
+              "Invalid JSON-RPC 2.0 request"
+            )
+          )
+        );
+        return;
+      }
+
+      try {
+        const resp = await handleRequest(parsed, { writeLine });
+        if (resp !== null) writeLine(JSON.stringify(resp));
+        if (parsed.method === "shutdown") {
+          scheduleExit();
+        }
+      } catch (err) {
+        writeLine(
+          JSON.stringify(
+            makeError(
+              parsed.id ?? null,
+              JSON_RPC_ERRORS.INTERNAL_ERROR,
+              (err as Error).message
+            )
+          )
+        );
+      }
+    });
+  });
+
+  rl.on("close", () => {
+    log("stdin closed, exiting");
+    if (!exited) {
+      // Make sure any in-flight queued work finishes and its responses
+      // are flushed before the process goes away.
+      scheduleExit();
+    }
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+export { startServer, handleRequest, isJsonRpcRequest };
+```
+
+And the new test:
+
+```ts
+test("pipelined burst of five requests all get responses in order", async () => {
+  const child = spawn("node", [SERVER_ENTRY], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+
+  // Write all five requests in a single burst without awaiting any response.
+  const requests = [
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "inspect_tree", arguments: { path: PROJECT_ROOT, maxDepth: 1 } },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "run_command_safe",
+        arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] },
+      },
+    },
+    { jsonrpc: "2.0", id: 5, method: "shutdown", params: {} },
+  ];
+  child.stdin.write(requests.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+  // Wait for the process to exit.
+  const exitInfo: { code: number | null } = { code: null };
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      resolve();
+    }, 10000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      exitInfo.code = code;
+      resolve();
+    });
+  });
+
+  // Parse responses in arrival order from stdout.
+  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  assert.equal(
+    lines.length,
+    5,
+    `expected 5 responses in order, got ${lines.length}; stdout=${stdout}; stderr=${stderr}`
+  );
+
+  const responses = lines.map((line) => JSON.parse(line));
+  for (let i = 0; i < 5; i++) {
+    assert.equal(
+      (responses[i] as { id: number }).id,
+      i + 1,
+      `response at position ${i} should have id ${i + 1}; got ${JSON.stringify(responses[i])}`
+    );
+  }
+
+  // Sanity-check the shape of each response.
+  assert.ok(
+    (responses[0] as { result?: { serverInfo?: { name?: string } } }).result?.serverInfo?.name,
+    "initialize should return serverInfo.name"
+  );
+  assert.ok(
+    (responses[1] as { result?: { tools?: unknown[] } }).result?.tools,
+    "tools/list should return tools"
+  );
+  assert.ok(
+    (responses[2] as { result?: { ok?: boolean; data?: unknown } }).result?.ok,
+    "tools/call inspect_tree should return ok"
+  );
+  assert.ok(
+    (responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.ok,
+    "tools/call run_command_safe should return ok"
+  );
+  assert.ok(
+    (responses[4] as { result?: { shutdown?: boolean } }).result?.shutdown,
+    "shutdown should be acknowledged"
+  );
+
+  // The process should have exited cleanly after all responses were flushed.
+  assert.equal(exitInfo.code, 0, `server should exit with code 0; stderr=${stderr}`);
+});
+```
+
+Wait, I should double-check: after the process exits, is all the stdout data available? When the child process exits, its stdout is closed. The parent receives any remaining data via the "data" event or "end" event. By the time the "exit" event fires on the parent, all stdout data should have been received (or the pipe is closed).
+
+Actually, there's a subtlety: the "exit" event fires when the child process exits, but the parent's stdout stream might still have buffered data. The "close" event fires when the stdio streams are closed. To be safe, I should wait for "close" instead of "exit".
+
+Let me use "close":
+
+```ts
+await new Promise<void>((resolve) => {
+  const timer = setTimeout(() => {
+    try { child.kill("SIGKILL"); } catch { /* ignore */ }
+    resolve();
+  }, 10000);
+  child.on("close", (code) => {
+    clearTimeout(timer);
+    exitInfo.code = code;
+    resolve();
+  });
+});
+```
+
+"close" fires when the stdio streams are closed, which is after all data has been received. This is the safer option.
+
+OK let me also think about edge cases:
+- What if the server crashes before processing all 5 requests? Then stdout has fewer than 5 lines, and the test fails (which is correct).
+- What if the server processes requests out of order? Then the ids in stdout are not 1,2,3,4,5, and the test fails (which is correct with the fix).
+- What if the server exits before writing all responses? Then stdout has fewer than 5 lines, and the test fails (which is correct with the fix).
+
+Great, the test is robust.
+
+Now let me also think: the user said "Run: npm run build, npm test, and the manual pipeline smoke. All must pass."
+
+The "manual pipeline smoke" is not defined in the task. I think it means: manually test the pipeline by running a command like the test does. Let me create a manual smoke test that the user can run.
+
+Actually, "manual pipeline smoke" might just mean: run a quick command to verify the fix works. Like:
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inspect_tree","arguments":{"path":".","maxDepth":1}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command_safe","arguments":{"command":"node","args":["-e","process.stdout.write(\"ok\")"]}}}' \
+  '{"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}' \
+  | node dist/index.js
+```
+
+This writes all 5 requests in a burst to the server's stdin. The server should output 5 responses in order and then exit. I can verify by checking the output.
+
+I'll run this as the manual smoke test and verify the output.
+
+OK let me implement everything.
+
+Wait, I want to double-check one thing: the `enqueue` function. The current code does `processingChain.then(task, task)`. The `task` function is async (returns a Promise). The `.then` callback receives the resolved value of the previous promise (which is undefined, since the chain starts with `Promise.resolve()`). The task function ignores its argument and returns a Promise.
+
+If the task throws synchronously, `.then(task, task)` catches it and... no, `.then(onFulfilled, onRejected)` calls `onFulfilled` on resolve and `onRejected` on reject. If the previous promise resolved and `task` throws synchronously, the new promise is rejected with the thrown error. The next `.then(task, task)` would call `task` (as onRejected) on the rejected promise.
+
+So errors in one task don't stall the queue. Good.
+
+But the `void next.catch(() => undefined)` is to suppress unhandled rejection warnings. Since we attach `.catch` to `next`, Node.js considers the rejection handled. Good.
+
+Actually wait, `next` is assigned to `processingChain`. So the next enqueue's `.then(task, task)` is called on `next` (the new processingChain). If `next` is rejected (because the task threw), the next enqueue's `.then(task, task)` calls `task` as onRejected. So the next task runs. Good.
+
+But the `void next.catch(() => undefined)` creates a new promise (the result of .catch) and discards it. The original `next` is still rejected, but the .catch on it means Node.js won't emit an unhandled rejection warning. Good.
+
+OK the design is sound. Let me code it.
+
+Hmm, one more thing: I should also handle the case where `rl.on("close")` fires while there are still queued tasks. The `scheduleExit` function attaches a .then to processingChain, which fires after all queued tasks complete. Then setImmediate(exit). This should be fine.
+
+But what if `rl.on("close")` fires and there are no queued tasks? Then processingChain is already resolved (or will be soon). scheduleExit's .then fires immediately (or on the next microtask), then setImmediate(exit). The process exits. Good.
+
+What if the shutdown task is in the queue and `rl.on("close")` also fires? Both call scheduleExit. The first call sets exited = true and attaches .then. The second call sees exited = true and no-ops. Good.
+
+Wait, my scheduleExit has `if (exited) return;` at the top. So the second call returns immediately. Only the first call's .then fires. Good.
+
+But there's a subtle issue: the first call's .then is on the processingChain at the time of the first call. The second call would have attached to a different (later) processingChain, but since it returns early, it doesn't matter.
+
+OK, I'm confident the design is correct. Let me code it.
+
+One more thought: the `client.call` method in the test uses `this.nextId++` which starts at 1. But in my custom spawn test, I'm manually constructing requests with ids 1-5. This is fine and more explicit.
+
+Let me also think: should the test use `client.call` for some assertions? No, the custom spawn is cleaner for verifying arrival order. The existing tests use `client.call` for their assertions, which is fine.
+
+OK, final code. Let me write it.
+
+Actually, let me re-examine the `enqueue` function one more time. The signature is:
+```ts
+function enqueue(task: () => Promise<void> | void): void
+```
+
+The task can return void or Promise<void>. Inside:
+```ts
+const next = processingChain.then(task, task);
+```
+
+`.then` expects callbacks that return a value or a thenable. If `task` returns void, `.then` treats it as `undefined`. If `task` returns a Promise, `.then` waits for it. So this works for both cases.
+
+If `task` throws synchronously, `.then` catches it and the new promise is rejected. If `task` returns a rejected promise, the new promise is rejected. The next `.then(task, task)` calls `task` as onRejected. So the queue continues. Good.
+
+OK, coding time.
+
+Let me also think about: the `scheduleExit` function uses `setImmediate(() => process.exit(0))`. setImmediate fires on the next "check" phase of the event loop, after I/O events. This gives stdout a chance to flush. But is it sufficient?
+
+In the current broken code, the shutdown handler does:
+```ts
+ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+setImmediate(() => process.exit(0));
+```
+
+The writeLine is sync (calls process.stdout.write). setImmediate fires on the next check phase. Between the write and setImmediate, the event loop runs I/O, which includes flushing stdout to the OS. So the data should be in the OS pipe buffer by the time setImmediate fires.
+
+But wait, the write is async via libuv. process.stdout.write returns a boolean. For a pipe, the data goes into libuv's write queue. libuv flushes it during the I/O phase. setImmediate fires after the I/O phase. So by the time setImmediate fires, the data should be flushed.
+
+This is the same pattern I'll use in scheduleExit. So it should be fine.
+
+Actually, let me be extra safe and use a callback on the last write. But the last write is done by the queue (the line handler calls writeLine). I don't have a hook to know which write is the "last" one.
+
+Alternatively, I can track whether the last task in the chain is the shutdown task, and attach the exit callback to that write. But this complicates the code.
+
+For now, let me stick with setImmediate. It matches the existing pattern and should be sufficient.
+
+OK, final code:
+
+```ts
+function scheduleExit(): void {
+  if (exited) return;
+  exited = true;
+  // Wait for every queued task (including the shutdown response) to
+  // settle, then give stdout one more tick to flush before exiting.
+  const chain = processingChain;
+  chain.then(
+    () => setImmediate(() => process.exit(0)),
+    () => setImmediate(() => process.exit(0))
+  );
+}
+```
+
+This ensures the exit fires after the chain settles. setImmediate gives stdout a chance to flush. process.exit terminates the process.
+
+Let me now write the full updated files.
+
+Actually, I realize I should also update the `enqueue` function to handle the case where the task itself returns a rejected promise. The current design uses `void next.catch(() => undefined)` to suppress warnings. But the rejected promise is still the new processingChain. The next enqueue's `.then(task, task)` calls `task` as onRejected. So the next task runs. Good.
+
+But what if the task is a notification (no id)? The line handler still enqueues it. The task does its work (no response to write). The queue continues. Good.
+
+What if the task throws synchronously in the parse step? The enqueued async function catches the error in the try/catch and writes an error response. So the task doesn't throw. Good.
+
+What if the task throws in the handleRequest catch? Same — caught and error response written. Good.
+
+What if writeLine itself throws? That would be an unhandled error in the task, which would reject the processingChain. The next enqueue's `.then(task, task)` calls the next task as onRejected. So the queue continues. But the current task didn't write its response. Hmm.
+
+In practice, writeLine (process.stdout.write) rarely throws. It might return false on backpressure, but doesn't throw. So this is a non-issue.
+
+OK, I'm confident. Let me write the code.
+
+Let me also double check the export at the end. The current code exports `startServer, handleRequest, isJsonRpcRequest`. I should keep the same exports.
+
+And the `if (require.main === module)` check at the end — this ensures the server only starts when run directly, not when imported. I'll keep this.
+
+OK, writing the code now.
+
+Wait, one more thing. The user said "Add a node:test case in test/server.test.ts". So the test goes in the existing `test/server.test.ts` file, not a new file. I'll add it at the end of the existing file.
+
+The existing file imports `spawn, ChildProcessWithoutNullStreams` from `node:child_process`. My test uses `spawn` directly. Good.
+
+The existing file also uses `path, fs, os`. My test uses `path` (for PROJECT_ROOT). Good.
+
+OK, final code. Let me write it.
+</think>
+
+Now I have a clear understanding of the bug and the codebase. Let me plan the fix.
+## The bug
+
+The `readline.on("line", ...)` handler in `src/index.ts:194` is `async` and dispatches each request independently. The `shutdown` case at `src/index.ts:156` synchronously writes its response and calls `setImmediate(() => process.exit(0))`. When five requests arrive in one burst:
+
+1. readline fires five "line" events back-to-back; all five async handlers start and immediately `await` their `handleRequest`.
+2. The shutdown handler's `handleRequest` is fully synchronous — it writes the shutdown line and schedules `process.exit(0)` via `setImmediate`.
+3. `setImmediate` fires before the still-suspended `tools/call` (which is awaiting `run_command_safe` spawning a child process) gets a chance to write its response.
+4. `process.exit(0)` kills the process; the `run_command_safe` response is never written and the parent never sees id=4.
+
+## The fix
+
+Introduce a serialized promise chain. Every line is appended to the chain via `enqueue`, so tasks run strictly in arrival order and each response is fully written before the next request begins. The `shutdown` case just returns its response (the queue writes it like any other), and `scheduleExit` waits for the chain to fully drain before calling `process.exit(0)`.
+[0m← [0mEdit src/index.ts
+Index: /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
+===================================================================
+--- /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
++++ /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
+@@ -153,13 +153,13 @@
+   }
+ }
+ 
+ case "shutdown": {
+-  // Respond and exit cleanly.
+-  ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));
+-  // Give the response a tick to flush, then exit.
+-  setImmediate(() => process.exit(0));
+-  return null;
++  // The response is returned and written by the queue. The queue's
++  // exit logic (triggered when the method is "shutdown") ensures the
++  // process only exits after every prior response has been flushed,
++  // even when the client pipelines several requests in one burst.
++  return { jsonrpc: "2.0", id, result: { shutdown: true } };
+ }
+ 
+ default: {
+   return makeError(
+
+[0m
+[0m← [0mEdit src/index.ts
+Index: /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
+===================================================================
+--- /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
++++ /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/src/index.ts
+@@ -182,64 +182,117 @@
+ function log(msg: string): void {
+   process.stderr.write(`[${SERVER_NAME}] ${msg}\n`);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Serial request queue
++//
++// readline fires a "line" event for every newline-terminated JSON request
++// on stdin. If the client pipelines several requests in a single burst
++// (write-all-then-read), the async handlers for each line start
++// concurrently. That is fine for synchronous methods, but for an async
++// method like `tools/call` (which spawns a child process) the in-flight
++// tool call can still be pending when a later `shutdown` line causes the
++// process to exit, dropping the tool-call response on the floor.
++//
++// The fix is a serialized queue: every parsed line is appended to a
++// promise chain. Each task only begins after the previous one has fully
++// settled (including writing its response line), so requests are
++// processed strictly in arrival order. `shutdown` is just another task
++// in the chain; once it has written its response, `scheduleExit` waits
++// for the chain to drain and then flushes stdout before exiting.
++// ---------------------------------------------------------------------------
++let processingChain: Promise<void> = Promise.resolve();
++let exited = false;
++
++function enqueue(task: () => Promise<void> | void): void {
++  // `then(task, task)` runs the task whether the previous promise
++  // resolved or rejected, so a single failing task does not stall the
++  // queue. The trailing `void next.catch(...)` marks the rejection as
++  // handled so Node.js does not emit an unhandled-rejection warning
++  // when no further task is enqueued to consume it.
++  const next = processingChain.then(task, task);
++  void next.catch(() => undefined);
++  processingChain = next;
++}
++
++function scheduleExit(): void {
++  if (exited) return;
++  exited = true;
++  // Wait for every queued task (including the shutdown response itself)
++  // to settle, then give stdout one more tick to flush before exiting.
++  const chain = processingChain;
++  chain.then(
++    () => setImmediate(() => process.exit(0)),
++    () => setImmediate(() => process.exit(0))
++  );
++}
++
+ function startServer(): void {
+   const rl = readline.createInterface({
+     input: process.stdin,
+     crlfDelay: Infinity,
+   });
+ 
+   log(`${SERVER_NAME} v${SERVER_VERSION} ready on stdio`);
+ 
+-  rl.on("line", async (line) => {
++  rl.on("line", (line) => {
+     const trimmed = line.trim();
+     if (!trimmed) return;
+ 
+-    let parsed: unknown;
+-    try {
+-      parsed = JSON.parse(trimmed);
+-    } catch (err) {
+-      writeLine(
+-        JSON.stringify(
+-          makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
+-        )
+-      );
+-      return;
+-    }
++    enqueue(async () => {
++      let parsed: unknown;
++      try {
++        parsed = JSON.parse(trimmed);
++      } catch (err) {
++        writeLine(
++          JSON.stringify(
++            makeError(null, JSON_RPC_ERRORS.PARSE_ERROR, `Invalid JSON: ${(err as Error).message}`)
++          )
++        );
++        return;
++      }
+ 
+-    if (!isJsonRpcRequest(parsed)) {
+-      writeLine(
+-        JSON.stringify(
+-          makeError(
+-            (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
+-            JSON_RPC_ERRORS.INVALID_REQUEST,
+-            "Invalid JSON-RPC 2.0 request"
++      if (!isJsonRpcRequest(parsed)) {
++        writeLine(
++          JSON.stringify(
++            makeError(
++              (isPlainObject(parsed) ? (parsed.id as never) : null) ?? null,
++              JSON_RPC_ERRORS.INVALID_REQUEST,
++              "Invalid JSON-RPC 2.0 request"
++            )
+           )
+-        )
+-      );
+-      return;
+-    }
++        );
++        return;
++      }
+ 
+-    try {
+-      const resp = await handleRequest(parsed, { writeLine });
+-      if (resp !== null) writeLine(JSON.stringify(resp));
+-    } catch (err) {
+-      writeLine(
+-        JSON.stringify(
+-          makeError(
+-            parsed.id ?? null,
+-            JSON_RPC_ERRORS.INTERNAL_ERROR,
+-            (err as Error).message
++      try {
++        const resp = await handleRequest(parsed, { writeLine });
++        if (resp !== null) writeLine(JSON.stringify(resp));
++        if (parsed.method === "shutdown") {
++          scheduleExit();
++        }
++      } catch (err) {
++        writeLine(
++          JSON.stringify(
++            makeError(
++              parsed.id ?? null,
++              JSON_RPC_ERRORS.INTERNAL_ERROR,
++              (err as Error).message
++            )
+           )
+-        )
+-      );
+-    }
++        );
++      }
++    });
+   });
+ 
+   rl.on("close", () => {
+     log("stdin closed, exiting");
+-    process.exit(0);
++    if (!exited) {
++      // Make sure any in-flight queued work finishes and its responses
++      // are flushed before the process goes away.
++      scheduleExit();
++    }
+   });
+ }
+ 
+ if (require.main === module) {
+
+[0m
+[0m→ [0mRead src/index.ts
+Let me verify the resulting file looks correct:
+[0m
+[0m# [0mTodos
+[✓] Fix src/index.ts: add serialized request queue, make shutdown wait for prior responses
+[•] Add pipelined burst test in test/server.test.ts
+[ ] Run npm run build and verify it passes
+[ ] Run npm test and verify all tests pass
+[ ] Run manual pipeline smoke test
+[0m
+[0m← [0mEdit test/server.test.ts
+Index: /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/test/server.test.ts
+===================================================================
+--- /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/test/server.test.ts
++++ /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run/test/server.test.ts
+@@ -357,5 +357,146 @@
+   // Give the server a moment to exit.
+   await new Promise((r) => setTimeout(r, 300));
+   assert.ok(client.isExited, "server should have exited after shutdown");
+   await client.shutdown();
++});
++
++test("pipelined burst of five requests all get responses in order before shutdown exits", async () => {
++  // Regression test: when initialize, tools/list, tools/call, run_command_safe,
++  // and shutdown are written to stdin in one burst (no awaiting between writes),
++  // the server must process them strictly in arrival order, write every
++  // response, and only then exit. Previously the shutdown handler could
++  // schedule `process.exit(0)` before the in-flight `run_command_safe`
++  // tool call had a chance to write its response, dropping id=4 on the
++  // floor. This test uses a raw spawn + raw stdio so we can observe the
++  // exact arrival order of response lines on stdout.
++  const child = spawn("node", [SERVER_ENTRY], {
++    stdio: ["pipe", "pipe", "pipe"],
++  });
++  child.stdout.setEncoding("utf8");
++  child.stderr.setEncoding("utf8");
++  let stdout = "";
++  let stderr = "";
++  child.stdout.on("data", (chunk: string) => {
++    stdout += chunk;
++  });
++  child.stderr.on("data", (chunk: string) => {
++    stderr += chunk;
++  });
++
++  // Write all five requests in a single burst. None of these writes is
++  // awaited individually; the OS pipe just gets every newline-terminated
++  // line at once. The readline interface on the server side will see them
++  // in order and fire five "line" events back-to-back.
++  const requests = [
++    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
++    { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
++    {
++      jsonrpc: "2.0",
++      id: 3,
++      method: "tools/call",
++      params: {
++        name: "inspect_tree",
++        arguments: { path: PROJECT_ROOT, maxDepth: 1 },
++      },
++    },
++    {
++      jsonrpc: "2.0",
++      id: 4,
++      method: "tools/call",
++      params: {
++        name: "run_command_safe",
++        arguments: { command: "node", args: ["-e", "process.stdout.write('ok')"] },
++      },
++    },
++    { jsonrpc: "2.0", id: 5, method: "shutdown", params: {} },
++  ];
++  const burst = requests.map((r) => JSON.stringify(r)).join("\n") + "\n";
++  child.stdin.write(burst);
++  // Signal EOF so a well-behaved server that reaches the end of the
++  // request stream will not block waiting for more input.
++  child.stdin.end();
++
++  // Wait for the process to exit (and the stdio streams to close) so all
++  // flushed responses are visible in `stdout`. Use the "close" event,
++  // which fires after stdout has been fully drained, rather than "exit".
++  const exitInfo: { code: number | null; signal: NodeJS.Signals | null } = {
++    code: null,
++    signal: null,
++  };
++  await new Promise<void>((resolve) => {
++    const timer = setTimeout(() => {
++      try {
++        child.kill("SIGKILL");
++      } catch {
++        /* ignore */
++      }
++      resolve();
++    }, 10000);
++    child.on("close", (code, signal) => {
++      clearTimeout(timer);
++      exitInfo.code = code;
++      exitInfo.signal = signal;
++      resolve();
++    });
++  });
++
++  // Parse the response lines in arrival order.
++  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
++  assert.equal(
++    lines.length,
++    5,
++    `expected 5 responses in order before exit, got ${lines.length}\n` +
++      `stdout=${JSON.stringify(stdout)}\nstderr=${JSON.stringify(stderr)}`
++  );
++
++  const responses = lines.map((line) => JSON.parse(line));
++  for (let i = 0; i < 5; i++) {
++    assert.equal(
++      (responses[i] as { id: number }).id,
++      i + 1,
++      `response at position ${i} should have id ${i + 1}; ` +
++        `got ${JSON.stringify(responses[i])}`
++    );
++  }
++
++  // Sanity-check the shape of each response.
++  assert.ok(
++    (responses[0] as { result?: { serverInfo?: { name?: string } } }).result?.serverInfo?.name,
++    "initialize should return serverInfo.name"
++  );
++  assert.ok(
++    (responses[1] as { result?: { tools?: unknown[] } }).result?.tools,
++    "tools/list should return tools"
++  );
++  assert.equal(
++    (responses[2] as { result?: { ok?: boolean } }).result?.ok,
++    true,
++    "tools/call inspect_tree should return ok"
++  );
++  assert.equal(
++    (responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.ok,
++    true,
++    "tools/call run_command_safe should return ok"
++  );
++  assert.equal(
++    (responses[3] as { result?: { ok?: boolean; data?: { stdout?: string } } }).result?.data?.stdout,
++    "ok",
++    "run_command_safe should have written 'ok' to stdout"
++  );
++  assert.equal(
++    (responses[4] as { result?: { shutdown?: boolean } }).result?.shutdown,
++    true,
++    "shutdown should be acknowledged"
++  );
++
++  // The server must have exited cleanly only after every prior response
++  // was flushed. If the queue is broken the process either times out
++  // (we kill it) or it would still pass the assertions above but the
++  // responses for the in-flight tool call would be missing.
++  assert.equal(
++    exitInfo.code,
++    0,
++    `server should exit with code 0; code=${exitInfo.code} signal=${exitInfo.signal}\n` +
++      `stderr=${JSON.stringify(stderr)}`
++  );
+ });
+\ No newline at end of file
+
+[0m
+Now let me add the burst test. The test spawns the server directly, writes all five requests in a single `stdin.write` call, waits for the process to exit, then asserts that the five response lines arrived in id-order 1→5 before the exit.
+[0m# [0mTodos
+[✓] Fix src/index.ts: add serialized request queue, make shutdown wait for prior responses
+[✓] Add pipelined burst test in test/server.test.ts
+[•] Run npm run build and verify it passes
+[ ] Run npm test and verify all tests pass
+[ ] Run manual pipeline smoke test
+[0m
+Now let me run the build and the tests.
+[0m$ [0mnpm run build
+> codex-project-inspector@0.1.0 build
+> tsc -p tsconfig.json
+[0m
+Build passes cleanly. Now the test suite:
+[0m$ [0mnpm test
+> codex-project-inspector@0.1.0 test
+> node --test --import tsx test/*.test.ts
+
+✔ server boots and responds to initialize (71.735291ms)
+✔ tools/list returns the three required tools (58.307625ms)
+✔ ping returns { pong: true } (61.064417ms)
+✔ inspect_tree on a real temp directory returns entries with correct shape (61.504333ms)
+✔ summarize_package on its own directory returns a structured summary (57.059125ms)
+✔ run_command_safe runs an allow-listed command and returns stdout (107.465958ms)
+✔ run_command_safe rejects commands outside the allow-list (62.669833ms)
+✔ run_command_safe rejects shell metacharacters in args (61.603708ms)
+✔ server returns METHOD_NOT_FOUND for unknown methods (61.598792ms)
+✔ server returns PARSE_ERROR for non-JSON input (65.417792ms)
+✔ shutdown method exits the server (362.635667ms)
+✔ pipelined burst of five requests all get responses in order before shutdown exits (118.714792ms)
+ℹ tests 12
+ℹ suites 0
+ℹ pass 12
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3965.390792
+[0m
+<think>
+All 12 tests pass, including the new burst test. Now let me also verify that the new test would have failed against the old code. Let me also run the manual pipeline smoke test.
+</think>
+
+All 12 tests pass, including the new burst test. Let me also confirm the new test would actually catch the regression by temporarily reverting just the queue logic and re-running it:
+[93m[1m! [0mpermission requested: external_directory (/tmp/*); auto-rejecting
+[0m✗ [0mcp src/index.ts /tmp/index.ts.fixed && cat > /tmp/check_regression.sh <<'EOF'
+#!/bin/bash
+set -e
+cd /Users/coenhewes/Documents/Forge-code/Forge-coding/.opencode/tmp/harder-task/opencode-run
+# Revert the fix in-place by removing the queue and restoring the old shutdown behavior.
+node - <<'NODE'
+const fs = require('fs');
+const p = 'src/index.ts';
+let s = fs.readFileSync(p, 'utf8');
+// Remove the queue, enqueue, scheduleExit block.
+s = s.replace(/\/\/ -+\n\/\/ Serial request queue[\s\S]*?^}\n\n/m, '');
+// Restore the old shutdown case.
+s = s.replace(
+  /case "shutdown": \{[\s\S]*?return \{ jsonrpc: "2\.0", id, result: \{ shutdown: true \} \};\n    \}/,
+  'case "shutdown": {\n      // Respond and exit cleanly.\n      ctx.writeLine(JSON.stringify({ jsonrpc: "2.0", id, result: { shutdown: true } }));\n      // Give the response a tick to flush, then exit.\n      setImmediate(() => process.exit(0));\n      return null;\n    }'
+);
+// Make rl.on("line") use the old async style.
+s = s.replace(/rl\.on\("line", \(line\) => \{\n([\s\S]*?)\n    \}\);/m, (m, body) => {
+  // Re-inline the body back into an async arrow function (no enqueue wrapping).
+  return 'rl.on("line", async (line) => {\n' + body.replace(/      enqueue\(async \(\) => \{\n/, '').replace(/\n      \}\);\n    \}\);$/, '\n    });');
+});
+fs.writeFileSync(p, s);
+console.log('reverted');
+NODE
+npm run build >/dev/null 2>&1
+echo "--- running burst test against broken code ---"
+node --test --import tsx test/server.test.ts 2>&1 | grep -E "burst|✔|✖|fail|Error" | head -40
+echo "--- restoring fix ---"
+cp /tmp/index.ts.fixed src/index.ts
+npm run build >/dev/null 2>&1
+echo "--- running burst test against fixed code ---"
+node --test --import tsx test/server.test.ts 2>&1 | grep -E "burst|✔|✖|fail|Error" | head -40
+EOF
+bash /tmp/check_regression.sh failed
+[91m[1mError: [0mThe user rejected permission to use this specific tool call.
