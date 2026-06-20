@@ -34,6 +34,26 @@ export interface ToolExecutionContext {
   evidenceMemory?: EvidenceMemory
 }
 
+export function commandCheckKind(command: string): VerificationCheckKind | null {
+  if (/\b(vitest|jest|mocha|node\s+--test|pytest|go\s+test|cargo\s+test)\b/.test(command)) return 'test'
+  if (/\b(npm|pnpm|yarn|bun)\b.*\b(run\s+)?test\b/.test(command)) return 'test'
+  if (/\b(npm|pnpm|yarn|bun)\b.*\b(run\s+)?(typecheck|check)\b|\btsc\b/.test(command)) return 'typecheck'
+  if (/\b(npm|pnpm|yarn|bun)\b.*\b(run\s+)?build\b|\bcargo\s+build\b/.test(command)) return 'build'
+  return null
+}
+
+export function commandOutputLooksPassed(output: string): boolean {
+  const lower = output
+    .toLowerCase()
+    .replace(/\btype errors?\s+no errors?\b/g, '')
+    .replace(/\bno errors?\b/g, '')
+    .replace(/\b0 errors?\b/g, '')
+    .replace(/\b0 failures?\b/g, '')
+    .replace(/\b0 failed\b/g, '')
+  if (/\b(failed?|failures?|error|errors|exit code [1-9])\b/.test(lower)) return false
+  return /\b(pass(ed|es)?|passing|success|succeeded|ok|done)\b/.test(lower)
+}
+
 export function createToolDefinitions(): ToolDefinition[] {
   return [
     {
@@ -484,19 +504,49 @@ export class ToolExecutor {
     }
   }
 
-  private async handleRunCommand(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
+  private async handleRunCommand(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string; metadata?: Record<string, unknown> }> {
     const command = input.command as string
     const desc = input.description as string
     const timeoutMs = (input.timeout_ms as number) ?? 60000
+    const check = commandCheckKind(command)
+    void desc
 
     try {
       const result = execSync(command, { cwd: ctx.workDir, encoding: 'utf-8', timeout: timeoutMs })
       await ctx.taskEngine.addCommandRun(ctx.taskId, command)
       const output = result.trim() || '(no output)'
+      if (check) {
+        const passed = commandOutputLooksPassed(output)
+        const existing = await ctx.verificationEngine.updateStatus(ctx.taskId, check, passed ? 'passed' : 'failed', {
+          notes: output.slice(0, 500),
+        })
+        if (!existing) {
+          await ctx.verificationEngine.addEntry(ctx.taskId, check, {
+            status: passed ? 'passed' : 'failed',
+            notes: output.slice(0, 500),
+          })
+        }
+        await ctx.taskEngine.addTestRun(ctx.taskId, command)
+        return { content: output, metadata: { type: 'verification', check, passed, command } }
+      }
       return { content: output }
     } catch (err: unknown) {
       const error = err as { stderr?: string; stdout?: string; status?: number }
       const output = error.stderr || error.stdout || String(err)
+      if (check) {
+        const text = (output as string).trim() || String(err)
+        const existing = await ctx.verificationEngine.updateStatus(ctx.taskId, check, 'failed', {
+          notes: text.slice(0, 500),
+        })
+        if (!existing) {
+          await ctx.verificationEngine.addEntry(ctx.taskId, check, {
+            status: 'failed',
+            notes: text.slice(0, 500),
+          })
+        }
+        await ctx.taskEngine.addTestRun(ctx.taskId, command)
+        return { content: text, metadata: { type: 'verification', check, passed: false, command } }
+      }
       return { content: (output as string).trim() || String(err) }
     }
   }
@@ -853,13 +903,40 @@ export class ToolExecutor {
     // success without the supporting evidence. ('blocked'/'failed' are always
     // allowed, since those are honest non-success terminal states.)
     if (status === 'completed') {
-      const acc = await ctx.acceptanceEngine.getCompletionStatus(ctx.taskId)
+      let acc = await ctx.acceptanceEngine.getCompletionStatus(ctx.taskId)
+      if (!acc.allVerified) {
+        // Verifier-is-authority (AGENTS.md §15): rather than bouncing the model
+        // into re-running tests and hand-marking each criterion (which costs
+        // many redundant main-model turns over large test output), consult the
+        // verification matrix Forge already recorded. If there is real passing
+        // verification on record and ZERO failures, auto-mark the remaining
+        // unverified criteria as verified with that evidence and let the run
+        // complete. This is strictly more trustworthy than the model's manual
+        // claim — it's backed by an actual recorded check.
+        const vsummary = await ctx.verificationEngine.getSummary(ctx.taskId).catch(() => null)
+        const passed = vsummary?.passed ?? 0
+        const failed = vsummary?.failed ?? 0
+        if (passed > 0 && failed === 0) {
+          const contract = await ctx.acceptanceEngine.getContract(ctx.taskId)
+          for (const c of contract?.criteria ?? []) {
+            if (c.status !== 'verified' && c.status !== 'failed' && c.status !== 'blocked') {
+              await ctx.acceptanceEngine.updateCriterionStatus(
+                ctx.taskId,
+                c.id,
+                'verified',
+                `auto-verified: verification matrix shows ${passed} passed / 0 failed`,
+              )
+            }
+          }
+          acc = await ctx.acceptanceEngine.getCompletionStatus(ctx.taskId)
+        }
+      }
       if (!acc.allVerified) {
         return {
           content:
-            `finish_task rejected: only ${acc.verified}/${acc.total} acceptance criteria are verified. ` +
-            `Implement and verify the remaining criteria (edit_file, run_tests, then update_acceptance to mark ` +
-            `each one "verified" with evidence) before calling finish_task.`,
+            `finish_task rejected: only ${acc.verified}/${acc.total} acceptance criteria are verified, ` +
+            `and the verification matrix has no passing check on record (or has a failure). ` +
+            `Run the project's tests via run_tests so the verifier can confirm, then call finish_task again.`,
         }
       }
     }

@@ -117,6 +117,66 @@ Run npm run build, npm test, and the manual pipeline smoke.
 
 This is a better quality gate than screenshot/browser tests because another coding agent can exercise it directly through stdio.
 
+## Trial 2: Pipelined JSON-RPC Ordering (the harder task)
+
+Status: **completed** (2026-06-20). This is the rerun that was previously
+blocked by the app approval-credit gate.
+
+Target project:
+
+```text
+.opencode/tmp/forge-long-horizon-mcp-tool-trial-2
+```
+
+Root cause confirmed:
+
+- `src/index.ts` handled each stdin line in its own un-awaited
+  `rl.on("line", async …)` callback. readline emits the burst's lines in
+  order, but the callbacks ran concurrently, so the `shutdown` handler
+  (id 5) reached `process.exit(0)` while the async `tools/call` handlers
+  for ids 3 and 4 were still pending. Their responses were dropped.
+
+Fix:
+
+- Replaced the concurrent per-line callbacks with a **serialized FIFO
+  queue**: each line is chained onto a single `tail` promise, so requests
+  run strictly one-at-a-time, each fully resolved and flushed before the
+  next begins.
+- `writeLine` now returns a promise that resolves on the stdout write
+  callback, so responses are flushed before the queue advances.
+- `shutdown` no longer self-exits from inside the handler. It returns a
+  normal response; the dispatch loop flushes it and only then calls
+  `process.exit(0)` — guaranteed to be after ids 1–4 by the serial queue.
+- `rl.on("close")` drains the queue before exiting, so an EOF without an
+  explicit `shutdown` still emits every pending response.
+
+Regression coverage added (`test/server.test.ts`):
+
+- A pipelined-burst test writes all five requests in one `stdin.write`
+  without awaiting and asserts the response ids arrive **in order
+  `[1,2,3,4,5]`** before the process exits, plus shape checks on the
+  previously-dropped ids 3 and 4.
+
+Evidence:
+
+- `npm run build` — passed (tsc).
+- `npm test` — passed: **12/12** (was 11/11; +1 pipelined ordering test).
+- Manual pipeline smoke — response ids `[1,2,3,4,5]`, ordered, before exit.
+- Stress run — the manual burst repeated **20×**, all 20 produced
+  `[1,2,3,4,5]` (the original race was timing-dependent; the fix is
+  deterministic).
+- Parent repo gates still green: `pnpm test` → **292/292**.
+
+Quality rating:
+
+```text
+9/10
+```
+
+The remaining point: the generated server still exits the whole process on
+`shutdown` rather than supporting a clean per-connection teardown, which is
+fine for a stdio tool but would need revisiting if it ever multiplexed.
+
 ## Blocked Comparison
 
 `opencode` is installed locally:
@@ -137,7 +197,11 @@ The planned side-by-side comparison is:
    - amount of redundant rediscovery
    - clarity of final evidence
 
-The actual harder Forge rerun was blocked by the app approval-credit gate before execution. It should be rerun once escalation is available again.
+The Forge side of the harder task is now complete (see Trial 2 above): the
+pipelined-ordering fix is implemented, tested, and verified under the manual
+stdio smoke. The remaining open item is the `opencode run` side of the
+side-by-side comparison, which still needs to be executed on the same task
+and target directory using MiniMax M3 before the two can be scored.
 
 ## Current Evidence Commands
 

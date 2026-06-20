@@ -54,8 +54,12 @@ import type { LocalModelConfig } from '@forge/types'
 import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
 import type { GitConfig, ProviderConfig } from '@forge/types'
 import { writeFile, mkdir } from 'node:fs/promises'
-import { basename, join, dirname } from 'node:path'
+import { basename, join, dirname, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 import { AgentContextBuilder } from './context-builder.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
@@ -156,6 +160,123 @@ export interface AgentResult {
   stageTrace?: Array<{ stage: StageName; iteration: number; reason: string }>
   /** True if the run was a resume of a previously-crashed session. */
   resumed?: boolean
+  /**
+   * Cumulative MAIN-MODEL token usage for the run (local-model work excluded).
+   * The headline efficiency metric: verified tasks per main-model token.
+   */
+  mainModelUsage?: { inputTokens: number; outputTokens: number; calls: number }
+}
+
+/**
+ * Read-only discovery primitives. Withheld from the EDIT tool set once the
+ * model is stuck reading without writing, so the only path forward is to apply
+ * an edit (or finish). run_command/run_tests are intentionally NOT here — the
+ * model still needs them to build and verify after writing.
+ */
+const READ_ONLY_TOOL_NAMES = new Set<string>([
+  'read_file',
+  'search_code',
+  'glob_files',
+  'retrieve_artifact',
+])
+
+/**
+ * Maximum consecutive EDIT passes with no file write before the loop pauses.
+ * Past the read-tool withhold (≥3) and shell-inspection block, if the model
+ * still hasn't written, it is not going to — pause instead of spinning.
+ */
+const EDIT_NO_WRITE_HARD_CAP = 8
+
+/** Shell utilities that only read/inspect files and produce no edits. */
+const READ_ONLY_SHELL_TOOLS = new Set<string>([
+  'cat', 'sed', 'awk', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
+  'head', 'tail', 'less', 'more', 'wc', 'nl', 'cut', 'sort', 'uniq',
+  'ls', 'tree', 'find', 'stat', 'file', 'cmp', 'diff', 'fold', 'column',
+])
+
+/**
+ * True if a shell command string is pure read-only file inspection (every
+ * pipeline segment is a read-only utility). Build/test/edit commands
+ * (npm, node, tsc, pnpm, git, tee, >, >>, etc.) are NOT matched, so the model
+ * can still verify after writing even while read tools are withheld. Used to
+ * stop a read-happy model from dodging the EDIT write-forcing guard via the
+ * shell. Conservative: anything with a redirection or an unrecognised command
+ * is treated as NOT read-only (i.e. allowed through).
+ */
+/**
+ * True if a shell command builds, type-checks, lints, or runs tests — i.e.
+ * forward-progress verification, not idle inspection. Used so a repair loop
+ * (run test → read output → fix) doesn't trip the EDIT no-write spin cap.
+ */
+export function isBuildOrTestCommand(command: unknown): boolean {
+  if (typeof command !== 'string') return false
+  return /\b(npm|pnpm|yarn|bun)\b.*\b(run\s+)?(build|test|typecheck|lint|check)\b|\b(tsc|vitest|jest|mocha|node\s+--test|pytest|go\s+test|cargo\s+(test|build|check))\b/.test(
+    command,
+  )
+}
+
+/**
+ * True if a shell command mutates files in the working tree (renames, in-place
+ * edits, applies patches, moves/copies). Such a command is real forward
+ * progress even though it isn't a tracked edit_file — so it must reset the EDIT
+ * no-write spin cap. (Observed: MiniMax-M3 completed a 29-file rename via
+ * `git mv … && sed …`; without this, the spin cap fired and Forge PAUSED on an
+ * already-finished task.)
+ */
+export function isFileMutatingCommand(command: unknown): boolean {
+  if (typeof command !== 'string') return false
+  return (
+    /\bgit\s+(mv|apply|checkout|restore|rm)\b/.test(command)
+    || /\bsed\s+-i\b/.test(command)
+    || /\bperl\s+-i\b/.test(command)
+    || /\b(mv|cp)\s+[^|]*\S/.test(command)
+    || /\bpatch\b/.test(command)
+    || /\btee\b/.test(command)
+    || /\b(echo|printf|cat)\b[^|;&]*\s>>?\s*[\w./-]+/.test(command)
+  )
+}
+
+/**
+ * Stable key identifying what a read/search/inspection tool call targeted, so
+ * repeated reads of the same location can be told apart from exploring new ones.
+ * Returns null for non-read tools (they aren't "reads" for localization). For
+ * read-only shell inspection, keys on the command text itself.
+ */
+export function readTargetKey(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  const i = input ?? {}
+  switch (toolName) {
+    case 'read_file':
+      return `read:${String(i.path ?? '')}@${i.offset ?? 0}:${i.limit ?? ''}`
+    case 'retrieve_artifact':
+      return `artifact:${String(i.artifact_ref ?? i.artifactRef ?? '')}`
+    case 'search_code':
+      return `search:${String(i.pattern ?? '')}|${String(i.include ?? '')}`
+    case 'glob_files':
+      return `glob:${String(i.pattern ?? '')}`
+    case 'run_command':
+      return isReadOnlyShellInspection(i.command) ? `sh:${String(i.command ?? '').trim()}` : null
+    default:
+      return null
+  }
+}
+
+export function isReadOnlyShellInspection(command: unknown): boolean {
+  if (typeof command !== 'string') return false
+  const cmd = command.trim()
+  if (!cmd) return false
+  // Output redirection or append means it writes — not read-only.
+  if (/>>?|\btee\b/.test(cmd)) return false
+  const segments = cmd.split('|').map((s) => s.trim()).filter(Boolean)
+  if (segments.length === 0) return false
+  for (const seg of segments) {
+    // First bare token of the segment (skip env-var assignments like FOO=bar).
+    const tokens = seg.split(/\s+/).filter((t) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+    const head = tokens[0]
+    if (!head) return false
+    const base = head.replace(/^.*\//, '') // strip any path prefix
+    if (!READ_ONLY_SHELL_TOOLS.has(base)) return false
+  }
+  return true
 }
 
 interface InternalState {
@@ -183,6 +304,19 @@ interface InternalState {
   consecutiveNoTool: number
   /** Consecutive failed/truncated completions (drives error tolerance). */
   consecutiveErrors: number
+  /**
+   * Consecutive EDIT passes that made NO progress of any kind — no write, no
+   * verification run, and no NEW file/search read. Reading a not-yet-seen
+   * location is legitimate localization progress (root cause far from symptom),
+   * so it must NOT count here; only pure-redundant re-reading does. Drives the
+   * write-forcing nudge / read-withhold / hard cap.
+   */
+  editPassesWithoutWrite: number
+  /**
+   * Read targets already seen this run (file path + offset, or search pattern).
+   * Used to distinguish productive new-location reads from redundant re-reads.
+   */
+  readTargets: Set<string>
 }
 
 export class AgentLoop {
@@ -251,6 +385,14 @@ export class AgentLoop {
 
   /** Trace events captured during the current run. */
   private pendingTrace: TraceEventInput[] = []
+
+  /**
+   * Cumulative MAIN-MODEL (frontier provider) token usage for the run. This is
+   * the metric Forge optimizes — verified tasks per main-model token — since
+   * local-model work (summarize/compact/embed) is unmetered. Local-model calls
+   * are NOT counted here.
+   */
+  private mainModelUsage = { inputTokens: 0, outputTokens: 0, calls: 0 }
 
   constructor(config: AgentConfig) {
     this.config = config
@@ -636,6 +778,8 @@ export class AgentLoop {
       stageTrace: [],
       consecutiveNoTool: 0,
       consecutiveErrors: 0,
+      editPassesWithoutWrite: 0,
+      readTargets: new Set<string>(),
     }
 
     const fire = (event: Omit<AgentEvent, 'iteration'>) => {
@@ -752,6 +896,7 @@ export class AgentLoop {
       riskLevel: this.taskRisk?.level,
       stageTrace: internal.stageTrace,
       resumed: options.resumed,
+      mainModelUsage: { ...this.mainModelUsage },
     }
     void lastDecisionReason
   }
@@ -1008,6 +1153,21 @@ export class AgentLoop {
     fire: (event: Omit<AgentEvent, 'iteration'>) => void,
   ): Promise<{ terminal?: boolean; terminalStatus?: TaskStatus | 'completed'; summary?: string }> {
     fire({ type: 'status', message: 'EDIT: invoking model to propose changes', status: 'edit' })
+    // Forcing function: once the model has spent several EDIT turns reading
+    // without writing, remove the read-only tools so the only way forward is to
+    // write (or finish). The prose nudge in handleCompletion escalates first;
+    // this is the hard backstop for models that ignore it.
+    const stuckReading = internal.editPassesWithoutWrite >= 3
+    const editTools = stuckReading
+      ? tools.filter((t) => !READ_ONLY_TOOL_NAMES.has(t.name))
+      : tools
+    if (stuckReading) {
+      fire({
+        type: 'status',
+        message: `EDIT: read tools withheld (no write in ${internal.editPassesWithoutWrite} passes) — write or finish`,
+        status: 'edit',
+      })
+    }
     const agentContext = this.contextBuilder.build({
       taskId: internal.taskId,
       task: internal.task,
@@ -1015,13 +1175,13 @@ export class AgentLoop {
       domainSelection: this.domainSelection,
       boundedContext,
       acceptanceContract: contract,
-      tools,
+      tools: editTools,
       mode: this.config.mode,
       warnings: await this.failureEngine.getWarnings(internal.taskId),
       capabilityNames: _capabilityTools.map((t) => t.name),
       riskAssessment: this.taskRisk,
     })
-    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools, internal.taskId)
+    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, editTools, internal.taskId)
     return this.handleCompletion(internal, tools, contract, boundedContext, _capabilityTools, fire, completion)
   }
 
@@ -1256,8 +1416,50 @@ export class AgentLoop {
     const changedFiles: string[] = []
     let terminalSignal: { status: TaskStatus; summary: string } | undefined
     let expandedThisTurn: string[] | undefined
+    // A pass that runs build/test/verification is making forward progress even
+    // without a file write (the model is in a run-test → read-output → fix
+    // repair loop). Such passes must NOT count toward the no-write spin cap, or
+    // a legitimate repair loop gets paused. (iter3 regression: the hard cap
+    // mis-fired mid-repair while npm test was timing out.)
+    let ranVerificationThisPass = false
+    // A pass that reads a NEW file/range or runs a NEW search is making
+    // localization progress (legitimately exploring to find a root cause far
+    // from its symptom). It must NOT count toward the no-write spin cap — only
+    // re-reading already-seen locations does.
+    let readNewThisPass = false
 
     for (const toolCall of completion.toolCalls) {
+      // EDIT read-leak guard. When read tools are withheld (the model has been
+      // stuck reading without writing), a read-happy model will route file
+      // inspection through run_command (cat/sed/grep/head/tail/…) to dodge the
+      // withhold. Observed with MiniMax-M3: 45 such shell reads across 44
+      // withhold passes, never converging. Deny pure read-only shell
+      // inspection while stuck so the only path forward is to write or finish.
+      // npm/node/tsc build & test commands are NOT read-only inspection and
+      // pass through — the model still needs them to verify after writing.
+      if (
+        internal.stage === 'EDIT'
+        && internal.editPassesWithoutWrite >= 3
+        && toolCall.name === 'run_command'
+        && isReadOnlyShellInspection((toolCall.input as Record<string, unknown> | undefined)?.command)
+      ) {
+        fire({
+          type: 'status',
+          message: 'EDIT: read-only shell inspection blocked while stuck — write or finish',
+          status: 'edit',
+          toolName: toolCall.name,
+        })
+        toolMessages.push({
+          role: 'tool',
+          content:
+            'Blocked: read-only shell inspection (cat/sed/grep/head/tail/…) is disabled because you have read ' +
+            'repeatedly without writing. You already have enough context. Apply the change now with edit_file or ' +
+            'write_file, run npm run build / npm test to verify, or call finish_task. Do not read more.',
+          toolCallId: toolCall.id,
+        })
+        continue
+      }
+
       // Permission check before execution.
       const decision = this.permissionEngine.evaluate(toolCall.name, toolCall.input)
       if (decision.action === 'deny') {
@@ -1273,8 +1475,42 @@ export class AgentLoop {
         continue
       }
       if (decision.action === 'ask') {
-        // Emit a "needs human approval" terminal signal so the loop
-        // pauses cleanly. The TUI shows the question.
+        // A destructive-looking run_command must NOT hard-halt an unattended
+        // long-horizon run. (Observed: MiniMax-M3 chose an efficient
+        // `grep … | xargs sh -c 'sed … > tmp && mv'` bulk rename; the classifier
+        // flagged `sh -c` and blocked the whole run for human approval, wasting
+        // the run.) Instead: do NOT execute the risky command (safety preserved),
+        // but DENY-and-continue with a redirect to tracked edits, and record the
+        // decision — mirroring the low/medium-risk ask_question autonomy policy.
+        // Non-shell asks still escalate to a human.
+        if (toolCall.name === 'run_command') {
+          fire({
+            type: 'status',
+            message: `Blocked risky shell command, continuing autonomously: ${decision.reason}`,
+            status: 'permission-ask',
+            toolName: toolCall.name,
+          })
+          await this.decisionEngine.addEntry(
+            internal.taskId,
+            'Declined a risky shell command and continued autonomously',
+            `Permission classifier flagged: ${decision.reason}. An unattended run does not halt for this.`,
+            [],
+            { domain: 'autonomy:shell' },
+          )
+          toolMessages.push({
+            role: 'tool',
+            content:
+              `Blocked (not executed): ${decision.reason}. ` +
+              'This is an autonomous run — it will not pause for approval. Do NOT retry this command. ' +
+              'Make the change through tracked tools instead: use edit_file / write_file for each file ' +
+              '(these are checkpointed and recorded as evidence), or use a non-destructive command. ' +
+              'For a repo-wide rename, apply edit_file to each affected file in turn.',
+            toolCallId: toolCall.id,
+          })
+          continue
+        }
+        // Non-shell ask: emit a "needs human approval" terminal signal so the
+        // loop pauses cleanly. The TUI shows the question.
         fire({
           type: 'status',
           message: `Permission ask for ${toolCall.name}: ${decision.reason}`,
@@ -1314,6 +1550,42 @@ export class AgentLoop {
       if ((toolCall.name === 'write_file' || toolCall.name === 'edit_file') && toolInput?.path) {
         changedFiles.push(toolInput.path as string)
       }
+      // Track whether this pass ran a build/test/verification — productive work
+      // that should not count toward the EDIT no-write spin cap.
+      if (
+        toolCall.name === 'run_tests'
+        || toolCall.name === 'run_verification'
+        || toolCall.name === 'verify_check'
+        || (toolCall.name === 'run_command'
+          && (isBuildOrTestCommand((toolInput)?.command)
+            || (isFileMutatingCommand((toolInput)?.command)
+              && !result.content.startsWith('Error:'))))
+      ) {
+        ranVerificationThisPass = true
+      }
+      // Track NEW-location reads as localization progress. A read of a file
+      // range or a search pattern not seen before this run means the model is
+      // actively localizing, not spinning — so it must not advance the cap.
+      {
+        const readKey = readTargetKey(toolCall.name, toolInput)
+        if (readKey && !internal.readTargets.has(readKey)) {
+          internal.readTargets.add(readKey)
+          readNewThisPass = true
+        }
+      }
+      // A file-mutating shell command (git mv / sed -i / patch / redirect) is a
+      // real change to the tree even though it isn't a tracked edit_file. Record
+      // the working-tree delta as touched files so completion detection and the
+      // evidence ledger know work happened (otherwise Forge can finish a task
+      // via shell and not realize it).
+      if (
+        toolCall.name === 'run_command'
+        && isFileMutatingCommand((toolInput)?.command)
+        && !result.content.startsWith('Error:')
+      ) {
+        const mutated = await this.detectWorkingTreeChanges(internal.taskId)
+        for (const f of mutated) if (!changedFiles.includes(f)) changedFiles.push(f)
+      }
       if (expandedThisTurn && toolResultMetadata(result)?.type === 'expansion') {
         expandedThisTurn = [
           ...(expandedThisTurn ?? []),
@@ -1347,6 +1619,36 @@ export class AgentLoop {
           summary: (result.metadata.summary as string) || result.content,
         }
         break
+      }
+      if (
+        result.metadata?.type === 'verification'
+        && result.metadata.passed === true
+        && result.metadata.check === 'test'
+      ) {
+        const taskState = await this.taskEngine.getTask(internal.taskId)
+        const filesTouched = taskState?.filesTouched ?? []
+        const vsummary = await this.verificationEngine.getSummary(internal.taskId).catch(() => null)
+        const passed = vsummary?.passed ?? 0
+        const failed = vsummary?.failed ?? 0
+        if (filesTouched.length > 0 && passed > 0 && failed === 0) {
+          const contract = await this.acceptanceEngine.getContract(internal.taskId)
+          for (const c of contract?.criteria ?? []) {
+            if (c.status !== 'verified' && c.status !== 'failed' && c.status !== 'blocked') {
+              await this.acceptanceEngine.updateCriterionStatus(
+                internal.taskId,
+                c.id,
+                'verified',
+                `auto-verified: ${String(result.metadata.command ?? 'test command')} passed`,
+              )
+            }
+          }
+          terminalSignal = {
+            status: 'completed',
+            summary:
+              `Completed after passing test verification (${String(result.metadata.command ?? 'test command')}).`,
+          }
+          break
+        }
       }
       if (result.metadata?.type === 'question') {
         const question = String(result.metadata?.question ?? 'Needs human input')
@@ -1406,6 +1708,71 @@ export class AgentLoop {
       await this.traceRecorder.record(internal.taskId, 'decision' as TraceEventType, `Selected ${selection.selectedTests.length} affected tests`, {
         payload: { filesChanged: changedFiles, testCount: selection.selectedTests.length },
       })
+    }
+
+    // EDIT write-forcing guard. In EDIT the model is supposed to implement the
+    // change, but a read-happy model can spin indefinitely calling read_file /
+    // search_code without ever producing a write — burning the whole budget
+    // with zero code changes (observed with MiniMax-M3 on the pipelined-stdio
+    // task: 14 EDIT passes, 0 writes). We count consecutive EDIT passes that
+    // touched no file and inject an escalating nudge so context-gathering
+    // converges to an actual edit. Reset as soon as a write lands.
+    if (internal.stage === 'EDIT' && !terminalSignal) {
+      const wroteThisPass = changedFiles.length > 0
+      if (wroteThisPass || ranVerificationThisPass || readNewThisPass) {
+        // Forward progress = a write, a build/test/verification run, OR reading
+        // a NEW location (active localization). Reset the spin counter. Only a
+        // pass that did NONE of these — pure redundant re-reading of things
+        // already seen — advances toward the cap.
+        internal.editPassesWithoutWrite = 0
+      } else {
+        internal.editPassesWithoutWrite += 1
+        const n = internal.editPassesWithoutWrite
+        if (n === 2) {
+          internal.messages.push({
+            role: 'user',
+            content:
+              'You are in the EDIT stage and have spent the last ' + n + ' turns only reading/searching, not editing. ' +
+              'You now have enough context. Stop gathering context and implement the change now: call edit_file or write_file ' +
+              'to apply the fix in this turn. Do not call read_file or search_code again unless an edit fails.',
+          })
+        } else if (n >= EDIT_NO_WRITE_HARD_CAP) {
+          // Hard cap: the model has spun far too long reading without writing
+          // (even with read tools withheld and shell inspection blocked). Stop
+          // burning budget — pause with durable state so a human or a resume
+          // can intervene, rather than churning to the iteration ceiling.
+          await this.taskEngine.setNextAction(
+            internal.taskId,
+            'EDIT stalled: model read ' + n + ' passes without writing. Resume to retry or narrow the task.',
+          )
+          await this.failureEngine.addEntry(
+            internal.taskId,
+            'EDIT stage stalled without a write',
+            'edit-stage',
+            n + ' consecutive EDIT passes produced no file write despite read tools being withheld',
+            'The model could not converge from context-gathering to an edit. Consider a smaller task or more targeted localization.',
+            {},
+          )
+          return {
+            terminal: true,
+            terminalStatus: 'paused',
+            summary:
+              'Paused: the EDIT stage read ' + n + ' passes without producing a write. ' +
+              'Resume to retry, or narrow the task scope.',
+          }
+        } else if (n >= 3) {
+          // Strip-read backstop already withholds read tools in runEditStage; here
+          // we escalate the prose so the model commits to a write or finishes.
+          internal.messages.push({
+            role: 'user',
+            content:
+              'STOP READING. This is your ' + n + 'th consecutive EDIT turn with no file write. ' +
+              'Reading more will not help and is wasting the run budget. In your NEXT response you MUST call edit_file ' +
+              'or write_file to apply the implementation. If you believe no edit is needed, call finish_task with an ' +
+              'explanation instead. Any further read attempt (including shell cat/sed/grep) is a mistake.',
+          })
+        }
+      }
     }
 
     if (terminalSignal) {
@@ -1484,6 +1851,14 @@ export class AgentLoop {
       } else {
         result = await this.toolExecutor.execute(toolCall, toolContext)
       }
+    } catch (err) {
+      // A tool that throws (e.g. read_file on a path the model guessed wrong,
+      // ENOENT) must NOT crash a long-horizon run. Return the error as the tool
+      // result so the model sees it and self-corrects (fix the path, try
+      // another file), exactly as it would for any other tool failure.
+      const msg = err instanceof Error ? err.message : String(err)
+      fire({ type: 'error', message: `Tool ${toolCall.name} failed: ${msg}`, error: msg, toolName: toolCall.name })
+      result = { content: `Error: ${toolCall.name} failed: ${msg}` }
     } finally {
       if (commandRowId && this.stateStore) {
         try {
@@ -1618,7 +1993,30 @@ export class AgentLoop {
         })) {
           streamChunks.push(chunk)
         }
-        return this.mergeStreamResult(streamChunks)
+        const merged = this.mergeStreamResult(streamChunks)
+        if (merged.usage) {
+          this.mainModelUsage.inputTokens += merged.usage.inputTokens
+          this.mainModelUsage.outputTokens += merged.usage.outputTokens
+          this.mainModelUsage.calls += 1
+          this.pendingTrace.push({
+            type: 'model_call' as TraceEventType,
+            taskId,
+            actor: 'agent',
+            summary:
+              `Main-model call: ${merged.usage.inputTokens} in / ${merged.usage.outputTokens} out tokens ` +
+              `(run total ${this.mainModelUsage.inputTokens}/${this.mainModelUsage.outputTokens} over ${this.mainModelUsage.calls} calls)`,
+            payload: {
+              inputTokens: merged.usage.inputTokens,
+              outputTokens: merged.usage.outputTokens,
+              runTotalInput: this.mainModelUsage.inputTokens,
+              runTotalOutput: this.mainModelUsage.outputTokens,
+              calls: this.mainModelUsage.calls,
+              localModel: false,
+              authoritative: true,
+            },
+          })
+        }
+        return merged
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         this.lastProviderError = msg
@@ -1628,6 +2026,42 @@ export class AgentLoop {
       }
     }
     return { content: '', finishReason: 'error' }
+  }
+
+  /**
+   * Inspect the git working tree for changed source files and record them as
+   * touched. Used after a file-mutating shell command (git mv / sed -i / patch)
+   * so Forge's state knows work happened even when the change bypassed the
+   * tracked edit_file tool. Returns the changed paths (best-effort; returns []
+   * if the workDir isn't a git repo or git is unavailable).
+   */
+  private async detectWorkingTreeChanges(taskId: string): Promise<string[]> {
+    try {
+      const { stdout: rootStdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: this.config.workDir,
+        maxBuffer: 1024 * 1024,
+      })
+      if (resolve(rootStdout.trim()) !== resolve(this.config.workDir)) return []
+      const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
+        cwd: this.config.workDir,
+        maxBuffer: 8 * 1024 * 1024,
+      })
+      const files: string[] = []
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue
+        // Format: "XY path" or rename "XY old -> new". Take the final path.
+        const rest = line.slice(3)
+        const path = rest.includes(' -> ') ? rest.split(' -> ')[1] ?? rest : rest
+        const clean = path.trim().replace(/^"|"$/g, '')
+        if (clean) files.push(clean)
+      }
+      for (const f of files) {
+        try { await this.taskEngine.addFileTouched(taskId, f) } catch { /* non-fatal */ }
+      }
+      return files
+    } catch {
+      return []
+    }
   }
 
   /**
@@ -1934,6 +2368,9 @@ export class AgentLoop {
     let content = ''
     const collectedToolCalls: ToolCall[] = []
     let finishReason: CompletionResult['finishReason'] = 'stop'
+    let inputTokens = 0
+    let outputTokens = 0
+    let sawUsage = false
 
     for (const chunk of chunks) {
       if (chunk.content) content += chunk.content
@@ -1941,6 +2378,16 @@ export class AgentLoop {
       if (chunk.toolCalls) {
         for (const tc of chunk.toolCalls) {
           collectedToolCalls.push(tc)
+        }
+      }
+      if (chunk.usage) {
+        if (typeof chunk.usage.inputTokens === 'number') {
+          inputTokens = Math.max(inputTokens, chunk.usage.inputTokens)
+          sawUsage = true
+        }
+        if (typeof chunk.usage.outputTokens === 'number') {
+          outputTokens = Math.max(outputTokens, chunk.usage.outputTokens)
+          sawUsage = true
         }
       }
     }
@@ -1957,6 +2404,7 @@ export class AgentLoop {
       content,
       toolCalls: uniqueToolCalls.length > 0 ? uniqueToolCalls : undefined,
       finishReason,
+      ...(sawUsage ? { usage: { inputTokens, outputTokens } } : {}),
     }
   }
 }

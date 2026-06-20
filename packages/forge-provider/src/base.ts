@@ -347,6 +347,9 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
   let content = ''
   const toolCalls: ToolCall[] = []
   let finishReason: CompletionResult['finishReason'] = 'stop'
+  let inputTokens = 0
+  let outputTokens = 0
+  let sawUsage = false
 
   for (const chunk of chunks) {
     if (chunk.content) content += chunk.content
@@ -356,9 +359,26 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
       }
     }
     if (chunk.finishReason) finishReason = chunk.finishReason
+    if (chunk.usage) {
+      // Usage fields are cumulative snapshots, not increments — take the max
+      // seen so a late partial snapshot can't lower the count.
+      if (typeof chunk.usage.inputTokens === 'number') {
+        inputTokens = Math.max(inputTokens, chunk.usage.inputTokens)
+        sawUsage = true
+      }
+      if (typeof chunk.usage.outputTokens === 'number') {
+        outputTokens = Math.max(outputTokens, chunk.usage.outputTokens)
+        sawUsage = true
+      }
+    }
   }
 
-  return { content, toolCalls: toolCalls.length > 0 ? toolCalls : undefined, finishReason }
+  return {
+    content,
+    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    finishReason,
+    ...(sawUsage ? { usage: { inputTokens, outputTokens } } : {}),
+  }
 }
 
 export function getSystemMessage(messages: Message[]): string | undefined {

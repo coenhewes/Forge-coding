@@ -1,4 +1,5 @@
-export { AgentLoop } from './agent-loop.js'
+export { AgentLoop, isReadOnlyShellInspection, isBuildOrTestCommand, isFileMutatingCommand, readTargetKey } from './agent-loop.js'
+export { commandCheckKind, commandOutputLooksPassed } from './tools.js'
 export type { AgentConfig, AgentResult, AgentEvent } from './agent-loop.js'
 
 export { AgentContextBuilder } from './context-builder.js'
