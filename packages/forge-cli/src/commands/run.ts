@@ -136,6 +136,9 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
     `Verification passed: ${result.verificationPassed}`,
     `Acceptance passed: ${result.acceptancePassed}`,
     ...(result.riskLevel ? [`Risk level: ${result.riskLevel}`] : []),
+    ...(result.mainModelUsage
+      ? [`Main-model tokens: ${result.mainModelUsage.inputTokens} in / ${result.mainModelUsage.outputTokens} out over ${result.mainModelUsage.calls} calls (local-model work excluded)`]
+      : []),
     `Summary: ${result.summary}`,
     ...(result.promotedCheckpointId ? [`Promoted checkpoint: ${result.promotedCheckpointId}`] : []),
     ...(result.branch ? [`Branch: ${result.branch}`] : []),

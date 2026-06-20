@@ -18,6 +18,7 @@ export type TraceEventType =
   | 'pr_update'
   | 'subtask_completed'
   | 'local_model_invoked'
+  | 'model_call'
   | 'error'
 
 export interface TraceEvent {

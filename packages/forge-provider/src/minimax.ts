@@ -47,8 +47,26 @@ export class MinimaxProvider implements ModelProvider {
       stream: true,
     }
 
-    if (system) body.system = system
-    if (request.tools) body.tools = mapAnthropicTools(request.tools)
+    // Prompt caching: the system prompt and tool schemas are stable across the
+    // many calls of a long-horizon run (~4-5K tokens combined). Marking them
+    // with cache_control lets MiniMax serve them from cache on later calls, so
+    // they stop counting as fresh input tokens — the single biggest lever on
+    // Forge's main-model token cost (local-model work is already free). The
+    // cache covers everything up to and including the marked block, so we mark
+    // the system block and the LAST tool.
+    if (system) {
+      body.system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+    }
+    if (request.tools) {
+      const tools = mapAnthropicTools(request.tools)
+      if (tools && tools.length > 0) {
+        tools[tools.length - 1] = {
+          ...tools[tools.length - 1],
+          cache_control: { type: 'ephemeral' },
+        }
+      }
+      body.tools = tools
+    }
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
 
@@ -103,6 +121,18 @@ export class MinimaxProvider implements ModelProvider {
         chunk.finishReason = 'stop'
       }
 
+      // Token usage (Anthropic-style): input_tokens arrives on message_start,
+      // output_tokens accumulates on message_delta. Surface both so the agent
+      // loop can track real main-model spend (the metric Forge optimizes:
+      // verified tasks per main-model token, with local-model work being free).
+      if (event === 'message_start') {
+        const msg = data.message as Record<string, unknown> | undefined
+        const usage = msg?.usage as Record<string, unknown> | undefined
+        if (usage && typeof usage.input_tokens === 'number') {
+          chunk.usage = { inputTokens: usage.input_tokens as number }
+        }
+      }
+
       if (event === 'message_delta') {
         const delta = data.delta as Record<string, unknown> | undefined
         if (delta?.stop_reason === 'end_turn') {
@@ -111,6 +141,20 @@ export class MinimaxProvider implements ModelProvider {
           chunk.finishReason = 'length'
         } else if (delta?.stop_reason === 'tool_use') {
           chunk.finishReason = 'tool_calls'
+        }
+        // MiniMax reports the FINAL token counts on message_delta — both
+        // input_tokens and output_tokens (message_start carries zeros). Capture
+        // both here.
+        const usage = data.usage as Record<string, unknown> | undefined
+        if (usage) {
+          const next = { ...chunk.usage }
+          if (typeof usage.input_tokens === 'number' && usage.input_tokens > 0) {
+            next.inputTokens = usage.input_tokens as number
+          }
+          if (typeof usage.output_tokens === 'number') {
+            next.outputTokens = usage.output_tokens as number
+          }
+          chunk.usage = next
         }
       }
 

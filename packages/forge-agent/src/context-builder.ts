@@ -93,20 +93,13 @@ export class AgentContextBuilder {
       '- If a hypothesis fails, record the failure and try a different approach.',
     ]
 
-    if (options.acceptanceContract) {
-      const contract = options.acceptanceContract
-      parts.push('', '## Acceptance Criteria')
-      parts.push('The following criteria define what "done" means:')
-      for (const criterion of contract.criteria) {
-        const icon = criterion.status === 'verified' ? '✓' : criterion.status === 'failed' ? '✗' : '○'
-        parts.push(`- ${icon} [${criterion.id}] ${criterion.description}`)
-      }
-    }
-
-    if (options.warnings && options.warnings.length > 0) {
-      parts.push('', '## Active Warnings')
-      for (const w of options.warnings) parts.push(`- ${w}`)
-    }
+    // NOTE: dynamic per-turn state (acceptance-criterion statuses, warnings,
+    // evidence/verification counts, task state) is intentionally NOT included in
+    // the system prompt. It is regenerated every turn in the SITUATION REPORT
+    // (a user message). Keeping the system prompt byte-stable within a run lets
+    // the provider serve it (and the tool schemas) from prompt cache, which is
+    // the dominant lever on main-model token cost — and avoids duplicating the
+    // same state in two places.
 
     if (options.riskAssessment) {
       const r = options.riskAssessment
@@ -144,45 +137,9 @@ export class AgentContextBuilder {
         parts.push(`- Primary: ${bc.selectedDomains.join(', ')}`)
       }
 
-      if (bc.evidence) {
-        parts.push('', '## Evidence Summary')
-        parts.push(`- Total: ${bc.evidence.totalEntries} | Verified: ${bc.evidence.verified} | Unverified: ${bc.evidence.unverified} | Needs review: ${bc.evidence.needsReview}`)
-      }
-
-      if (bc.verificationStatus) {
-        parts.push('', '## Verification Status')
-        parts.push(`- Passed: ${bc.verificationStatus.passed} | Failed: ${bc.verificationStatus.failed} | Remaining: ${bc.verificationStatus.remaining}`)
-      }
-
-      if (bc.failureWarnings && bc.failureWarnings.length > 0) {
-        parts.push('', '## Failure Warnings (from previous attempts)')
-        for (const w of bc.failureWarnings) parts.push(`- ${w}`)
-      }
-
-      if (bc.openQuestions && bc.openQuestions.length > 0) {
-        parts.push('', '## Open Questions')
-        for (const q of bc.openQuestions) parts.push(`- ${q}`)
-      }
-
       if (bc.riskConstraints && bc.riskConstraints.length > 0) {
         parts.push('', '## Risk Constraints')
         for (const rc of bc.riskConstraints) parts.push(`- ${rc}`)
-      }
-    }
-
-    if (options.taskState) {
-      const ts = options.taskState
-      parts.push('', '## Task State')
-      parts.push(`- Status: ${ts.status}`)
-      parts.push(`- Next action: ${ts.nextAction}`)
-      if (ts.filesTouched.length > 0) parts.push(`- Files touched: ${ts.filesTouched.join(', ')}`)
-      if (ts.remainingWork.length > 0) {
-        parts.push('- Remaining work:')
-        for (const rw of ts.remainingWork) parts.push(`  - ${rw}`)
-      }
-      if (ts.reviewBlockers.length > 0) {
-        parts.push('- Review blockers:')
-        for (const rb of ts.reviewBlockers) parts.push(`  - ${rb}`)
       }
     }
 
@@ -224,15 +181,8 @@ export class AgentContextBuilder {
   }
 
   private buildUserMessage(options: ContextBuilderOptions): Message {
-    let content = options.task
-
-    if (options.taskState) {
-      const ts = options.taskState
-      if (ts.completedWork.length > 0) {
-        content += '\n\nAlready completed:\n' + ts.completedWork.map((w) => `- ${w}`).join('\n')
-      }
-    }
-
-    return { role: 'user', content }
+    // Just the original task — kept stable. Progress/already-completed work is
+    // surfaced every turn in the situation report, so it is not duplicated here.
+    return { role: 'user', content: options.task }
   }
 }
