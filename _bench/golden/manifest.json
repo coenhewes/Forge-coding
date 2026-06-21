@@ -1,0 +1,69 @@
+[
+  {
+    "id": "GG01",
+    "repo": "colinhacks/zod",
+    "fixCommit": "76e8f706bb554de82234106de8299d0139cb3b8e",
+    "pr": 5898,
+    "title": "fix(v4): skip __proto__ key in object catchall",
+    "install": "pnpm install",
+    "verifyCmd": "pnpm test",
+    "verifyCwd": ".",
+    "singleTestCmd": "pnpm exec vitest run --project zod object.test"
+  },
+  {
+    "id": "GG02",
+    "repo": "colinhacks/zod",
+    "fixCommit": "cede2c63739a5823d6aa5093d291e9a111da943d",
+    "pr": 5900,
+    "title": "fix(v4): reject tuple holes before required defaults",
+    "install": "pnpm install",
+    "verifyCmd": "pnpm test",
+    "verifyCwd": ".",
+    "singleTestCmd": "pnpm exec vitest run --project zod tuple.test"
+  },
+  {
+    "id": "GG03",
+    "repo": "colinhacks/zod",
+    "fixCommit": "61d7bedb873bf8185162bb51d027fd8acf2710ee",
+    "pr": 5891,
+    "title": "fix(v4): apply key schema transforms in z.record()",
+    "install": "pnpm install",
+    "verifyCmd": "pnpm test",
+    "verifyCwd": ".",
+    "singleTestCmd": "pnpm exec vitest run --project zod record.test"
+  },
+  {
+    "id": "GL01",
+    "repo": "colinhacks/zod",
+    "longHorizon": true,
+    "_note": "4 independent RUNTIME bugs in distinct files (type-level 5882 + util 5856 removed to isolate multi-bug context-retention from hard type-inference fixes).",
+    "bugs": [
+      { "pr": 5925, "fixCommit": "fbe8ad1b709460fc45d88fdcb5eca591198de60d" },
+      { "pr": 5900, "fixCommit": "cede2c63739a5823d6aa5093d291e9a111da943d" },
+      { "pr": 5632, "fixCommit": "f19860f1f17e3bdc3e696ee5290441bba093d7a4" },
+      { "pr": 5758, "fixCommit": "28c156e254ebdf65d9ed3de4caf1d4293f7e7a84" }
+    ],
+    "install": "pnpm install",
+    "verifyCmd": "pnpm test",
+    "verifyCwd": ".",
+    "maxIterations": 300,
+    "timeoutHours": 3
+  },
+  {
+    "id": "GL02",
+    "repo": "colinhacks/zod",
+    "longHorizon": true,
+    "_note": "4 SMALL mechanical bugs (≤5 lines each) in distinct files — isolates multi-bug CONTEXT RETENTION (Forge's edge) from single-bug fix-difficulty/MM3-variance. Each fix is near-trivial; the challenge is fixing ALL of them across a long run.",
+    "bugs": [
+      { "pr": 5925, "fixCommit": "fbe8ad1b709460fc45d88fdcb5eca591198de60d" },
+      { "pr": 5719, "fixCommit": "7f789defd73ee35f3099ab5c2091cb19bd2b3578" },
+      { "pr": 5893, "fixCommit": "ebc8287ca206402cf3a9aceb745b204493cbadfb" },
+      { "pr": 5855, "fixCommit": "34f601590351e5d3a57fe20c001155940ba65324" }
+    ],
+    "install": "pnpm install",
+    "verifyCmd": "pnpm test",
+    "verifyCwd": ".",
+    "maxIterations": 300,
+    "timeoutHours": 3
+  }
+]

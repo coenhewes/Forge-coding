@@ -1,0 +1,10 @@
+# Heavy / ephemeral benchmark data — never commit (gigabytes of repo clones,
+# worktrees, fresh-DB artifacts, and per-run logs/results).
+repos/
+worktrees/
+cacheval/
+golden/results/
+golden/work/
+gauntlet/RG*/
+gauntlet/SUMMARY.md
+*.log
