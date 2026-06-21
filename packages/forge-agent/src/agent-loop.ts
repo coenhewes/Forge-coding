@@ -50,6 +50,7 @@ import { createContextServer, type ForgeContextServer } from '@forge/context-ser
 
 import { LocalModelService, CompactionPolicy } from '@forge/local-model'
 import type { LocalModelConfig } from '@forge/types'
+import { indexRepo, searchSemantic, type IndexDeps } from './semantic-index.js'
 
 import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
 import type { GitConfig, ProviderConfig } from '@forge/types'
@@ -164,28 +165,8 @@ export interface AgentResult {
    * Cumulative MAIN-MODEL token usage for the run (local-model work excluded).
    * The headline efficiency metric: verified tasks per main-model token.
    */
-  mainModelUsage?: { inputTokens: number; outputTokens: number; calls: number }
+  mainModelUsage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; calls: number }
 }
-
-/**
- * Read-only discovery primitives. Withheld from the EDIT tool set once the
- * model is stuck reading without writing, so the only path forward is to apply
- * an edit (or finish). run_command/run_tests are intentionally NOT here — the
- * model still needs them to build and verify after writing.
- */
-const READ_ONLY_TOOL_NAMES = new Set<string>([
-  'read_file',
-  'search_code',
-  'glob_files',
-  'retrieve_artifact',
-])
-
-/**
- * Maximum consecutive EDIT passes with no file write before the loop pauses.
- * Past the read-tool withhold (≥3) and shell-inspection block, if the model
- * still hasn't written, it is not going to — pause instead of spinning.
- */
-const EDIT_NO_WRITE_HARD_CAP = 8
 
 /** Shell utilities that only read/inspect files and produce no edits. */
 const READ_ONLY_SHELL_TOOLS = new Set<string>([
@@ -193,6 +174,13 @@ const READ_ONLY_SHELL_TOOLS = new Set<string>([
   'head', 'tail', 'less', 'more', 'wc', 'nl', 'cut', 'sort', 'uniq',
   'ls', 'tree', 'find', 'stat', 'file', 'cmp', 'diff', 'fold', 'column',
 ])
+
+// Compact the transcript only when the per-turn prompt (uncached + cache-read)
+// approaches this budget — opencode-style overflow compaction, NOT a proactive
+// per-turn bound. Keeping the full transcript preserves the model's multi-step
+// plan; caching makes the large prompt cheap. Conservative vs MiniMax-M3's
+// context window; lower if overflow errors appear.
+const CONTEXT_COMPACT_BUDGET = 100_000
 
 /**
  * True if a shell command string is pure read-only file inspection (every
@@ -237,6 +225,50 @@ export function isFileMutatingCommand(command: unknown): boolean {
 }
 
 /**
+ * Parse vitest/jest-style test output into a structured list of remaining
+ * failures + the summary line. The agent loop stores this in durable state and
+ * surfaces it in the per-turn situation report, so the model always knows what
+ * is still failing WITHOUT re-running the whole suite and re-parsing a huge,
+ * noisy output (the context-offload thesis: the local model + state track this,
+ * not the frontier model's working memory). Deterministic + free (no model call).
+ */
+export function parseTestFailures(output: unknown): { failures: { file: string; name: string }[]; summary: string | null; total: number | null } | null {
+  if (typeof output !== 'string' || output.length === 0) return null
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '')
+  const failures: { file: string; name: string }[] = []
+  const seen = new Set<string>()
+  let summary: string | null = null
+  let total: number | null = null
+  let sawTestSignal = false
+  for (const raw of output.split('\n')) {
+    const line = stripAnsi(raw)
+    // Summary line, e.g. "Tests  5 failed | 213 passed (218)". Capture the TOTAL
+    // (the "(218)") so the caller can tell a FULL-suite run from a filtered
+    // SUBSET — a subset showing "0 failing" must NOT be mistaken for "all green".
+    if (/\bTests?\s+\d+\s+(failed|passed)/.test(line)) {
+      summary = line.trim()
+      sawTestSignal = true
+      const tot = line.match(/\((\d+)\)\s*$/)
+      if (tot) { const n = Number(tot[1]); if (total == null || n > total) total = n }
+    } else if (/\bTest Files\s+\d+\s+(failed|passed)/.test(line)) {
+      summary = summary ?? line.trim()
+      sawTestSignal = true
+    }
+    // Failure line, e.g. " FAIL  |zod| src/…/x.test.ts > suite > case".
+    const m = line.match(/\bFAIL\b\s+(?:\|[^|]*\|\s*)?(\S+\.(?:test|spec)\.[a-z]+)\s*>\s*(.+?)\s*$/i)
+    if (m && m[1] && m[2]) {
+      sawTestSignal = true
+      const file = m[1]
+      const name = m[2].trim()
+      const key = `${file}::${name}`
+      if (!seen.has(key)) { seen.add(key); failures.push({ file, name }) }
+    }
+  }
+  if (!sawTestSignal) return null
+  return { failures, summary, total }
+}
+
+/**
  * Stable key identifying what a read/search/inspection tool call targeted, so
  * repeated reads of the same location can be told apart from exploring new ones.
  * Returns null for non-read tools (they aren't "reads" for localization). For
@@ -256,6 +288,30 @@ export function readTargetKey(toolName: string, input: Record<string, unknown> |
     case 'run_command':
       return isReadOnlyShellInspection(i.command) ? `sh:${String(i.command ?? '').trim()}` : null
     default:
+      return null
+  }
+}
+
+/**
+ * FILE/pattern-level "did we learn something genuinely new" key, used to decide
+ * whether a read pass counts as localisation DISCOVERY (resets the incremental-
+ * commit nudge). Unlike readTargetKey, read_file keys on the PATH only — paging
+ * the same file at a new offset is not a new discovery, so the nudge can advance
+ * when the model re-reads files it has already opened instead of committing to an
+ * edit. New files / search patterns / graph symbols ARE discoveries (real
+ * breadth → don't nudge). Returns null for shell inspection and non-read tools.
+ */
+export function discoveryKey(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  const i = input ?? {}
+  switch (toolName) {
+    case 'read_file':
+      return `file:${String(i.path ?? '')}`
+    case 'search_code':
+      return `search:${String(i.pattern ?? '')}`
+    case 'glob_files':
+      return `glob:${String(i.pattern ?? '')}`
+    default:
+      if (toolName.startsWith('repo.')) return `${toolName}:${JSON.stringify(i)}`
       return null
   }
 }
@@ -304,6 +360,9 @@ interface InternalState {
   consecutiveNoTool: number
   /** Consecutive failed/truncated completions (drives error tolerance). */
   consecutiveErrors: number
+  /** ID of the top hypothesis from the previous refresh — used to detect
+   *  hypothesis changes and reset probesThisPass. */
+  lastHypothesisId: string | null
   /**
    * Consecutive EDIT passes that made NO progress of any kind — no write, no
    * verification run, and no NEW file/search read. Reading a not-yet-seen
@@ -317,6 +376,25 @@ interface InternalState {
    * Used to distinguish productive new-location reads from redundant re-reads.
    */
   readTargets: Set<string>
+  /**
+   * File/pattern-level discovery keys (see discoveryKey). Drives the incremental-
+   * commit nudge: re-reading an already-opened file is not a discovery.
+   */
+  discoveries: Set<string>
+  /**
+   * Whether a write has happened since the last build/test/verification run.
+   * A test run only counts as EDIT-stage progress (resets the spin cap) if the
+   * model actually edited since the previous test run — re-running tests with no
+   * intervening edit is spinning, not progress.
+   */
+  wroteSinceVerify: boolean
+  /**
+   * Whether the full test/build suite has been run since the last edit. Used to
+   * block REDUNDANT re-runs (same result, heavy output) — the model may run the
+   * suite once to see failures, then must edit before running it again. This is
+   * the only EDIT-stage throttle; it does NOT cap localisation (reads stay free).
+   */
+  ranTestSinceLastEdit: boolean
 }
 
 export class AgentLoop {
@@ -392,7 +470,28 @@ export class AgentLoop {
    * local-model work (summarize/compact/embed) is unmetered. Local-model calls
    * are NOT counted here.
    */
-  private mainModelUsage = { inputTokens: 0, outputTokens: 0, calls: 0 }
+  private mainModelUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, calls: 0 }
+  /** Total prompt tokens (uncached + cache-read) on the last model call. Drives
+   *  overflow-based compaction so the full transcript is kept until near the limit. */
+  private lastPromptTokens = 0
+  /**
+   * Latest parsed test state, refreshed every time the model runs the suite.
+   * Surfaced in the situation report so the model tracks remaining failures via
+   * durable state instead of re-running + re-parsing the full output each turn.
+   */
+  private testState: {
+    failures: { file: string; name: string }[]
+    summary: string | null
+    staleAfterEdit: boolean
+  } | null = null
+  /** Largest test TOTAL seen (the full-suite size), to detect SUBSET runs. */
+  private fullSuiteTotal = 0
+  /**
+   * Deps for the semantic code index (embedding-backed retrieval). Set once the
+   * repo is embedded at startup; consumed by the search_semantic tool. null when
+   * the local embed model is unavailable (the tool then reports a fallback).
+   */
+  private semanticDeps: IndexDeps | null = null
 
   constructor(config: AgentConfig) {
     this.config = config
@@ -699,6 +798,43 @@ export class AgentLoop {
     // Phase 2c: Initialize durable Postgres state when configured.
     const repoId = await this.initDurableState(taskId, task)
 
+    // Phase 2d: Build the SEMANTIC CODE INDEX — embed the repo's source into
+    // Postgres so the model can locate code by meaning (search_semantic) instead
+    // of brute-force paging. Local-model + Postgres work, both unmetered. Failure
+    // here never aborts the run (the model falls back to lexical/graph tools).
+    const emitIndex = (message: string) =>
+      this.config.onEvent?.({ type: 'status', message, status: 'index', iteration: 0 } as AgentEvent)
+    if (this.localModel && this.stateStore && (await this.localModel.available().catch(() => false))) {
+      try {
+        const embedModel = this.config.localModel?.embed?.model ?? 'nomic-embed-text'
+        const deps: IndexDeps = {
+          workDir: this.config.workDir,
+          repoId,
+          localModel: this.localModel,
+          embeddingRepo: this.stateStore.repos.embeddings,
+          model: embedModel,
+          taskId,
+        }
+        emitIndex('Indexing repo for semantic search…')
+        const r = await indexRepo(deps)
+        if (!r.fallback && r.indexed > 0) {
+          this.semanticDeps = deps
+          emitIndex(`Semantic index ready: ${r.indexed} chunks from ${r.files} files`)
+          this.pendingTrace.push({
+            type: 'local_model_invoked' as TraceEventType,
+            taskId,
+            actor: 'agent',
+            summary: `Built semantic index: ${r.indexed} chunks / ${r.files} files`,
+            payload: { indexed: r.indexed, files: r.files, localModel: true, authoritative: false },
+          })
+        } else {
+          emitIndex(`Semantic index skipped (${r.fallback ? 'embed fallback' : 'no source'}) — using lexical tools`)
+        }
+      } catch (err) {
+        emitIndex(`Semantic index failed (${err instanceof Error ? err.message : 'error'}) — using lexical tools`)
+      }
+    }
+
     // Phase 3: Route task to domains
     this.domainSelection = routeTask(task, this.repoMap, this.repoGraph)
     const selectedDomains = this.domainSelection.selectedDomains
@@ -780,6 +916,10 @@ export class AgentLoop {
       consecutiveErrors: 0,
       editPassesWithoutWrite: 0,
       readTargets: new Set<string>(),
+      discoveries: new Set<string>(),
+      wroteSinceVerify: false,
+      ranTestSinceLastEdit: false,
+      lastHypothesisId: null,
     }
 
     const fire = (event: Omit<AgentEvent, 'iteration'>) => {
@@ -797,14 +937,53 @@ export class AgentLoop {
       }
       internal.iteration++
 
-      // Compact when the working log grows large; reference belief-store
-      // ids of dropped facts so retrieval is exact.
-      if (internal.iteration > 10 && internal.messages.length > 30) {
+      // Compact ONLY at overflow (opencode-style), not proactively. Keeping the
+      // full append-only transcript until the prompt approaches the context
+      // budget preserves the model's plan + progress across a long multi-step run
+      // — the thing that lets it march through a bug list instead of losing the
+      // thread. Caching makes the large transcript cheap. A safety message cap
+      // guards the first compaction before any token reading is available.
+      if (
+        (this.lastPromptTokens > 0 && this.lastPromptTokens > CONTEXT_COMPACT_BUDGET) ||
+        internal.messages.length > 400
+      ) {
         internal.messages = await this.compactMessages(internal.messages, taskId)
+        this.lastPromptTokens = 0 // reset so we don't recompact every turn post-summary
+      }
+
+      // Compact large tool outputs IN PLACE (once), persisting the result back
+      // into internal.messages. This is idempotent — already-compacted (short)
+      // messages are skipped — so the history content stays byte-stable across
+      // turns, which is what makes the append-only prefix cacheable. (Doing
+      // this on a throwaway per-turn copy, as before, re-summarized the same
+      // outputs with a fresh ref every turn → defeated prompt caching AND
+      // burned local-model time repeatedly.)
+      if (this.compactionPolicy) {
+        const compacted = await this.compactionPolicy.compactToolOutputs(taskId, internal.messages)
+        if (compacted.compacted > 0) {
+          internal.messages = compacted.messages
+          this.pendingTrace.push({
+            type: 'local_model_invoked',
+            taskId,
+            actor: 'agent',
+            summary: `Compacted ${compacted.compacted} tool output(s) in place (cache-stable)`,
+            payload: { refs: compacted.refs, localModel: true, authoritative: false },
+          })
+        }
       }
 
       // Refresh the belief snapshot and recompute the verification plan.
       await this.refreshBeliefSnapshot(internal)
+
+      // If the top hypothesis changed, give the agent a fresh probe budget.
+      // Without this, once probesThisPass hits the cap, the agent can never
+      // probe a new hypothesis — it's stuck re-running the same EDIT loop even
+      // when the belief state evolves.
+      const newTopHyp = topHypothesisFor(internal.belief)
+      if (internal.lastHypothesisId && newTopHyp && internal.lastHypothesisId !== newTopHyp.id) {
+        internal.probesThisPass = 0
+      }
+      internal.lastHypothesisId = newTopHyp?.id ?? null
 
       // Run the stage machine. The first iteration always LOCALIZEs.
       if (internal.iteration === 1) {
@@ -1153,21 +1332,14 @@ export class AgentLoop {
     fire: (event: Omit<AgentEvent, 'iteration'>) => void,
   ): Promise<{ terminal?: boolean; terminalStatus?: TaskStatus | 'completed'; summary?: string }> {
     fire({ type: 'status', message: 'EDIT: invoking model to propose changes', status: 'edit' })
-    // Forcing function: once the model has spent several EDIT turns reading
-    // without writing, remove the read-only tools so the only way forward is to
-    // write (or finish). The prose nudge in handleCompletion escalates first;
-    // this is the hard backstop for models that ignore it.
-    const stuckReading = internal.editPassesWithoutWrite >= 3
-    const editTools = stuckReading
-      ? tools.filter((t) => !READ_ONLY_TOOL_NAMES.has(t.name))
-      : tools
-    if (stuckReading) {
-      fire({
-        type: 'status',
-        message: `EDIT: read tools withheld (no write in ${internal.editPassesWithoutWrite} passes) — write or finish`,
-        status: 'edit',
-      })
-    }
+    // NOTE: we deliberately do NOT cap localisation. Reads are cheap (the
+    // append-only history is prompt-cached, so re-reads cost ~0), and on a large
+    // repo a genuine root-cause hunt may need many file reads — capping that with
+    // a fixed pass budget forces premature, wrong edits and defeats the whole
+    // point of a long-horizon agent. Instead we only cut GENUINE, scale-invariant
+    // WASTE in the per-tool guard below: (a) re-running the full test/build suite
+    // when nothing changed since the last run, and (b) exact-duplicate read-only
+    // shell inspection. All read tools stay available the entire time.
     const agentContext = this.contextBuilder.build({
       taskId: internal.taskId,
       task: internal.task,
@@ -1175,13 +1347,13 @@ export class AgentLoop {
       domainSelection: this.domainSelection,
       boundedContext,
       acceptanceContract: contract,
-      tools: editTools,
+      tools,
       mode: this.config.mode,
       warnings: await this.failureEngine.getWarnings(internal.taskId),
       capabilityNames: _capabilityTools.map((t) => t.name),
       riskAssessment: this.taskRisk,
     })
-    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, editTools, internal.taskId)
+    const completion = await this.runCompletion(agentContext.systemPrompt, agentContext.messages, internal.messages, tools, internal.taskId)
     return this.handleCompletion(internal, tools, contract, boundedContext, _capabilityTools, fire, completion)
   }
 
@@ -1426,35 +1598,42 @@ export class AgentLoop {
     // localization progress (legitimately exploring to find a root cause far
     // from its symptom). It must NOT count toward the no-write spin cap — only
     // re-reading already-seen locations does.
-    let readNewThisPass = false
+    // Only STRUCTURED new reads (read_file/search_code/glob_files) count as
+    // localization progress. Novel read-only SHELL inspection (sed/cat/grep/ls/
+    // wc/find with ever-different args) must NOT reset the spin cap — otherwise
+    // the model games the cap by interleaving shell pokes + test re-runs and
+    // never edits (observed on a 6-bug run: 50 EDIT passes, 0 edits, full suite
+    // re-run ~10x). The model has read_file/search_code for real localization.
+    let readNewStructuredThisPass = false
 
     for (const toolCall of completion.toolCalls) {
-      // EDIT read-leak guard. When read tools are withheld (the model has been
-      // stuck reading without writing), a read-happy model will route file
-      // inspection through run_command (cat/sed/grep/head/tail/…) to dodge the
-      // withhold. Observed with MiniMax-M3: 45 such shell reads across 44
-      // withhold passes, never converging. Deny pure read-only shell
-      // inspection while stuck so the only path forward is to write or finish.
-      // npm/node/tsc build & test commands are NOT read-only inspection and
-      // pass through — the model still needs them to verify after writing.
+      // Redundant-test-run guard (scale-invariant, the ONE genuine waste we cut).
+      // Re-running the full test/build suite when NOTHING has changed since the
+      // last run produces the identical result, costs a slow heavy run + a model
+      // turn over a huge output, and is the analysis-paralysis pattern (observed:
+      // a 6-bug run re-ran `pnpm test` ~10x, 0 edits, never converging). The model
+      // may run the suite ONCE to see the failures; after that it must make an
+      // edit before running it again. This does NOT cap localisation — read tools
+      // stay fully available so the model can localise as long as it needs.
       if (
         internal.stage === 'EDIT'
-        && internal.editPassesWithoutWrite >= 3
-        && toolCall.name === 'run_command'
-        && isReadOnlyShellInspection((toolCall.input as Record<string, unknown> | undefined)?.command)
+        && internal.ranTestSinceLastEdit
+        && (toolCall.name === 'run_tests'
+          || (toolCall.name === 'run_command'
+            && isBuildOrTestCommand((toolCall.input as Record<string, unknown> | undefined)?.command)))
       ) {
         fire({
           type: 'status',
-          message: 'EDIT: read-only shell inspection blocked while stuck — write or finish',
+          message: 'EDIT: redundant test re-run blocked (nothing changed since last run) — read the source and edit first',
           status: 'edit',
           toolName: toolCall.name,
         })
         toolMessages.push({
           role: 'tool',
           content:
-            'Blocked: read-only shell inspection (cat/sed/grep/head/tail/…) is disabled because you have read ' +
-            'repeatedly without writing. You already have enough context. Apply the change now with edit_file or ' +
-            'write_file, run npm run build / npm test to verify, or call finish_task. Do not read more.',
+            'Blocked: you already ran the test/build suite and have not changed any source since — re-running gives the ' +
+            'identical result. The current failing tests are listed in your SITUATION REPORT (top of this turn). Pick ' +
+            'one, read its source with read_file, fix the root cause with edit_file, THEN run the suite once to verify.',
           toolCallId: toolCall.id,
         })
         continue
@@ -1549,6 +1728,10 @@ export class AgentLoop {
       const toolInput = toolCall.input as Record<string, unknown> | undefined
       if ((toolCall.name === 'write_file' || toolCall.name === 'edit_file') && toolInput?.path) {
         changedFiles.push(toolInput.path as string)
+        // A fresh edit re-opens the door to running the test suite again, and
+        // makes the cached test state stale (the edit may have fixed something).
+        internal.ranTestSinceLastEdit = false
+        if (this.testState) this.testState.staleAfterEdit = true
       }
       // Track whether this pass ran a build/test/verification — productive work
       // that should not count toward the EDIT no-write spin cap.
@@ -1563,14 +1746,80 @@ export class AgentLoop {
       ) {
         ranVerificationThisPass = true
       }
-      // Track NEW-location reads as localization progress. A read of a file
-      // range or a search pattern not seen before this run means the model is
-      // actively localizing, not spinning — so it must not advance the cap.
+      // After a real test/build run, mark that a re-run is now redundant until the
+      // model edits again (the redundant-test guard above enforces this).
+      if (
+        toolCall.name === 'run_tests'
+        || (toolCall.name === 'run_command' && isBuildOrTestCommand((toolInput)?.command))
+      ) {
+        internal.ranTestSinceLastEdit = true
+        // Offload test-context tracking to durable state: parse the run's output
+        // into a structured remaining-failures list so the situation report can
+        // show it every turn (no re-running needed to "remember" what's failing).
+        const parsed = parseTestFailures(result.content)
+        if (parsed) {
+          if (parsed.total != null && parsed.total > this.fullSuiteTotal) this.fullSuiteTotal = parsed.total
+          // SUBSET-run guard: a filtered run (e.g. one test file, 16 of 3811)
+          // must NOT overwrite the remaining-failures state — its "0 failing"
+          // means only that subset passed, not the whole suite. (Observed: model
+          // fixed 1 of 4 bugs, ran a 16-test subset showing 0, believed it was
+          // done, and finished → gate FAIL on the other 3.) Only FULL-ish runs
+          // (total ≥ half the largest seen) update the authoritative state.
+          const isSubset = parsed.total != null && this.fullSuiteTotal > 0 && parsed.total < this.fullSuiteTotal * 0.5
+          if (isSubset) {
+            fire({
+              type: 'status',
+              message: `tests: SUBSET run (${parsed.failures.length} failing of ${parsed.total}) — NOT the full suite; run the full \`${''}test\` to confirm all bugs`,
+              status: 'test_result',
+            })
+            internal.messages.push({
+              role: 'user',
+              content:
+                `You ran a SUBSET of the test suite (${parsed.total} tests), not the full suite. Passing a subset does ` +
+                'NOT mean you are done — the gate runs the ENTIRE suite. The remaining failures from the last FULL run ' +
+                'are still in your situation report. Keep fixing those, then run the full suite to confirm.',
+            })
+          } else {
+            const prevCount = this.testState?.failures.length ?? null
+            const newCount = parsed.failures.length
+            this.testState = { failures: parsed.failures, summary: parsed.summary, staleAfterEdit: false }
+            // Live progress signal so convergence/fixation is visible in real time
+            // (renderer → live log): "tests: 4 failing (was 6)".
+            fire({
+              type: 'status',
+              message: `tests: ${newCount} failing${prevCount !== null ? ` (was ${prevCount})` : ''}${parsed.summary ? ` — ${parsed.summary}` : ''}`,
+              status: 'test_result',
+            })
+            // Anti-fixation: if a prior FULL run had failures and this one did
+            // NOT reduce the count, the recent edits did not work. Nudge to
+            // rethink or move to a different failing test.
+            if (prevCount !== null && newCount > 0 && newCount >= prevCount) {
+              internal.messages.push({
+                role: 'user',
+                content:
+                  `Your recent edits did NOT reduce the failing-test count (still ${newCount}). That fix attempt is not ` +
+                  'working. Do ONE of: (a) reconsider the root cause from a different angle, or (b) move to a DIFFERENT ' +
+                  'failing test from the situation report, fix that one, and return to this stubborn one later. Do not ' +
+                  'keep re-editing the same place the same way.',
+              })
+            }
+          }
+        }
+      }
+      // Track NEW-location reads. The dedup key (readTargets) is offset-level so
+      // exact re-reads are detectable. But the incremental-commit nudge resets on
+      // DISCOVERY, which is FILE/pattern-level: opening a genuinely new file or
+      // running a new search is real breadth (don't nudge); re-paging a file
+      // already opened (new offset, same path) is NOT new info and must let the
+      // nudge advance (observed: model re-read one small file 5× across 33 calls,
+      // 0 edits, and the offset-level reset kept the nudge from ever firing).
       {
         const readKey = readTargetKey(toolCall.name, toolInput)
-        if (readKey && !internal.readTargets.has(readKey)) {
-          internal.readTargets.add(readKey)
-          readNewThisPass = true
+        if (readKey) internal.readTargets.add(readKey)
+        const discKey = discoveryKey(toolCall.name, toolInput)
+        if (discKey && !internal.discoveries.has(discKey)) {
+          internal.discoveries.add(discKey)
+          readNewStructuredThisPass = true
         }
       }
       // A file-mutating shell command (git mv / sed -i / patch / redirect) is a
@@ -1719,11 +1968,19 @@ export class AgentLoop {
     // converges to an actual edit. Reset as soon as a write lands.
     if (internal.stage === 'EDIT' && !terminalSignal) {
       const wroteThisPass = changedFiles.length > 0
-      if (wroteThisPass || ranVerificationThisPass || readNewThisPass) {
-        // Forward progress = a write, a build/test/verification run, OR reading
-        // a NEW location (active localization). Reset the spin counter. Only a
-        // pass that did NONE of these — pure redundant re-reading of things
-        // already seen — advances toward the cap.
+      if (wroteThisPass) internal.wroteSinceVerify = true
+      // A build/test run is only PROGRESS if the model edited since the last one.
+      // Re-running tests with no intervening edit is spinning (analysis paralysis),
+      // not progress. (We do NOT pause on a no-write count — localisation is
+      // uncapped; the redundant-test guard + soft nudges handle convergence, and
+      // maxIterations is the ultimate backstop.)
+      const productiveVerify = ranVerificationThisPass && internal.wroteSinceVerify
+      if (ranVerificationThisPass) internal.wroteSinceVerify = false
+      if (wroteThisPass || productiveVerify || readNewStructuredThisPass) {
+        // Forward progress = a write, a build/test run that VERIFIED a fresh edit,
+        // OR a STRUCTURED new-location read (active localization via read_file/
+        // search_code). Reset the spin counter. Pure re-reading, novel shell
+        // pokes, or repeated test runs with no edit advance toward the cap.
         internal.editPassesWithoutWrite = 0
       } else {
         internal.editPassesWithoutWrite += 1
@@ -1732,44 +1989,19 @@ export class AgentLoop {
           internal.messages.push({
             role: 'user',
             content:
-              'You are in the EDIT stage and have spent the last ' + n + ' turns only reading/searching, not editing. ' +
-              'You now have enough context. Stop gathering context and implement the change now: call edit_file or write_file ' +
-              'to apply the fix in this turn. Do not call read_file or search_code again unless an edit fails.',
+              'You have had ' + n + ' EDIT turns with no edit and without uncovering anything new (re-reading the same ' +
+              'places). Work INCREMENTALLY: if you understand the root cause of ANY one of the failing tests, fix it now ' +
+              'with edit_file — you can investigate the others afterward. If you genuinely need more information, open a ' +
+              'NEW file or area you have not looked at yet (re-reading what you have seen will not help).',
           })
-        } else if (n >= EDIT_NO_WRITE_HARD_CAP) {
-          // Hard cap: the model has spun far too long reading without writing
-          // (even with read tools withheld and shell inspection blocked). Stop
-          // burning budget — pause with durable state so a human or a resume
-          // can intervene, rather than churning to the iteration ceiling.
-          await this.taskEngine.setNextAction(
-            internal.taskId,
-            'EDIT stalled: model read ' + n + ' passes without writing. Resume to retry or narrow the task.',
-          )
-          await this.failureEngine.addEntry(
-            internal.taskId,
-            'EDIT stage stalled without a write',
-            'edit-stage',
-            n + ' consecutive EDIT passes produced no file write despite read tools being withheld',
-            'The model could not converge from context-gathering to an edit. Consider a smaller task or more targeted localization.',
-            {},
-          )
-          return {
-            terminal: true,
-            terminalStatus: 'paused',
-            summary:
-              'Paused: the EDIT stage read ' + n + ' passes without producing a write. ' +
-              'Resume to retry, or narrow the task scope.',
-          }
         } else if (n >= 3) {
-          // Strip-read backstop already withholds read tools in runEditStage; here
-          // we escalate the prose so the model commits to a write or finishes.
           internal.messages.push({
             role: 'user',
             content:
-              'STOP READING. This is your ' + n + 'th consecutive EDIT turn with no file write. ' +
-              'Reading more will not help and is wasting the run budget. In your NEXT response you MUST call edit_file ' +
-              'or write_file to apply the implementation. If you believe no edit is needed, call finish_task with an ' +
-              'explanation instead. Any further read attempt (including shell cat/sed/grep) is a mistake.',
+              'This is your ' + n + 'th consecutive EDIT turn with no edit and no new findings. Commit to a fix now: pick ' +
+              'the failing test you understand best and apply edit_file to its root cause. Partial progress (fixing one ' +
+              'of several bugs) is good — verify after each fix and continue. Only open a genuinely NEW area if you still ' +
+              'lack the information to fix any of them; if a fix is truly impossible, call finish_task with an explanation.',
           })
         }
       }
@@ -1788,6 +2020,29 @@ export class AgentLoop {
    * recovery (started/running → completed) and writes stdout/stderr
    * to the artifact store.
    */
+  /**
+   * Semantic code search over the embedded repo index. Returns the most
+   * relevant source snippets for a natural-language query, so the model can
+   * localise by meaning in one call instead of paging files.
+   */
+  private async handleSearchSemantic(input: Record<string, unknown>): Promise<{ content: string }> {
+    const query = String(input.query ?? '').trim()
+    if (!query) return { content: 'search_semantic: provide a non-empty "query".' }
+    if (!this.semanticDeps) {
+      return { content: 'search_semantic is unavailable (no semantic index for this run). Use search_code (regex), glob_files, or read_file instead.' }
+    }
+    const topK = typeof input.k === 'number' && input.k > 0 ? Math.min(input.k, 15) : 8
+    const hits = await searchSemantic(query, this.semanticDeps, topK)
+    if (hits.length === 0) return { content: `No semantic matches for: ${query}. Try a different phrasing, or use search_code/read_file.` }
+    const lines = [`Top ${hits.length} code matches for "${query}" (by semantic similarity):`, '']
+    for (const h of hits) {
+      lines.push(`── ${h.file}:${h.start}-${h.end}  (score ${h.score}) ──`)
+      lines.push(h.snippet.length > 1400 ? h.snippet.slice(0, 1400) + '\n… (truncated; read_file for more)' : h.snippet)
+      lines.push('')
+    }
+    return { content: lines.join('\n') }
+  }
+
   private async executeToolCall(
     internal: InternalState,
     toolCall: ToolCall,
@@ -1841,7 +2096,9 @@ export class AgentLoop {
 
     let result: { content: string; metadata?: Record<string, unknown> }
     try {
-      if (this.capabilityExecutor && this.capabilityRegistry?.get(toolCall.name)) {
+      if (toolCall.name === 'search_semantic') {
+        result = await this.handleSearchSemantic(toolCall.input)
+      } else if (this.capabilityExecutor && this.capabilityRegistry?.get(toolCall.name)) {
         const capResult = await this.capabilityExecutor.execute(
           toolCall.name,
           toolCall.input,
@@ -1876,9 +2133,6 @@ export class AgentLoop {
     void fire
   }
 
-  /** How many of the most recent raw turns to replay alongside the situation report. */
-  private static readonly RECENT_WINDOW = 14
-
   /**
    * State-backed context (AGENTS.md: "never rely purely on a long chat
    * transcript"). Each turn the model sees: the original task, a SITUATION
@@ -1909,6 +2163,28 @@ export class AgentLoop {
       const checks = await this.verificationEngine.getEntries(taskId).catch(() => [])
       if (checks.length > 0) {
         lines.push('', `Verification checks: ${checks.map((e) => `${e.check}=${e.status}`).join(' ')}`)
+      }
+
+      // Remaining failing tests from the last suite run — tracked here so the
+      // model fixes them incrementally without re-running to "remember" them.
+      if (this.testState) {
+        const ts = this.testState
+        const staleNote = ts.staleAfterEdit ? ' (STALE — you edited since this run; re-run the suite ONCE to refresh)' : ''
+        if (ts.failures.length > 0) {
+          lines.push('', `Failing tests from last run${staleNote}${ts.summary ? ` — ${ts.summary}` : ''}:`)
+          for (const f of ts.failures.slice(0, 25)) lines.push(`  ✗ ${f.file} > ${f.name}`)
+          if (ts.failures.length > 25) lines.push(`  …and ${ts.failures.length - 25} more`)
+          lines.push('Fix these ROOT CAUSES in source one at a time; do not re-run the full suite until you have edited.')
+          if (this.semanticDeps) {
+            lines.push(
+              'To localise fast, CALL search_semantic("<describe the buggy behaviour or the code you need>") — it ' +
+              'returns the most relevant SOURCE snippets from a semantic index of this repo, so you can jump to the ' +
+              'right code in one call instead of reading many files. Then reason about the root cause and edit_file.',
+            )
+          }
+        } else if (ts.summary) {
+          lines.push('', `Last test run: ${ts.summary}${staleNote}`)
+        }
       }
 
       const openSubtasks = (task.subtasks ?? []).filter((s) => s.status !== 'completed')
@@ -1954,27 +2230,23 @@ export class AgentLoop {
       // dryRun — synthesize a no-tool completion so the loop can advance.
       return { content: 'dry-run: no provider configured', finishReason: 'stop' }
     }
-    // State-backed context: original task + fresh situation report + a bounded
-    // window of recent turns (not the whole transcript). Orphan tool blocks
-    // from the window cut are scrubbed by the provider message mapper.
+    // State-backed context, ordered for prompt caching:
+    //   [ ...baseMessages (task, stable),
+    //     ...history (append-only, tool outputs already compacted in place),
+    //     situation (fresh per-turn, volatile → LAST) ]
+    // The last history message carries cacheBoundary, so the provider caches
+    // the whole stable prefix and only the situation report + the reply are
+    // billed fresh. History is the FULL working log (already bounded by
+    // compactMessages) rather than a sliding slice — a sliding window shifts
+    // its prefix every turn and can never cache. Orphan tool blocks are
+    // scrubbed by the provider message mapper.
     const situation = await this.buildSituationReport(taskId)
-    let recentWindow = history.slice(-AgentLoop.RECENT_WINDOW)
-    if (this.compactionPolicy) {
-      const compacted = await this.compactionPolicy.compactToolOutputs(taskId, recentWindow)
-      recentWindow = compacted.messages
-      if (compacted.compacted > 0) {
-        this.pendingTrace.push({
-          type: 'local_model_invoked',
-          taskId,
-          actor: 'agent',
-          summary: `Compacted ${compacted.compacted} historical tool output(s) before frontier call`,
-          payload: { refs: compacted.refs, localModel: true, authoritative: false },
-        })
-      }
-    }
+    const historyForCall: Message[] = history.map((m, i) =>
+      i === history.length - 1 ? { ...m, cacheBoundary: true } : m,
+    )
     const assembled: Message[] = situation
-      ? [...baseMessages, situation, ...recentWindow]
-      : [...baseMessages, ...recentWindow]
+      ? [...baseMessages, ...historyForCall, situation]
+      : [...baseMessages, ...historyForCall]
     // A single failed completion (network blip, provider 4xx/5xx, truncated
     // tool JSON) must never crash a long-horizon run. Retry once, then degrade
     // to a 'error' finishReason that the loop turns into a corrective nudge.
@@ -1995,8 +2267,15 @@ export class AgentLoop {
         }
         const merged = this.mergeStreamResult(streamChunks)
         if (merged.usage) {
+          const cacheRead = merged.usage.cacheReadTokens ?? 0
+          // Total prompt size THIS turn = uncached input + cache-read (the cached
+          // prefix). Drives compaction: we keep the full transcript until this
+          // approaches the context budget, like opencode (compact at overflow,
+          // not proactively) — so the model retains its plan + progress.
+          this.lastPromptTokens = merged.usage.inputTokens + cacheRead
           this.mainModelUsage.inputTokens += merged.usage.inputTokens
           this.mainModelUsage.outputTokens += merged.usage.outputTokens
+          this.mainModelUsage.cacheReadTokens += cacheRead
           this.mainModelUsage.calls += 1
           this.pendingTrace.push({
             type: 'model_call' as TraceEventType,
@@ -2004,16 +2283,32 @@ export class AgentLoop {
             actor: 'agent',
             summary:
               `Main-model call: ${merged.usage.inputTokens} in / ${merged.usage.outputTokens} out tokens ` +
-              `(run total ${this.mainModelUsage.inputTokens}/${this.mainModelUsage.outputTokens} over ${this.mainModelUsage.calls} calls)`,
+              `(${cacheRead} cache-read; run total ${this.mainModelUsage.inputTokens}/${this.mainModelUsage.outputTokens}, ` +
+              `${this.mainModelUsage.cacheReadTokens} cache-read over ${this.mainModelUsage.calls} calls)`,
             payload: {
               inputTokens: merged.usage.inputTokens,
               outputTokens: merged.usage.outputTokens,
+              cacheReadTokens: cacheRead,
               runTotalInput: this.mainModelUsage.inputTokens,
               runTotalOutput: this.mainModelUsage.outputTokens,
+              runTotalCacheRead: this.mainModelUsage.cacheReadTokens,
               calls: this.mainModelUsage.calls,
               localModel: false,
               authoritative: true,
             },
+          })
+          // Live per-call visibility (stderr renderer). Essential for a tool
+          // with loop/efficiency bugs: shows uncached-input growth and whether
+          // prompt caching is engaging (cacheRead) turn-by-turn, in real time —
+          // not just at the end. cacheRead should climb as the append-only
+          // history caches; a flat cacheRead with rising input = caching broke.
+          this.config.onEvent?.({
+            type: 'status',
+            iteration: this.mainModelUsage.calls,
+            message:
+              `model #${this.mainModelUsage.calls}: ${merged.usage.inputTokens} in / ${merged.usage.outputTokens} out / ${cacheRead} cacheRead ` +
+              `· totals ${this.mainModelUsage.inputTokens} in / ${this.mainModelUsage.cacheReadTokens} cacheRead`,
+            status: 'model_call',
           })
         }
         return merged
@@ -2191,8 +2486,11 @@ export class AgentLoop {
   private async compactMessages(messages: Message[], taskId: string, force = false): Promise<Message[]> {
     if (!force && messages.length <= 30) return messages
     if (messages.length <= 12) return messages
-    const keepStart = 2
-    const keepEnd = 10
+    // Keep a LARGE recent tail (opencode-style): compaction fires only at
+    // overflow, so we summarise the old head but preserve plenty of recent
+    // reasoning + progress so the model doesn't lose its plan mid-run.
+    const keepStart = 4
+    const keepEnd = 30
     const start = messages.slice(0, keepStart)
     const end = messages.slice(-keepEnd)
     const middle = messages.slice(keepStart, -keepEnd)
@@ -2370,6 +2668,7 @@ export class AgentLoop {
     let finishReason: CompletionResult['finishReason'] = 'stop'
     let inputTokens = 0
     let outputTokens = 0
+    let cacheReadTokens = 0
     let sawUsage = false
 
     for (const chunk of chunks) {
@@ -2389,6 +2688,10 @@ export class AgentLoop {
           outputTokens = Math.max(outputTokens, chunk.usage.outputTokens)
           sawUsage = true
         }
+        if (typeof chunk.usage.cacheReadTokens === 'number') {
+          cacheReadTokens = Math.max(cacheReadTokens, chunk.usage.cacheReadTokens)
+          sawUsage = true
+        }
       }
     }
 
@@ -2404,7 +2707,7 @@ export class AgentLoop {
       content,
       toolCalls: uniqueToolCalls.length > 0 ? uniqueToolCalls : undefined,
       finishReason,
-      ...(sawUsage ? { usage: { inputTokens, outputTokens } } : {}),
+      ...(sawUsage ? { usage: { inputTokens, outputTokens, cacheReadTokens } } : {}),
     }
   }
 }

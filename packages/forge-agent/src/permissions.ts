@@ -175,6 +175,12 @@ export class PermissionEngine {
       action: 'allow',
       reason: 'retrieve_artifact is read-only evidence access',
     })
+    rules.push({
+      tool: 'search_semantic',
+      pattern: '*',
+      action: 'allow',
+      reason: 'search_semantic is read-only semantic retrieval',
+    })
 
     // 3. Non-destructive shell commands are allowed by default.
     //    Destructive ones are escalated to 'ask'.

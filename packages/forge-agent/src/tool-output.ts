@@ -14,7 +14,14 @@ import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-export const DEFAULT_TOOL_RESULT_BUDGET = 4000
+// Raised from 4000 once history became prompt-cached: a 4 KB budget truncated
+// normal read_file results (a 100-line file is often 4-8 KB), so the model
+// received chopped reads + a "retrieve by ref" stub and resorted to repeated
+// grep/sed/re-reads — crippling localisation (opencode returns full reads and
+// never hits this). 16 KB lets a typical read/search return whole; genuinely
+// huge dumps (full test logs) still truncate, and those are tracked separately
+// via parseTestFailures → the situation report. Cached, so the cost is one-time.
+export const DEFAULT_TOOL_RESULT_BUDGET = 16000
 
 export type ToolCompressionStrategy =
   | 'passthrough'

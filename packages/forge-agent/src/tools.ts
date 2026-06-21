@@ -108,6 +108,23 @@ export function createToolDefinitions(): ToolDefinition[] {
       },
     },
     {
+      name: 'search_semantic',
+      description:
+        'Find source code by MEANING using the repo\'s embedding index — describe what you are looking for in natural ' +
+        'language (e.g. "where object catchall handling skips inherited keys" or "function that applies default metadata ' +
+        'from json schema"). Returns the most relevant code snippets with file:line ranges. PREFER this over paging files ' +
+        'with read_file when localising a bug: one query usually pinpoints the relevant code. Falls back gracefully if no ' +
+        'index is available.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Natural-language description of the code/behaviour you want to find' },
+          k: { type: 'number', description: 'Number of snippets to return (default 8, max 15)', default: 8 },
+        },
+        required: ['query'],
+      },
+    },
+    {
       name: 'glob_files',
       description: 'Find files by glob pattern.',
       inputSchema: {
@@ -701,7 +718,7 @@ export class ToolExecutor {
     }
   }
 
-  private async handleRunVerification(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string }> {
+  private async handleRunVerification(input: Record<string, unknown>, ctx: ToolExecutionContext): Promise<{ content: string; metadata?: Record<string, unknown> }> {
     const kinds = Array.isArray(input.checks) ? (input.checks as RunnableCheck[]) : undefined
     const results = await runVerification(ctx.workDir, kinds)
     if (results.length === 0) {
@@ -719,12 +736,29 @@ export class ToolExecutor {
     }
     const lines = results.map((r) => `${r.passed ? '✓' : '✗'} ${r.kind}: ${r.command}`)
     const failed = results.filter((r) => !r.passed)
+    const allPassed = failed.length === 0
+
+    // Emit 'verification' metadata so the auto-verification gate in
+    // handleCompletion can fire — matches what handleRunCommand does
+    // for recognized test commands (line 530). Without this, the gate
+    // silently skips, and the stage machine loops EDIT→EDIT→EDIT
+    // indefinitely even though tests pass.
+    const metadata: Record<string, unknown> = {
+      type: 'verification',
+      passed: allPassed,
+    }
+    if (results.length === 1) {
+      metadata.check = results[0]!.kind
+      metadata.command = results[0]!.command
+    }
+
     return {
       content:
         `Verification results:\n${lines.join('\n')}\n\n` +
-        (failed.length === 0
+        (allPassed
           ? 'All checks passed. You may now update_acceptance for criteria backed by these checks.'
           : `${failed.length} check(s) FAILED. Fix the issues and re-run run_verification. First failure output:\n${failed[0]!.output.slice(-1500)}`),
+      metadata,
     }
   }
 
@@ -732,7 +766,24 @@ export class ToolExecutor {
     const contract = await ctx.acceptanceEngine.getContract(ctx.taskId)
     if (!contract) return { content: 'No acceptance contract found.' }
     const criterionId = input.criterion_id as string
-    const status = input.status as 'verified' | 'failed' | 'needs_review' | 'skipped' | 'blocked'
+    // Normalize the status: the tool schema advertises a friendlier vocabulary
+    // ('passed', 'not_applicable', 'needs_human_review') than the internal
+    // CriterionStatus enum. Map them so a legitimately not-applicable criterion
+    // resolves (→ 'skipped') instead of being stored as an unknown status that
+    // blocks completion forever. (Observed: model marked a database criterion
+    // 'not_applicable' on a pure logic fix and the run could never complete.)
+    const STATUS_ALIASES: Record<string, 'verified' | 'failed' | 'needs_review' | 'skipped' | 'blocked'> = {
+      passed: 'verified',
+      verified: 'verified',
+      not_applicable: 'skipped',
+      skipped: 'skipped',
+      needs_human_review: 'needs_review',
+      needs_review: 'needs_review',
+      failed: 'failed',
+      blocked: 'blocked',
+    }
+    const rawStatus = String(input.status ?? '')
+    const status = STATUS_ALIASES[rawStatus] ?? 'needs_review'
 
     // Evidence-backed gate: "verified" requires the criterion's required checks
     // to have PASSED via run_verification. The model cannot self-declare done.

@@ -123,6 +123,51 @@ export class EmbeddingRepo {
     return rows.map(mapEmbedding)
   }
 
+  /**
+   * Nearest-neighbour search by cosine similarity, computed in process (V1 has
+   * no ANN index — vectors are JSONB). Loads up to `pool` candidate vectors for
+   * the repo/type/model and returns the top-k by cosine to `queryVector`. Fine
+   * for a single-repo working set (thousands of chunks); a later migration can
+   * swap in pgvector behind this same method.
+   */
+  async nearest(
+    repoId: string,
+    queryVector: number[],
+    opts: { targetType?: EmbeddingTargetType; model?: string; topK?: number; pool?: number } = {},
+  ): Promise<{ targetRef: string; score: number; contentHash: string }[]> {
+    const { targetType, model, topK = 8, pool = 8000 } = opts
+    const raw = targetType
+      ? await this.sql<RawEmbedding[]>`
+          select id, repo_id, target_ref, model, dim, vector, content_hash, target_type, created_at
+          from embeddings
+          where repo_id = ${repoId} and target_type = ${targetType}
+          limit ${pool}
+        `
+      : await this.sql<RawEmbedding[]>`
+          select id, repo_id, target_ref, model, dim, vector, content_hash, target_type, created_at
+          from embeddings
+          where repo_id = ${repoId}
+          limit ${pool}
+        `
+    const rows: RawEmbedding[] = model ? raw.filter((r: RawEmbedding) => r.model === model) : raw
+    const q = queryVector
+    const qNorm = Math.sqrt(q.reduce((s, v) => s + v * v, 0)) || 1
+    const scored: { targetRef: string; score: number; contentHash: string }[] = rows.map((row: RawEmbedding) => {
+      const vec = typeof row.vector === 'string' ? (JSON.parse(row.vector) as number[]) : row.vector
+      let dot = 0
+      let vNorm = 0
+      const n = Math.min(vec.length, q.length)
+      for (let i = 0; i < n; i++) {
+        dot += vec[i]! * q[i]!
+        vNorm += vec[i]! * vec[i]!
+      }
+      const score = dot / (qNorm * (Math.sqrt(vNorm) || 1))
+      return { targetRef: row.target_ref, score, contentHash: row.content_hash }
+    })
+    scored.sort((a, b) => b.score - a.score)
+    return scored.slice(0, topK)
+  }
+
   async deleteForTarget(repoId: string, targetType: EmbeddingTargetType, targetRef: string, model?: string): Promise<number> {
     const rows = model
       ? await this.sql<{ id: string }[]>`

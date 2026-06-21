@@ -214,6 +214,15 @@ export function mapAnthropicMessages(messages: Message[]): Record<string, unknow
       const content: Block[] = m.content ? [{ type: 'text', text: m.content }] : []
       normalized.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content })
     }
+
+    // Tag the last content block of a cache-boundary message so the provider
+    // can place a prompt-cache breakpoint there. The marker rides on the block
+    // object (by reference), so it survives the merge/filter passes below.
+    if (m.cacheBoundary) {
+      const lastEntry = normalized[normalized.length - 1]
+      const lastBlock = lastEntry?.content[lastEntry.content.length - 1]
+      if (lastBlock) lastBlock.__cacheBoundary = true
+    }
   }
 
   // Merge consecutive same-role turns (concatenate their blocks).
@@ -349,6 +358,7 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
   let finishReason: CompletionResult['finishReason'] = 'stop'
   let inputTokens = 0
   let outputTokens = 0
+  let cacheReadTokens = 0
   let sawUsage = false
 
   for (const chunk of chunks) {
@@ -370,6 +380,10 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
         outputTokens = Math.max(outputTokens, chunk.usage.outputTokens)
         sawUsage = true
       }
+      if (typeof chunk.usage.cacheReadTokens === 'number') {
+        cacheReadTokens = Math.max(cacheReadTokens, chunk.usage.cacheReadTokens)
+        sawUsage = true
+      }
     }
   }
 
@@ -377,7 +391,7 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
     content,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     finishReason,
-    ...(sawUsage ? { usage: { inputTokens, outputTokens } } : {}),
+    ...(sawUsage ? { usage: { inputTokens, outputTokens, cacheReadTokens } } : {}),
   }
 }
 

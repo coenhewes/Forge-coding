@@ -24,7 +24,15 @@ export interface CompactionPolicyConfig {
   targetTokens: number
 }
 
-const DEFAULT_THRESHOLD_CHARS = 4_000
+// Raised from 4_000 once the agent loop made history APPEND-ONLY + prompt-cached
+// (minimax cache_control on the stable prefix). A tool output now costs its full
+// size as fresh input exactly ONCE (the turn it appears), then is served from
+// cache for free on every later turn. Compacting it to a ref therefore saves
+// almost nothing but COSTS a later `retrieve_artifact` round-trip when the model
+// needs the detail back (observed: 9 retrieves in one GG01 run). So only compact
+// genuinely huge dumps (full multi-thousand-line test logs) that would pressure
+// the context window even cached. ~16k chars ≈ 4k tokens.
+const DEFAULT_THRESHOLD_CHARS = 16_000
 const DEFAULT_TARGET_TOKENS = 200
 
 export interface CompactionResult {
