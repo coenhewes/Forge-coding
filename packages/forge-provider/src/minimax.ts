@@ -41,6 +41,23 @@ export class MinimaxProvider implements ModelProvider {
     const system = getSystemMessage(request.messages)
     const messages = mapAnthropicMessages(request.messages)
 
+    // Place a prompt-cache breakpoint at the end of the append-only history
+    // (the message tagged with cacheBoundary by the agent loop). This caches
+    // the whole stable prefix — system + tools + task + history — so only the
+    // volatile per-turn situation report and the model's reply are billed as
+    // fresh input on later turns. Without this, the entire messages array is
+    // re-billed every call (the dominant token cost on long-horizon runs).
+    for (const m of messages) {
+      const content = m.content as Record<string, unknown>[] | undefined
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (block.__cacheBoundary) {
+          delete block.__cacheBoundary
+          block.cache_control = { type: 'ephemeral' }
+        }
+      }
+    }
+
     const body: Record<string, unknown> = {
       model: request.model || this.config.model,
       messages,
@@ -130,6 +147,9 @@ export class MinimaxProvider implements ModelProvider {
         const usage = msg?.usage as Record<string, unknown> | undefined
         if (usage && typeof usage.input_tokens === 'number') {
           chunk.usage = { inputTokens: usage.input_tokens as number }
+          if (typeof usage.cache_read_input_tokens === 'number') {
+            chunk.usage.cacheReadTokens = usage.cache_read_input_tokens as number
+          }
         }
       }
 
@@ -153,6 +173,11 @@ export class MinimaxProvider implements ModelProvider {
           }
           if (typeof usage.output_tokens === 'number') {
             next.outputTokens = usage.output_tokens as number
+          }
+          // cache_read_input_tokens: input served from MiniMax's prompt cache.
+          // The diagnostic for whether our cache_control markers actually engage.
+          if (typeof usage.cache_read_input_tokens === 'number') {
+            next.cacheReadTokens = usage.cache_read_input_tokens as number
           }
           chunk.usage = next
         }

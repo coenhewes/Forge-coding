@@ -130,6 +130,26 @@ node packages/forge-eval/dist/cli.js run --task "Add X" --fixture ./packages/for
 The headline demo (`demo`) implements organization invitations across auth, db,
 api, frontend, and tests on the `sample-saas` fixture.
 
+### Golden gauntlet (Forge vs opencode, same model)
+
+`_bench/golden/` is the rigorous head-to-head benchmark: it reproduces a **real merged upstream fixing
+PR** (or a multi-bug set), gives Forge and `opencode` the **identical fix-free task** on the same
+MiniMax-M3 model, and gates on the PR's **golden test + full suite green** (so a no-op or a weakened
+test cannot pass). It scores **quality-adjusted**: pass-rate + median main-model tokens + fix
+minimality (diff size vs the reference PR), with multi-run averaging for model variance.
+
+```bash
+node _bench/golden/golden-gauntlet.mjs --case GL02 --runs 3        # both agents, 3 runs each
+node _bench/golden/golden-gauntlet.mjs --case GG01 --agent forge   # one agent
+node _bench/golden/golden-gauntlet.mjs --case GL02 --prep-only     # validate a case reproduces
+```
+
+Requires Postgres (54329) + Ollama (`qwen2.5-coder:14b`, `nomic-embed-text`) up, and MiniMax + opencode
+configured. **Read `AGENTS.md` → "Engineering Status & Harness Findings" and `docs/harness-comparison-opencode.md`
+before working on the harness** — they capture the current results, the opencode structural comparison,
+and the active "clean-core" rebuild (full-transcript context + overflow-only compaction + semantic
+retrieval + the bug fixes that took Forge from failing to beating opencode on tokens).
+
 ---
 
 ## Development

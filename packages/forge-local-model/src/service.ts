@@ -365,9 +365,14 @@ export class LocalModelService {
         fallbackUsed: false,
         usage: result.usage,
       })
-      if (req.taskId) await this.record(req.taskId, provenance, { count: req.texts.length, dim })
+      // Recording is best-effort: a trace/artifact sink failure must NOT discard
+      // a successful embedding (that would surface as a bogus `fallbackUsed`).
+      if (req.taskId) {
+        try { await this.record(req.taskId, provenance, { count: req.texts.length, dim }) } catch { /* non-fatal */ }
+      }
       return { authoritative: false, vectors: result.vectors, dim, provenance }
-    } catch {
+    } catch (e) {
+      if (process.env.FORGE_DEBUG_EMBED) process.stderr.write(`[embed-fail] ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`)
       return this.finalizeFallback(empty())
     }
   }

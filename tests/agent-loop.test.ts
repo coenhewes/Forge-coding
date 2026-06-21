@@ -12,7 +12,7 @@ import type {
   ToolDefinition,
 } from '@forge/types'
 
-import { AgentLoop, isReadOnlyShellInspection, isBuildOrTestCommand, isFileMutatingCommand, readTargetKey, commandCheckKind, commandOutputLooksPassed } from '@forge/agent'
+import { AgentLoop, isReadOnlyShellInspection, isBuildOrTestCommand, isFileMutatingCommand, readTargetKey, discoveryKey, parseTestFailures, commandCheckKind, commandOutputLooksPassed } from '@forge/agent'
 import type { AgentEvent } from '@forge/agent'
 
 describe('run_command verification detection', () => {
@@ -84,6 +84,61 @@ describe('isFileMutatingCommand (shell progress detection)', () => {
     ]) {
       expect(isFileMutatingCommand(cmd), cmd).toBe(false)
     }
+  })
+})
+
+describe('discoveryKey (incremental-commit nudge — file-level, not offset-level)', () => {
+  it('keys read_file on PATH only, so re-paging the same file is not a new discovery', () => {
+    const a = discoveryKey('read_file', { path: 'src/x.ts', offset: 1, limit: 100 })
+    const b = discoveryKey('read_file', { path: 'src/x.ts', offset: 200, limit: 100 })
+    expect(a).toBe(b) // same file, different offset → same discovery key
+    expect(discoveryKey('read_file', { path: 'src/y.ts' })).not.toBe(a)
+  })
+  it('keys search/glob on pattern and returns null for shell/non-reads', () => {
+    expect(discoveryKey('search_code', { pattern: 'foo' })).toBe('search:foo')
+    expect(discoveryKey('glob_files', { pattern: '**/*.ts' })).toBe('glob:**/*.ts')
+    expect(discoveryKey('run_command', { command: 'cat x' })).toBeNull()
+    expect(discoveryKey('edit_file', { path: 'x' })).toBeNull()
+  })
+})
+
+describe('parseTestFailures (context offload — remaining failures tracking)', () => {
+  it('extracts failing test file+name and the summary from vitest output', () => {
+    const out = [
+      ' ❯ src/v4/classic/tests/object.test.ts (5 tests | 1 failed)',
+      ' FAIL  |zod| src/v4/classic/tests/object.test.ts > __proto__ paths > strict does not surface __proto__',
+      ' FAIL  |zod| src/v4/core/tests/tuple.test.ts > tuple > rejects holes',
+      'Test Files  2 failed | 337 passed (339)',
+      'Tests  5 failed | 3806 passed (3811)',
+    ].join('\n')
+    const r = parseTestFailures(out)
+    expect(r).not.toBeNull()
+    expect(r!.failures).toHaveLength(2)
+    expect(r!.failures[0]).toEqual({ file: 'src/v4/classic/tests/object.test.ts', name: '__proto__ paths > strict does not surface __proto__' })
+    expect(r!.failures[1]!.file).toBe('src/v4/core/tests/tuple.test.ts')
+    expect(r!.summary).toContain('5 failed')
+  })
+
+  it('dedups repeated FAIL lines', () => {
+    const out = [
+      ' FAIL  src/a.test.ts > x',
+      ' FAIL  src/a.test.ts > x',
+      'Tests  1 failed | 2 passed (3)',
+    ].join('\n')
+    expect(parseTestFailures(out)!.failures).toHaveLength(1)
+  })
+
+  it('returns a green summary with no failures when all pass', () => {
+    const r = parseTestFailures('Tests  3811 passed (3811)')
+    expect(r).not.toBeNull()
+    expect(r!.failures).toHaveLength(0)
+    expect(r!.summary).toContain('passed')
+  })
+
+  it('returns null for non-test output', () => {
+    expect(parseTestFailures('just some logs\nnothing here')).toBeNull()
+    expect(parseTestFailures('')).toBeNull()
+    expect(parseTestFailures(undefined)).toBeNull()
   })
 })
 

@@ -1903,3 +1903,106 @@ Same model.
 Better harness.
 Better engineering outcomes.
 ```
+
+---
+
+# Engineering Status & Harness Findings (LIVING — read before continuing harness work)
+
+_Last updated: 2026-06-21. Working state of the Forge-vs-opencode benchmark loop and the harness lessons.
+Deep running log: auto-memory file `forge-vs-opencode-loop.md`. Structural opencode comparison:
+`docs/harness-comparison-opencode.md`. Read all three._
+
+## The goal (how we measure "better harness")
+Same model (**MiniMax-M3**), same hardware (24GB M4 mini). On real OSS long-horizon tasks Forge must:
+(1) COMPLETE the task (gate); (2) use FEWER main-model tokens than `opencode` **quality-adjusted** (a
+bigger/non-minimal diff for the same outcome is WORSE — judge tokens against fix minimality); (3) degrade
+less as tasks get harder/longer. Local-model (Ollama) work is unmetered and does NOT count. A run without
+real local-model offload is INVALID.
+
+## Environment (verify before ANY run — never skip)
+- **Postgres** on port 54329 (Forge is Postgres-first). Start: `LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+  /opt/homebrew/opt/postgresql@16/bin/pg_ctl -D <repo>/.local/pgdata -l <repo>/.local/pgdata/server.log start`.
+  Verify: `pg_isready -p 54329`; `node -r dotenv/config packages/forge-cli/dist/cli.js doctor`.
+- **Ollama**: instruct=`qwen2.5-coder:14b` (~8.5GB), embed=`nomic-embed-text` (dim 768). Run with
+  `OLLAMA_KEEP_ALIVE=30s` (the 14B + a heavy test suite OOMs 24GB if pinned). Verify REAL (not fallback):
+  `node -r dotenv/config packages/forge-cli/dist/cli.js local test` → "summarize: ollama …", "embed: ok
+  dim=768". Forge `run` preflight does its OWN cold smoke test → warm the model right before launching (the
+  gauntlet harness does this automatically).
+- **MiniMax**: key in `.env` (MINIMAX_API_KEY) and `.forge/config.json`. Anthropic-style endpoint
+  `https://api.minimax.io/anthropic/v1/messages`; caching field `cache_read_input_tokens`.
+- Build/test: `pnpm build` (tsc project refs), `pnpm test` (~312 pass).
+
+## The rigorous gauntlet (use THIS, not the older _bench/gauntlet/)
+`_bench/golden/golden-gauntlet.mjs` — ground-truth harness. **Unit = a real merged upstream fixing PR** (or a
+multi-bug set). Mechanism: `git fetch --depth 2 <fixCommit>` → APFS-clonefile worktree → pre-fix checkout (or
+reverse-apply each bug's SOURCE hunks onto current main) → lay down the PR's **golden test** → assert it FAILS
+(bug reproduced). Both agents get the IDENTICAL fix-free task ("failing tests present; localize root cause in
+source; fix minimally; don't edit tests; full suite must pass"). Gate = re-apply golden test (anti-gaming) +
+FULL verify suite green + no test-weakening. Quality = agent non-test diff lines vs the PR's reference diff
+(over-engineering penalty >2.5×). Per-run fresh DB; local-model preflight enforced. **Multi-run for MM3
+variance: `--runs N` → pass-rate + median tokens/minimality, reliability-first verdict.**
+- Run: `node _bench/golden/golden-gauntlet.mjs --case GL02 --runs 3` (both agents), `--agent forge`, or
+  validate with `--case X --prep-only`. Results in `_bench/golden/results/<id>/`. Forge live feed needs
+  `--text` (the harness uses it). Cases (`_bench/golden/manifest.json`): GG01 (zod 1-bug gate), GL01 (4
+  harder zod bugs — fix-difficulty-dominated), **GL02 (4 EASY independent zod bugs — the cleanest
+  multi-bug-retention test, Forge's edge)**. Repo caches: `_bench/repos/<id>` (clonefiles of a zod clone).
+- GOTCHAS: zod tests run from REPO ROOT (`pnpm test`); date-fns needs `--exclude '**/*.tp.ts'`. Never run
+  vitest in a worktree while its Forge agent is live (OOM). Reverse-apply only works if the bug's file
+  hasn't changed since the fix (`git apply -R --check`; pick recent PRs).
+
+## Current standing (2026-06-21)
+- **GG01** (1 bug): Forge ~47K vs opencode ~45K, more minimal — competitive.
+- **GL02** (4 easy bugs), CLEAN-CORE: **Forge PASS 4/4 @ 84K tok (was FAIL 1/4 @ 196K); opencode PASS 4/4
+  @ 124K.** Forge now CONVERGES and wins TOKENS ~32%, but over-engineered (2.82× ref vs 0.55×) → opencode
+  wins minimality. First real Forge multi-bug win (a quality-adjusted TRADE). `--runs 3` + a minimal-fix
+  steer were in flight at handoff.
+- **GL01** (4 harder bugs): opencode PASS 168K; Forge fixed 7/9 then ground >200K.
+
+## ROOT-CAUSE DIAGNOSIS — "right blocks, stacked wrong"
+The thesis is NOT wrong — it was mis-scoped. Forge ran heavy machinery in the HOT PATH (every turn), which
+crippled the SAME model vs opencode's clean loop. Failures + fixes (SHIPPED unless noted):
+1. **Over-compaction**: compacted at 30 messages → per-turn prompt only ~8–15K → model LOST ITS PLAN →
+   fixed 1 bug then wandered. FIX: compact only at OVERFLOW (`CONTEXT_COMPACT_BUDGET=100K` via
+   `lastPromptTokens` = uncached+cacheRead), keep a large tail. Full transcript like opencode; caching = cheap.
+2. **`read_file` truncation**: `DEFAULT_TOOL_RESULT_BUDGET` was 4000 bytes → ~100-line reads chopped to a
+   ref-stub → model couldn't see files → endless grep. FIX: 16000. (Biggest crippler across ~17 runs.)
+3. **`search_semantic` permission-DENIED since built** (`permissions.ts` allowlist omitted it) → model looped
+   calling its steered tool. FIX: allow-listed it (read-only).
+4. **Off-ramps**: completion gated on acceptance criteria (a stop shortcut); a SUBSET test run showing "0
+   failing" made the model finish early. FIXES: persistence prompt ("full suite is the bar; multiple
+   failures = a checklist, fix ALL; subset ≠ done"); subset-run guard (`testState` tracks `fullSuiteTotal`,
+   ignores runs with total < 0.5×full).
+5. **Context offload**: SHIPPED `parseTestFailures` (each test run → structured remaining-failures list in
+   the situation report) + in-place idempotent tool-output compaction. PRINCIPLE: local/embed models
+   LIGHTEN LOAD (retrieval/compaction/rerank) — they must NOT DIAGNOSE; the MAIN model reasons.
+6. **Spin controls fighting the model** (debugged all session): opencode uses ONE doom-loop guard (same
+   tool+input 3× → stop). Forge currently keeps a redundant-full-suite-rerun block + soft incremental nudge.
+   STILL TODO: replace remaining forcing with a single doom-loop guard; slim/retire the now-redundant
+   regenerated situation report (transcript is kept now); make finish_task require the FULL suite green.
+   DO NOT re-introduce a fixed localisation/read cap — reads are cheap (cached); capping hurts large repos.
+
+## Token-efficiency facts (verified live)
+- MiniMax caching WORKS (`minimax.ts` marks system + last tool + the append-only history boundary via
+  `cacheBoundary`→`__cacheBoundary` with `cache_control:ephemeral`). `input_tokens` = UNCACHED portion;
+  `cache_read_input_tokens` → `mainModelUsage.cacheReadTokens` + CLI "Cache-read tokens" line.
+- Transcript MUST be append-only for caching (a sliding window shifts the prefix → 0 cache). Per-turn
+  tool-output compaction must be idempotent/in-place or it breaks caching.
+
+## Semantic retrieval (now-wired dormant edge)
+`packages/forge-agent/src/semantic-index.ts` + `EmbeddingRepo.nearest()`. Startup (agent-loop Phase 2d):
+chunk repo source (50-line windows, tests excluded, embed input capped 2000 chars to avoid nomic HTTP 400),
+embed into Postgres. `search_semantic` tool: embed query → cosine → snippets re-read from disk. Model tends
+to prefer read_file/grep; it's available + steered but optional. NEXT (on-thesis): have the LOCAL model
+RERANK retrieved chunks (dormant rerank fns) — local model as curating interface, never diagnostician.
+
+## Next steps (priority)
+1. Finish GL02 `--runs 3`; confirm the minimal-fix steer cut 2.82×→~1×.
+2. Re-validate GG01 + GL01 with clean-core.
+3. Finish clean-core #6 (doom-loop guard; slim situation report; gate=full-suite).
+4. Expand the gauntlet across repos (immer/TanStack-query/… verify offline tests + reverse-appliable recent
+   PRs) and to genuinely LONG / compaction-heavy tasks — where "degrade less" should let Forge win decisively.
+
+## Cruft to clean up
+`forge-types/src/local-model 2.ts` (duplicate source) + `dist/* 2.ts` artifacts. The older `_bench/gauntlet/`
+harness has validity holes (no golden gate, tokens-only scoring, truncated opencode task) — DO NOT use it for
+measured results; `_bench/golden/` supersedes it.

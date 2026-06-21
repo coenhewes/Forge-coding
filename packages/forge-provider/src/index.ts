@@ -11,7 +11,7 @@ export { OllamaProvider } from './ollama.js'
 export { OpenAIProvider } from './openai.js'
 export { AnthropicProvider } from './anthropic.js'
 export { MinimaxProvider } from './minimax.js'
-export { ProviderError } from './base.js'
+export { ProviderError, mapAnthropicMessages, mergeChunks } from './base.js'
 
 // Provider catalog — static metadata for routing and CLI tooling.
 export {
