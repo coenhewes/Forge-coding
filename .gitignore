@@ -7,3 +7,7 @@ dist/
 
 # local agent test sandbox (own git repo)
 sandbox/
+
+# benchmark secrets (Stripe test keys) — never commit
+_bench/**/.secrets/
+**/.secrets/
