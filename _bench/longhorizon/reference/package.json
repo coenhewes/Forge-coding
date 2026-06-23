@@ -1,0 +1,5 @@
+{
+  "name": "taskflow-reference", "private": true, "type": "module",
+  "scripts": { "build": "node -e \"process.exit(0)\"", "start": "node server.mjs" },
+  "dependencies": { "bcryptjs": "^2.4.3", "express": "^4.21.0", "cookie-parser": "^1.4.7", "stripe": "^17.0.0" }
+}

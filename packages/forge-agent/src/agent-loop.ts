@@ -63,6 +63,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 import { AgentContextBuilder } from './context-builder.js'
+import { detectChecks, runVerification } from './verification-bar.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
 import type { ToolExecutionContext } from './tools.js'
 import { PermissionEngine } from './permissions.js'
@@ -1863,10 +1864,35 @@ export class AgentLoop {
       toolMessages.push({ role: 'tool', content: compacted.content, toolCallId: toolCall.id })
 
       if (result.metadata?.type === 'finish') {
-        terminalSignal = {
-          status: (result.metadata.status as TaskStatus) || 'completed',
-          summary: (result.metadata.summary as string) || result.content,
+        const finishStatus = (result.metadata.status as TaskStatus) || 'completed'
+        // PRODUCTION-READINESS GATE (web apps): a "completed" claim must pass the
+        // e2e browser check — the running app actually renders, throws no JS
+        // errors, and clears the design bar. This is what stops the model from
+        // finishing on a broken or bare UI (the failure `boot` can't see). On
+        // failure we DON'T terminate — we feed the concrete problems back and the
+        // model keeps working until the product is genuinely done.
+        if (finishStatus === 'completed') {
+          let webApp = false
+          try { webApp = !!detectChecks(this.config.workDir).e2e } catch {}
+          if (webApp) {
+            fire({ type: 'status', message: 'finish gate: verifying the running UI in a real browser…', status: 'verification' })
+            let e2e: { passed: boolean; output: string } | undefined
+            try { [e2e] = await runVerification(this.config.workDir, ['e2e']) as { passed: boolean; output: string }[] } catch {}
+            if (e2e && !e2e.passed) {
+              fire({ type: 'status', message: 'finish gate: NOT done — UI/design check failed, continuing', status: 'verification' })
+              internal.messages.push({
+                role: 'user',
+                content:
+                  'NOT DONE YET. You called finish_task, but the production-readiness check on the RUNNING app failed:\n\n' +
+                  e2e.output +
+                  '\n\nThe product is not complete until it actually works AND looks like a polished, modern SaaS when loaded in a browser. ' +
+                  'Fix every problem above (broken/blank pages, JS errors, weak design) and keep building. Do NOT call finish_task again until the running UI genuinely renders, every flow works, and the design clears the bar.',
+              })
+              continue
+            }
+          }
         }
+        terminalSignal = { status: finishStatus, summary: (result.metadata.summary as string) || result.content }
         break
       }
       if (
@@ -2145,74 +2171,18 @@ export class AgentLoop {
     try {
       const task = await this.taskEngine.getTask(taskId)
       if (!task) return null
-      const lines: string[] = ['[SITUATION REPORT — regenerated from durable state each turn]']
-      lines.push(`Goal: ${task.currentInterpretation || task.originalRequest}`)
-      lines.push(`Status: ${task.status} | Next: ${task.nextAction || '(decide)'}`)
-
-      const contract = await this.acceptanceEngine.getContract(taskId).catch(() => undefined)
-      if (contract && contract.criteria.length > 0) {
-        const verified = contract.criteria.filter((c) => c.status === 'verified').length
-        lines.push('', `Acceptance criteria (${verified}/${contract.criteria.length} verified):`)
-        for (const c of contract.criteria) {
-          const icon = c.status === 'verified' ? '✓' : c.status === 'failed' ? '✗' : '○'
-          const checks = c.requiredChecks?.length ? ` [checks: ${c.requiredChecks.join(',')}]` : ''
-          lines.push(`  ${icon} [${c.id}] ${c.description}${checks}`)
-        }
-      }
-
-      const checks = await this.verificationEngine.getEntries(taskId).catch(() => [])
-      if (checks.length > 0) {
-        lines.push('', `Verification checks: ${checks.map((e) => `${e.check}=${e.status}`).join(' ')}`)
-      }
-
-      // Remaining failing tests from the last suite run — tracked here so the
-      // model fixes them incrementally without re-running to "remember" them.
-      if (this.testState) {
-        const ts = this.testState
-        const staleNote = ts.staleAfterEdit ? ' (STALE — you edited since this run; re-run the suite ONCE to refresh)' : ''
-        if (ts.failures.length > 0) {
-          lines.push('', `Failing tests from last run${staleNote}${ts.summary ? ` — ${ts.summary}` : ''}:`)
-          for (const f of ts.failures.slice(0, 25)) lines.push(`  ✗ ${f.file} > ${f.name}`)
-          if (ts.failures.length > 25) lines.push(`  …and ${ts.failures.length - 25} more`)
-          lines.push('Fix these ROOT CAUSES in source one at a time; do not re-run the full suite until you have edited.')
-          if (this.semanticDeps) {
-            lines.push(
-              'To localise fast, CALL search_semantic("<describe the buggy behaviour or the code you need>") — it ' +
-              'returns the most relevant SOURCE snippets from a semantic index of this repo, so you can jump to the ' +
-              'right code in one call instead of reading many files. Then reason about the root cause and edit_file.',
-            )
-          }
-        } else if (ts.summary) {
-          lines.push('', `Last test run: ${ts.summary}${staleNote}`)
-        }
-      }
-
-      const openSubtasks = (task.subtasks ?? []).filter((s) => s.status !== 'completed')
-      if (openSubtasks.length > 0) {
-        lines.push('', 'Open subtasks:')
-        for (const s of openSubtasks.slice(0, 12)) lines.push(`  ☐ ${s.description ?? s.id}`)
-      }
-
-      const recentEvidence = await this.evidenceMemory.queryByTask(taskId, 6).catch(() => [])
-      if (recentEvidence.length > 0) {
-        lines.push('', 'Recent evidence (recoverable by id):')
-        for (const a of recentEvidence) lines.push(`  ${a.id} (${a.kind}) ${a.description.slice(0, 80)}`)
-      }
-
-      const failures = await this.failureEngine.getEntries(taskId).catch(() => [])
-      if (failures.length > 0) {
-        lines.push('', 'Failures so far (do NOT repeat these approaches):')
-        for (const f of failures.slice(-3)) {
-          const desc = (f as { summary?: string; description?: string }).summary
-            ?? (f as { description?: string }).description ?? JSON.stringify(f).slice(0, 100)
-          lines.push(`  ⚠ ${String(desc).slice(0, 120)}`)
-        }
-      }
-
-      if (task.filesTouched.length > 0) {
-        lines.push('', `Files touched: ${task.filesTouched.slice(0, 20).join(', ')}`)
-      }
-      lines.push('', 'Continue from here: take the next concrete action toward verifying all criteria.')
+      // LEAN per-turn state (validated win on GL01: retention 1/3→3/3, tokens 174K→91K).
+      // clean-core kept the FULL transcript, so re-injecting durable state every turn became heavy,
+      // duplicative scaffolding that fragmented the model during hard edits. Keep ONLY the one thing
+      // tool-output compaction can lose: the compact remaining-failing-tests list. Everything else
+      // (goal/task is the stable first message; criteria/evidence/failures live in the transcript) is
+      // dropped. When nothing is failing, inject nothing — a pure clean transcript like opencode's.
+      if (!this.testState || this.testState.failures.length === 0) return null
+      const ts = this.testState
+      const staleNote = ts.staleAfterEdit ? ' (STALE — you edited since this run; re-run the suite ONCE to refresh)' : ''
+      const lines: string[] = [`Remaining failing tests${staleNote}${ts.summary ? ` — ${ts.summary}` : ''}:`]
+      for (const f of ts.failures.slice(0, 25)) lines.push(`  ✗ ${f.file} > ${f.name}`)
+      if (ts.failures.length > 25) lines.push(`  …and ${ts.failures.length - 25} more`)
       return { role: 'user', content: lines.join('\n') }
     } catch {
       return null

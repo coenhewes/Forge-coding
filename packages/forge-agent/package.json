@@ -30,7 +30,8 @@
     "@forge/verification-planner": "workspace:*",
     "@forge/belief": "workspace:*",
     "@forge/trace": "workspace:*",
-    "@forge/pr": "workspace:*"
+    "@forge/pr": "workspace:*",
+    "playwright": "^1.48.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
