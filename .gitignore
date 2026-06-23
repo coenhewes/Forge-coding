@@ -11,3 +11,19 @@ sandbox/
 # benchmark secrets (Stripe test keys) — never commit
 _bench/**/.secrets/
 **/.secrets/
+
+# --- open-source hygiene ---
+# OS / editor cruft
+.DS_Store
+**/.DS_Store
+# Agent working/temp dirs (not source)
+.opencode/
+.mavis/
+# Benchmark run artifacts (reproducible outputs, not source)
+_bench/**/runs/
+_bench/**/work/
+_bench/**/node_modules/
+_bench/**/*.log
+# iCloud filename-collision duplicates
+*\ 2
+*\ 2.*
