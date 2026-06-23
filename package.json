@@ -3,6 +3,8 @@
   "version": "0.0.1",
   "private": true,
   "description": "Long-horizon software engineering agent",
+  "license": "MIT",
+  "repository": "github:coenhewes/Forge-coding",
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",

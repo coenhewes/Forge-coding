@@ -10,6 +10,12 @@ better engineering outcomes on real, multi-file, multi-domain tasks.
 
 See [`AGENTS.md`](./AGENTS.md) for the full product thesis.
 
+> **Status: experimental / research.** Forge is an active research harness, not a finished
+> product. Its thesis — that externalizing state and offloading cheap cognition to local models
+> beats stuffing everything into the model's context — is supported by early benchmark evidence
+> (see [Benchmarks](#benchmarks)) but not yet proven on the hardest long-horizon tasks. Numbers
+> below are reported honestly, including where Forge only ties or where results are still landing.
+
 ---
 
 ## What makes Forge different
@@ -114,41 +120,68 @@ localize → patch → re-verify; `review`/`explore`/`research` do not modify co
 
 ---
 
-## Evaluation harness
+## Benchmarks
 
-Forge ships a baseline-comparison harness that runs the **same task** twice — once
-with the full harness, once with a flat baseline (no semantic fabric, no ledgers) —
-and prints the metric deltas.
+Forge is measured **head-to-head against [opencode](https://github.com/sst/opencode)** on the
+**same model** (MiniMax-M3), the **same hardware**, and the **same task** — so any difference is the
+*harness*, not the model. Runs are graded by a blind acceptance suite and averaged over multiple
+runs to absorb model variance. Both agents get the same credentials up front; "did it ask for keys"
+is never a graded difference.
+
+### Long-horizon SaaS build (`_bench/longhorizon`, `_bench/longhorizon2`)
+
+From a blank repo and one prompt, each agent must build a complete, working, well-designed SaaS. The
+grader scores three independent dimensions: **Works** (real browser flows via Playwright),
+**Complete** (exact REST contract + a real Stripe test-mode signed webhook), and **Designed**
+(screenshots rated 0–10 by a local vision model).
+
+**TaskFlow** (auth, projects, tasks, billing) — 3 runs each, reported honestly:
+
+| | Checks | Design (0–10) | Main-model tokens | Reliability |
+|---|--------|---------------|-------------------|-------------|
+| **Forge**    | 38/38 (all runs)   | ~5.5 avg | **~163K avg** | 0 hangs / 3 |
+| **opencode** | 38/38 (clean runs) | ~5.0 avg | ~359K avg | 1 hang / 3 (thrashed to 2.9M tokens) |
+
+Honest read: **output quality is a tie** — both pass every check. Forge's measured edge is **~2.2×
+fewer main-model tokens at equal quality** (it feeds the model far less context per call) plus
+steadier reliability. Design is a wash and below bar for both — a known gap.
+
+**Forgeflow** (orgs/RBAC, seat-based billing the agent provisions *itself* via the Stripe API, API
+tokens + rate limiting, outgoing webhooks, audit log) is a deliberately larger task — too big for one
+model session — to test whether Forge's durable state + verification loop sustains where a single-pass
+agent degrades. *This benchmark is in progress; results will be published here when complete, including
+if they tie.*
+
+```bash
+# blank repo → agent builds → blind grader → result JSON
+node _bench/longhorizon/longhorizon-runner.mjs --agent forge
+node _bench/longhorizon/longhorizon-runner.mjs --agent opencode
+```
+
+### Golden gauntlet (`_bench/golden`)
+
+Reproduces a **real merged upstream fixing PR**, gives both agents the identical fix-free task on the
+same model, and gates on the PR's **golden test + full suite green** (a no-op or a weakened test
+cannot pass). Scored on pass-rate and median main-model tokens, averaged over runs.
+
+```bash
+node _bench/golden/golden-gauntlet.mjs --case GL02 --runs 3        # both agents, 3 runs each
+node _bench/golden/golden-gauntlet.mjs --case GL02 --prep-only     # validate a case reproduces
+```
+
+### Harness ablation (dev tool)
+
+For local development, `forge-eval` runs the same task with the harness on vs. a flat baseline to
+inspect which components move which metrics — useful for development, not the headline comparison:
 
 ```bash
 pnpm build
 MINIMAX_API_KEY=... node packages/forge-eval/dist/cli.js demo
-# or a custom task:
-node packages/forge-eval/dist/cli.js run --task "Add X" --fixture ./packages/forge-eval/fixtures/sample-saas
 ```
 
-The headline demo (`demo`) implements organization invitations across auth, db,
-api, frontend, and tests on the `sample-saas` fixture.
-
-### Golden gauntlet (Forge vs opencode, same model)
-
-`_bench/golden/` is the rigorous head-to-head benchmark: it reproduces a **real merged upstream fixing
-PR** (or a multi-bug set), gives Forge and `opencode` the **identical fix-free task** on the same
-MiniMax-M3 model, and gates on the PR's **golden test + full suite green** (so a no-op or a weakened
-test cannot pass). It scores **quality-adjusted**: pass-rate + median main-model tokens + fix
-minimality (diff size vs the reference PR), with multi-run averaging for model variance.
-
-```bash
-node _bench/golden/golden-gauntlet.mjs --case GL02 --runs 3        # both agents, 3 runs each
-node _bench/golden/golden-gauntlet.mjs --case GG01 --agent forge   # one agent
-node _bench/golden/golden-gauntlet.mjs --case GL02 --prep-only     # validate a case reproduces
-```
-
-Requires Postgres (54329) + Ollama (`qwen2.5-coder:14b`, `nomic-embed-text`) up, and MiniMax + opencode
-configured. **Read `AGENTS.md` → "Engineering Status & Harness Findings" and `docs/harness-comparison-opencode.md`
-before working on the harness** — they capture the current results, the opencode structural comparison,
-and the active "clean-core" rebuild (full-transcript context + overflow-only compaction + semantic
-retrieval + the bug fixes that took Forge from failing to beating opencode on tokens).
+All benchmarks require Postgres (`:54329`) + Ollama (`qwen2.5-coder:14b`, `nomic-embed-text`,
+`llama3.2-vision`) running, with MiniMax and opencode configured. See `AGENTS.md` for full
+methodology and the harness-vs-opencode analysis.
 
 ---
 
@@ -162,4 +195,7 @@ pnpm test        # vitest unit/integration tests
 
 ## License
 
-MIT
+[MIT](./LICENSE) © 2026 Coen Hewes.
+
+Forge orchestrates third-party models and tools (MiniMax, Ollama models, opencode for benchmarking);
+their respective licenses and terms apply to their use. See [`NOTICE`](./NOTICE) for attributions.
