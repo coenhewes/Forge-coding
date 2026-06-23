@@ -24,7 +24,12 @@ const MAX_ITER = Number(arg('--max-iterations', '800'))
 const TIMEOUT_H = Number(arg('--timeout-hours', '4'))
 const PORT = Number(arg('--port', String(4400 + Math.floor(Math.random() * 100))))
 const ts = new Date().toISOString().replace(/[:.]/g, '-')
-const WORK = join(HERE, 'work', `${AGENT}-${ts}`)
+// CRITICAL: the agent work dir MUST live OUTSIDE the forge repo. When it was nested
+// inside, opencode resolved its project root to the outer repo, wrote TaskFlow files
+// to the repo root, ran `npm install` there, and clobbered the repo's pnpm-linked
+// node_modules/@forge/* — breaking Forge itself. An out-of-repo dir with its own git
+// init is the agent's sole project root.
+const WORK = join(process.env.HOME, 'forge-lh-work', `${AGENT}-${ts}`)
 const RESULTS = join(HERE, 'runs')
 mkdirSync(WORK, { recursive: true }); mkdirSync(RESULTS, { recursive: true })
 
@@ -80,11 +85,22 @@ function runOpencode() {
   const livePath = join(RESULTS, `opencode-live-${ts}.log`)
   const live = createWriteStream(livePath, { flags: 'w' })
   log(`live feed → ${livePath}`)
+  // Kill any STALE opencode server first: `opencode run` attaches to a running server,
+  // and a stale one rooted elsewhere makes opencode treat WORK as an "external_directory"
+  // and auto-reject all writes (0 files built). Fresh server → project root = WORK.
+  try { execSync('pkill -9 -f "opencode"', { stdio: 'ignore' }) } catch {}
   return new Promise((resolve) => {
     // ARGS ARRAY (no shell): the spec contains backticks + $ that a shell would
     // execute/expand, corrupting the task. spawn-with-array passes it literally.
-    const child = spawn('opencode', ['run', '-m', 'minimax/MiniMax-M3', '--format', 'json', '--print-logs', '--log-level', 'INFO', task],
-      { cwd: WORK, env: { ...process.env, MINIMAX_API_KEY: MINIMAX_KEY } })
+    // --pure: run core opencode without external plugins. In this env a global plugin
+    // hangs opencode at "init" (idle CPU, never reaches the model); --pure skips it and
+    // the full core agent + tools (read/write/bash) work normally (verified manually).
+    // --dir WORK: pin opencode's project root to the work dir explicitly.
+    // --dangerously-skip-permissions: opencode's headless flag — auto-approve writes to
+    // its sandbox (Forge also writes freely when autonomous; fair apples-to-apples).
+    // stdin from /dev/null so opencode never blocks reading piped input.
+    const child = spawn('opencode', ['run', '--pure', '--dangerously-skip-permissions', '--dir', WORK, '-m', 'minimax/MiniMax-M3', '--format', 'json', '--print-logs', '--log-level', 'INFO', task],
+      { cwd: WORK, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MINIMAX_API_KEY: MINIMAX_KEY } })
     let out = ''
     child.stdout.on('data', (d) => { out += d; live.write(d) })
     child.stderr.on('data', (d) => { live.write(d) })
@@ -125,6 +141,12 @@ async function gradeBuiltApp() {
 async function main() {
   log(`workdir ${WORK}`)
   sh('git init -q', { cwd: WORK }); writeFileSync(join(WORK, '.gitkeep'), '')
+  // FAIRNESS: give BOTH agents the real Stripe test-mode credentials up front in .env
+  // (no agent-specific request protocol). "Did it ask for resources" is observational only,
+  // never a graded differentiator — both start with everything they need to build billing.
+  writeFileSync(join(WORK, '.env'),
+    Object.entries(SEC).map(([k, v]) => `${k}=${v}`).join('\n') + '\n' + `PORT=3000\n`)
+  log('wrote .env with Stripe test-mode keys (both agents, up front)')
   const oracle = spawn('node', [ORACLE, WORK, SECRETS], { stdio: ['ignore', 'inherit', 'inherit'] })
   log(`agent run starting (maxIter ${MAX_ITER}, timeout ${TIMEOUT_H}h)…`)
   const run = await (AGENT === 'forge' ? runForge() : runOpencode())
