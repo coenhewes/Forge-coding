@@ -8,3 +8,10 @@ golden/work/
 gauntlet/RG*/
 gauntlet/SUMMARY.md
 *.log
+
+# Long-horizon benchmark: secrets + run artifacts — NEVER commit
+longhorizon/.secrets/
+longhorizon/reference/node_modules/
+longhorizon/acceptance/node_modules/
+longhorizon/runs/
+longhorizon/work/
