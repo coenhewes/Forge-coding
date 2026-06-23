@@ -12,19 +12,14 @@ design is something you'd be proud to ship. "The tests pass" or "the API returns
 actually driving the running app in a browser (not just hitting the API), and keep going until it's
 right.
 
-## Requesting resources you cannot create yourself (IMPORTANT)
+## Credentials — already provided in `.env`
 
-Some things an AI genuinely cannot self-provision: real API keys, secrets, paid accounts. **Do not
-fabricate, hardcode, or stub these.** When you need one, REQUEST it:
-
-- Append one line to `RESOURCE_REQUESTS.txt` in the repo root: `REQUEST: <clear description>`
-  (e.g. `REQUEST: Stripe test-mode secret + publishable keys and a recurring price id`).
-- Shortly after, the granted values will be written into `.env` (KEY=VALUE lines) and acknowledged in
-  `RESOURCE_GRANTS.txt`. Poll those files; read the keys from `.env` (load it with a dotenv loader).
-- If a request cannot be fulfilled, the grant note will say so — then use your best engineering
-  judgment and continue. Never block forever; never invent a credential.
-
-You WILL need Stripe test-mode credentials for billing (below). Request them this way.
+A `.env` file in the repo root already contains the real credentials you need, including Stripe
+**test-mode** keys: `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_PRICE_ID`,
+`STRIPE_WEBHOOK_SECRET`. **Load `.env` at startup** (use a dotenv loader or `process.loadEnvFile()`)
+and read the keys from `process.env`. **Do not fabricate, hardcode, or stub credentials** — use the
+ones in `.env`. If you genuinely need an additional resource that is not present, append one line
+`REQUEST: <clear description>` to `RESOURCE_REQUESTS.txt` and continue working; never block forever.
 
 ## Stack (REQUIRED — the automated acceptance suite depends on these)
 
