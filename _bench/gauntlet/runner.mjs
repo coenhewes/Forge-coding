@@ -27,7 +27,10 @@ const MANIFEST_PATH = join(GAUNTLET_DIR, 'real-gauntlet.json')
 const REPO_CACHE = join(BENCH_DIR, 'repos')
 const WORK_DIR = join(BENCH_DIR, 'worktrees')
 const FORGE_ROOT = join(__dirname, '..', '..')
-const MINIMAX_KEY = 'REDACTED_MINIMAX_API_KEY'
+function minimaxKey() {
+  try { const c = JSON.parse(readFileSync(join(FORGE_ROOT, '.forge', 'config.json'), 'utf8')); return c?.providers?.minimax?.apiKey || c?.provider?.apiKey || process.env.MINIMAX_API_KEY || '' } catch { return process.env.MINIMAX_API_KEY || '' }
+}
+const MINIMAX_KEY = minimaxKey()
 
 function run(cmd, opts = {}) {
   const { cwd = FORGE_ROOT, ignoreFailure = false, timeout = 300_000, input, env = {} } = opts
