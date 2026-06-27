@@ -12,6 +12,7 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     maxSubagents: 3,
   },
   mode: 'implement',
+  autonomy: 'balanced',
   workDir: process.cwd(),
   stateDir: join(process.cwd(), DEFAULT_STATE_DIR),
   logLevel: 'info',

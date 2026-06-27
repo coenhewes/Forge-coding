@@ -11,7 +11,9 @@ export { OllamaProvider } from './ollama.js'
 export { OpenAIProvider } from './openai.js'
 export { AnthropicProvider } from './anthropic.js'
 export { MinimaxProvider } from './minimax.js'
-export { ProviderError } from './base.js'
+export { ProviderError, mergeUsage } from './base.js'
+export { estimateCostUsd, MODEL_PRICES } from './pricing.js'
+export type { ModelPrice } from './pricing.js'
 
 /**
  * Environment variables checked for each provider's API key, in order. The

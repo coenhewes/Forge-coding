@@ -262,6 +262,7 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
   let content = ''
   const toolCalls: ToolCall[] = []
   let finishReason: CompletionResult['finishReason'] = 'stop'
+  const usage = mergeUsage(chunks)
 
   for (const chunk of chunks) {
     if (chunk.content) content += chunk.content
@@ -273,7 +274,27 @@ export function mergeChunks(chunks: CompletionChunk[]): CompletionResult {
     if (chunk.finishReason) finishReason = chunk.finishReason
   }
 
-  return { content, toolCalls: toolCalls.length > 0 ? toolCalls : undefined, finishReason }
+  return { content, toolCalls: toolCalls.length > 0 ? toolCalls : undefined, finishReason, usage }
+}
+
+/**
+ * Merge token usage across stream chunks. Providers report input once (at start)
+ * and output cumulatively (growing on each delta), so taking the max of each
+ * field yields the correct final totals for a single completion.
+ */
+export function mergeUsage(
+  chunks: CompletionChunk[],
+): { inputTokens: number; outputTokens: number } | undefined {
+  let input = 0
+  let output = 0
+  let seen = false
+  for (const c of chunks) {
+    if (!c.usage) continue
+    seen = true
+    input = Math.max(input, c.usage.inputTokens ?? 0)
+    output = Math.max(output, c.usage.outputTokens ?? 0)
+  }
+  return seen ? { inputTokens: input, outputTokens: output } : undefined
 }
 
 export function getSystemMessage(messages: Message[]): string | undefined {

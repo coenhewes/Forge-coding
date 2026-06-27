@@ -40,10 +40,17 @@ export interface ToolCall {
   input: Record<string, unknown>
 }
 
+export interface TokenUsage {
+  inputTokens: number
+  outputTokens: number
+}
+
 export interface CompletionChunk {
   content?: string
   toolCalls?: ToolCall[]
   finishReason?: 'stop' | 'length' | 'tool_calls' | 'error'
+  /** Token usage, when the provider reports it (often only on a final chunk). */
+  usage?: TokenUsage
 }
 
 export interface CompletionResult {

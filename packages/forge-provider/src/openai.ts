@@ -47,6 +47,7 @@ export class OpenAIProvider implements ModelProvider {
     if (request.toolChoice) body.tool_choice = request.toolChoice
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
+    body.stream_options = { include_usage: true }
 
     const response = await fetchStream(url, {
       method: 'POST',
@@ -59,6 +60,16 @@ export class OpenAIProvider implements ModelProvider {
     })
 
     for await (const data of parseSSE(response)) {
+      const usage = data.usage as Record<string, unknown> | undefined
+      if (usage?.prompt_tokens !== undefined) {
+        yield {
+          usage: {
+            inputTokens: Number(usage.prompt_tokens),
+            outputTokens: Number(usage.completion_tokens ?? 0),
+          },
+        }
+      }
+
       const choices = data.choices as Record<string, unknown>[] | undefined
       if (!choices || choices.length === 0) continue
 

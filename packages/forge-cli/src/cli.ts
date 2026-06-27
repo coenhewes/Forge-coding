@@ -118,6 +118,7 @@ async function cmdRun(args: string[]) {
     workDir: config.workDir,
     stateDir: config.stateDir,
     mode: config.mode,
+    autonomy: config.autonomy,
     maxIterations: 50,
     features: config.features,
     git: config.git,
@@ -146,6 +147,11 @@ async function cmdRun(args: string[]) {
   console.log(`Verification passed: ${result.verificationPassed}`)
   console.log(`Acceptance passed: ${result.acceptancePassed}`)
   if (result.riskLevel) console.log(`Risk level: ${result.riskLevel}`)
+  if (result.usage) {
+    console.log(
+      `Tokens: ${result.usage.inputTokens} in / ${result.usage.outputTokens} out  ($${result.usage.costUsd.toFixed(4)})`,
+    )
+  }
   console.log(`Summary: ${result.summary}`)
 
   if (result.promotedCheckpointId) {
@@ -254,6 +260,7 @@ async function cmdResume(args: string[]) {
     workDir: config.workDir,
     stateDir: config.stateDir,
     mode: config.mode,
+    autonomy: config.autonomy,
     maxIterations: 50,
     features: config.features,
     git: config.git,

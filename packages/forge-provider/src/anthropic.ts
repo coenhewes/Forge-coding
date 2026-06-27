@@ -112,10 +112,21 @@ export class AnthropicProvider implements ModelProvider {
         } else if (delta?.stop_reason === 'tool_use') {
           chunk.finishReason = 'tool_calls'
         }
+        const usage = data.usage as Record<string, unknown> | undefined
+        if (usage?.output_tokens !== undefined) {
+          chunk.usage = { inputTokens: 0, outputTokens: Number(usage.output_tokens) }
+        }
       }
 
       if (event === 'message_start') {
-        // no content in initial message
+        const message = data.message as Record<string, unknown> | undefined
+        const usage = message?.usage as Record<string, unknown> | undefined
+        if (usage?.input_tokens !== undefined) {
+          chunk.usage = {
+            inputTokens: Number(usage.input_tokens),
+            outputTokens: Number(usage.output_tokens ?? 0),
+          }
+        }
       }
 
       yield chunk

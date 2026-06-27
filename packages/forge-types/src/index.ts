@@ -104,6 +104,7 @@ export type {
   CompletionResult,
   ModelProvider,
   SubagentConfig,
+  TokenUsage,
 } from './provider.js'
 
 export type {
@@ -116,4 +117,5 @@ export type {
   ForgeConfig,
   ForgeConfigFile,
   GitConfig,
+  AutonomyMode,
 } from './config.js'

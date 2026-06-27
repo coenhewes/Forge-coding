@@ -12,7 +12,7 @@ import type {
   CompletionResult,
 } from '@forge/types'
 
-import { createProvider } from '@forge/provider'
+import { createProvider, mergeUsage, estimateCostUsd } from '@forge/provider'
 import { scanRepository } from '@forge/harness'
 import { buildGraph } from '@forge/harness'
 import { getDomainManifests } from '@forge/harness'
@@ -41,6 +41,7 @@ import { join, dirname } from 'node:path'
 import { AgentContextBuilder } from './context-builder.js'
 import { ToolExecutor, createToolDefinitions } from './tools.js'
 import type { ToolExecutionContext } from './tools.js'
+import { resolveAutonomy, type AutonomyProfile } from './autonomy.js'
 
 export interface AgentEvent {
   type: 'thinking' | 'tool_call' | 'tool_result' | 'file_touched' | 'command_run' | 'status' | 'error' | 'model_response'
@@ -60,6 +61,7 @@ export interface AgentConfig {
   stateDir: string
   mode: 'explore' | 'implement' | 'repair' | 'review' | 'maintain' | 'research'
   maxIterations?: number
+  autonomy?: import('@forge/types').AutonomyMode
   onEvent?: (event: AgentEvent) => void
   features?: {
     repoGraph?: boolean
@@ -91,6 +93,7 @@ export interface AgentResult {
   prUrl?: string
   prPath?: string
   riskLevel?: string
+  usage?: { inputTokens: number; outputTokens: number; costUsd: number }
 }
 
 export class AgentLoop {
@@ -124,6 +127,7 @@ export class AgentLoop {
   private capabilityExecutor?: CapabilityExecutor
   private taskRisk?: TaskRiskAssessment
   private activeDomains: string[] = []
+  private autonomy: AutonomyProfile
 
   constructor(config: AgentConfig) {
     this.config = config
@@ -150,6 +154,7 @@ export class AgentLoop {
       branchPrefix: 'forge/',
     }
     this.gitClient = new GitClient(config.workDir)
+    this.autonomy = resolveAutonomy(config.autonomy)
   }
 
   async buildRepoIntelligence(): Promise<void> {
@@ -162,7 +167,7 @@ export class AgentLoop {
 
   async run(task: string): Promise<AgentResult> {
     const taskId = `task-${Date.now()}`
-    const maxIterations = this.config.maxIterations ?? 50
+    const maxIterations = this.config.maxIterations ?? this.autonomy.maxIterations
 
     // Phase 1: Initialize task state
     await this.taskEngine.createTask(taskId, task)
@@ -228,6 +233,8 @@ export class AgentLoop {
     let finalStatus = 'in_progress'
     let finalSummary = ''
     let consecutiveNoTool = 0
+    let totalInputTokens = 0
+    let totalOutputTokens = 0
 
     const fire = (event: Omit<AgentEvent, 'iteration'>) => {
       this.config.onEvent?.({ ...event, iteration: iterations } as AgentEvent)
@@ -273,7 +280,7 @@ export class AgentLoop {
           tools: tools,
           toolChoice: 'auto',
           maxTokens: this.config.provider.maxTokens ?? 4096,
-          temperature: this.config.provider.temperature ?? 0.2,
+          temperature: this.config.provider.temperature ?? this.autonomy.temperature,
         })) {
           streamChunks.push(chunk)
           if (chunk.content) {
@@ -284,6 +291,11 @@ export class AgentLoop {
       } catch (err) {
         fire({ type: 'error', message: `Provider error: ${err}`, error: String(err) })
         break
+      }
+
+      if (result.usage) {
+        totalInputTokens += result.usage.inputTokens
+        totalOutputTokens += result.usage.outputTokens
       }
 
       if (result.content) {
@@ -519,6 +531,14 @@ export class AgentLoop {
       prUrl: pr.prUrl,
       prPath: pr.prPath,
       riskLevel: this.taskRisk?.level,
+      usage: {
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        costUsd: estimateCostUsd(this.config.provider.model, {
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+        }),
+      },
     }
   }
 
@@ -684,6 +704,7 @@ export class AgentLoop {
       content,
       toolCalls: uniqueToolCalls.length > 0 ? uniqueToolCalls : undefined,
       finishReason,
+      usage: mergeUsage(chunks),
     }
   }
 
