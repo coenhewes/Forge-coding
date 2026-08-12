@@ -5,12 +5,14 @@ import { OllamaProvider } from './ollama.js'
 import { OpenAIProvider } from './openai.js'
 import { AnthropicProvider } from './anthropic.js'
 import { MinimaxProvider } from './minimax.js'
+import { NousProvider } from './nous.js'
 
 export { OpenRouterProvider } from './openrouter.js'
 export { OllamaProvider } from './ollama.js'
 export { OpenAIProvider } from './openai.js'
 export { AnthropicProvider } from './anthropic.js'
 export { MinimaxProvider } from './minimax.js'
+export { NousProvider } from './nous.js'
 export { ProviderError, mapAnthropicMessages, mergeChunks } from './base.js'
 
 // Provider catalog — static metadata for routing and CLI tooling.
@@ -44,6 +46,7 @@ const API_KEY_ENV: Record<ProviderConfig['name'], string[]> = {
   openai: ['OPENAI_API_KEY'],
   anthropic: ['ANTHROPIC_API_KEY'],
   minimax: ['MINIMAX_API_KEY'],
+  nous: ['NOUS_API_KEY'],
 }
 
 /** Resolve the API key from config, falling back to the provider's env vars. */
@@ -91,6 +94,8 @@ export function createProvider(config: ProviderConfig): ModelProvider {
       return new AnthropicProvider(config)
     case 'minimax':
       return new MinimaxProvider(config)
+    case 'nous':
+      return new NousProvider(config)
     default: {
       const _exhaustive: never = config.name
       throw new Error(`Unknown provider: ${_exhaustive}`)

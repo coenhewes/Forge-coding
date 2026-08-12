@@ -1,20 +1,14 @@
 # Forge
 
-**A long-horizon software-engineering agent that turns a task into a verified, reviewable pull request.**
+**A long-horizon coding agent that turns a real engineering task into a verified, reviewable pull request — through a better harness, not just another chat-with-tools agent.**
 
-Forge is not a chat app that can edit files. It is a coding agent wrapped in a
-*harness*: a repo-aware semantic operating environment that gives the same model
-better engineering outcomes on real, multi-file, multi-domain tasks.
+Forge's edge is the *harness*: a repo-aware **semantic MCP fabric**, durable task state, evidence tracking, a risk model, and verification gates that are first-class parts of the system. The same model, on the same repo and task, gets better engineering outcomes because it operates *through* a mapped software system instead of a flat filesystem and a pile of tools.
 
 > **Same model. Same repo. Same task. Better harness. Better engineering outcomes.**
 
-See [`AGENTS.md`](./AGENTS.md) for the full product thesis.
+See [`AGENTS.md`](./AGENTS.md) for the full product thesis, and [`docs/semantic-mcp-fabric.md`](./docs/semantic-mcp-fabric.md) for how the capability fabric works and how to extend it.
 
-> **Status: experimental / research.** Forge is an active research harness, not a finished
-> product. Its thesis — that externalizing state and offloading cheap cognition to local models
-> beats stuffing everything into the model's context — is supported by early benchmark evidence
-> (see [Benchmarks](#benchmarks)) but not yet proven on the hardest long-horizon tasks. Numbers
-> below are reported honestly, including where Forge only ties or where results are still landing.
+> **Status: working harness, honest about limits.** Forge is an actively developed engineering agent, not a research demo. Its core thesis — that externalizing state and offloading cheap cognition to local models beats stuffing everything into the model's context — is backed by head-to-head benchmark evidence (see [Benchmarks](#benchmarks)). Quality on the benchmark tasks is currently a *tie* with a strong flat harness at equal token cost; Forge's measured advantages are token efficiency (~2.2× fewer main-model tokens) and steadier reliability. Design quality is a known gap. Numbers below are reported honestly, including where Forge only ties or where results are still landing.
 
 ---
 
@@ -22,14 +16,15 @@ See [`AGENTS.md`](./AGENTS.md) for the full product thesis.
 
 Most coding agents hand the model a flat filesystem and a pile of `read_file` /
 `write_file` / `run_command` tools. Forge instead operates the repository as a
-mapped software system:
+mapped software system, exposed to the agent through a semantic capability fabric:
 
 - **Repo map & repository graph** — packages, routes, services, DB schema,
   migrations, test suites, and a symbol/call/import graph.
 - **Semantic MCP fabric** — domain-routed, repo-aware capabilities
   (`repo.find_callers`, `repo.find_definitions`, `repo.explain_dependency_path`,
   `db.get_table_schema`, `tests.find_related_tests`, …) for discovery and
-  localization, instead of grepping blind.
+  localization, instead of grepping blind. **You can add your own domains and
+  capabilities** — see [`docs/semantic-mcp-fabric.md`](./docs/semantic-mcp-fabric.md).
 - **Durable task state** — task engine, acceptance contract, evidence ledger,
   failure ledger, decision ledger, and a verification matrix, all persisted to
   `.forge/` so work survives context resets and process restarts.
@@ -42,6 +37,36 @@ mapped software system:
 - **Branch → commit → reviewable PR** — every successful run produces a git
   branch, a commit, and a structured PR body (evidence, risks, verification,
   failure/recovery, review guidance).
+
+---
+
+## Try it on a real repo
+
+Before anything else, point Forge at a repo you actually care about:
+
+```bash
+# 1) Build Forge once, from its checkout:
+git clone https://github.com/coenhewes/Forge-coding.git && cd Forge-coding
+pnpm install && pnpm build
+node packages/forge-cli/dist/cli.js setup   # pick a provider + add an API key
+
+# 2) Point it at a real repo (any git repo on your machine):
+cd /path/to/your-repo
+node /path/to/Forge-coding/packages/forge-cli/dist/cli.js run \
+  "Add pagination to the users list endpoint"
+```
+
+Forge runs against the repo in your current directory, branches, implements,
+verifies, and drafts a PR (written to `.forge/tasks/<id>/PR.md` by default, or
+opened via `gh` if you set `git.pr: "gh"`).
+
+`git.pr` can be `"file"` (write the PR body to `.forge/tasks/<id>/PR.md`),
+`"gh"` (open a real PR via the `gh` CLI), or `"off"`. See
+[Configuration](#configuration-forgeconfigjson) below.
+
+> Forge is strongest on **multi-file, multi-domain, verification-heavy** tasks
+> (auth changes, billing swaps, migrations, "implement this feature end to end").
+> It is not built to win at one-shot autocomplete.
 
 ---
 
@@ -73,7 +98,7 @@ The `forge` script is also wired at the repo root: `pnpm forge run "<task>"`.
 
 API keys are read from the environment (never committed): `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MINIMAX_API_KEY`. Supported providers:
-`anthropic`, `openai`, `openrouter`, `ollama`, `ollama-cloud`, `minimax`.
+`anthropic`, `openai`, `openrouter`, `ollama`, `ollama-cloud`, `minimax`, `nous`.
 
 `git.pr` is `"file"` (write the PR body to `.forge/tasks/<id>/PR.md`), `"gh"`
 (open a real PR via the `gh` CLI), or `"off"`.
@@ -93,6 +118,16 @@ API keys are read from the environment (never committed): `ANTHROPIC_API_KEY`,
 | `forge evidence <taskId>` | Evidence, failure, and decision ledgers |
 | `forge dashboard [taskId]` | TUI dashboard |
 | `forge setup` | Provider/model setup wizard |
+
+### Observability
+
+Forge records what it did and why, so a PR is reviewable after the fact:
+
+- `forge evidence <taskId>` — the evidence, failure, and decision ledgers
+  (what was tried, what failed, what was recovered, what was decided).
+- `forge trace` / the flight recorder — a step-by-step trace of work performed.
+- Slash commands in the REPL: `/verify`, `/failures`, `/trace`, `/pr`, `/doctor`,
+  `/sessions`, `/mode`, `/budget`, `/compact`.
 
 ### Modes
 
@@ -182,6 +217,25 @@ MINIMAX_API_KEY=... node packages/forge-eval/dist/cli.js demo
 All benchmarks require Postgres (`:54329`) + Ollama (`qwen2.5-coder:14b`, `nomic-embed-text`,
 `llama3.2-vision`) running, with MiniMax and opencode configured. See `AGENTS.md` for full
 methodology and the harness-vs-opencode analysis.
+
+---
+
+## Where Forge is headed
+
+The core stays open-source and MIT. The near-term product direction builds on
+what the harness already does:
+
+- **Hosted runner** — run Forge on your repo without standing up Postgres/Ollama;
+  managed state, secrets, compute, and long-running tasks. Your token efficiency
+  is the margin advantage.
+- **Team features** — shared task state, approval gates driven by the risk model,
+  audit trails from the ledgers, and Slack/Linear notifications.
+- **GitHub App** — open PRs on demand or from issues/comments.
+- **Capability packs** — first-party and community domains/capabilities for specific
+  stacks (see [`docs/semantic-mcp-fabric.md`](./docs/semantic-mcp-fabric.md)).
+
+Local CLI use stays free; the hosted runner and team features are where the
+product is monetized.
 
 ---
 

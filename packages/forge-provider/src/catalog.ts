@@ -208,6 +208,25 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = Object.freeze([
     defaultModel: 'qwen3:8b',
     notes: 'Local Ollama — zero-cost, requires ollama serve; override localModel.instruct for another installed model',
   }),
+  Object.freeze<ProviderCatalogEntry>({
+    name: 'nous',
+    vendor: 'Nous Research',
+    defaultBaseUrl: 'https://inference-api.nousresearch.com/v1',
+    apiKeyEnv: ['NOUS_API_KEY'],
+    capabilities: {
+      tools: true,
+      vision: false,
+      streaming: true,
+      jsonMode: true,
+      systemMessage: true,
+    },
+    contextWindow: 128_000,
+    defaultMaxTokens: 8192,
+    costTier: 2,
+    requiresApiKey: true,
+    defaultModel: 'upstage/solar-pro4:free',
+    notes: 'Nous Research Inference API — OpenAI-compatible gateway (OpenRouter-backed catalog); try upstage/solar-pro4 or Hermes 4.x',
+  }),
 ])
 
 /** Map keyed by provider name for O(1) lookup. Built once at module load. */

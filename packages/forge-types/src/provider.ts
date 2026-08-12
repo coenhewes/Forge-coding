@@ -1,4 +1,4 @@
-export type ProviderName = 'openrouter' | 'ollama' | 'ollama-cloud' | 'openai' | 'anthropic' | 'minimax'
+export type ProviderName = 'openrouter' | 'ollama' | 'ollama-cloud' | 'openai' | 'anthropic' | 'minimax' | 'nous'
 
 export interface ProviderConfig {
   name: ProviderName
