@@ -85,9 +85,9 @@ export async function runRun(parsed: ParsedArgs): Promise<CommandResult<AgentRes
     git: config.git,
     stateStore: preflight.stateStore,
     stateStoreMode: preflight.stateMode,
-    // Activate the non-authoritative local-model layer (compaction/triage)
+    // Activate the non-authoritative cheap-model layer (compaction/triage)
     // when configured. Falls back to deterministic behavior if unavailable.
-    localModel: config.localModel,
+    localModel: config.cheapModel ?? config.localModel,
     // Live event stream to stderr (kept off stdout so --json stays clean).
     onEvent: createRunRenderer(!parsed.json),
   }

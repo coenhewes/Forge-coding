@@ -9,12 +9,12 @@
  * read-only diagnostics and never mutate task state.
  */
 import { LocalModelRouter, LocalModelService } from '@forge/local-model'
-import type { LocalModelConfig } from '@forge/types'
+import type { CheapModelConfig } from '@forge/types'
 import { loadConfig } from '../config.js'
 import type { CommandResult, ParsedArgs } from './output.js'
 
 export interface LocalStatusData {
-  enabled: LocalModelConfig['enabled']
+  enabled: CheapModelConfig['enabled']
   available: boolean
   instruct: { provider: string; model: string; endpoint?: string }
   embed: { provider: string; model: string; endpoint?: string }
@@ -26,9 +26,9 @@ export interface LocalTestData {
   embed: { ok: boolean; fallbackUsed: boolean; latencyMs: number; dim: number }
 }
 
-async function resolveLocalConfig(): Promise<LocalModelConfig> {
+async function resolveLocalConfig(): Promise<CheapModelConfig> {
   const config = await loadConfig()
-  return config?.localModel ?? { enabled: 'auto' }
+  return config?.cheapModel ?? config?.localModel ?? { enabled: 'auto' }
 }
 
 export async function runLocal(parsed: ParsedArgs): Promise<CommandResult> {

@@ -70,11 +70,14 @@ export class LocalModelRouter {
     }
   }
 
-  /** The instruct provider config (config override → local Ollama default). */
+  /** The instruct provider config (config override → local Ollama default).
+   *  The override may be ANY provider: local Ollama, a free API model
+   *  (e.g. Nous upstage/solar-pro4:free), or a cheap remote model. */
   instructConfig(): ProviderConfig {
     if (this.config.instruct) return this.config.instruct
-    // Prefer the cheapest tools-capable provider, biased to local Ollama.
-    const selection = selectProvider({ maxCostTier: 1, preferred: 'ollama', streaming: false })
+    // No override: default to the cheapest tools-capable provider. We no longer
+    // hard-bias to Ollama here — the user can configure any cheap provider.
+    const selection = selectProvider({ streaming: false })
     const name = selection?.entry.name ?? 'ollama'
     return defaultProviderConfig(name, { timeoutMs: this.config.timeoutMs ?? DEFAULT_TIMEOUT_MS })
   }
@@ -100,12 +103,18 @@ export class LocalModelRouter {
     return this.deps.createEmbeddingProvider(this.embedConfig())
   }
 
-  /** Whether the local layer should be attempted. Caches the `auto` probe. */
+  /** Whether the cheap-model layer should be attempted. Caches the `auto` probe.
+   *
+   *  - Remote/API providers (anything other than `ollama`) are treated as
+   *    available without a reachability probe — the auth + call will surface
+   *    failures at request time and fall back deterministically.
+   *  - Local Ollama is probed once against its `/api/tags` endpoint. */
   async available(): Promise<boolean> {
     if (this.config.enabled === 'off') return false
     if (this.config.enabled === 'on') return true
+    const cfg = this.instructConfig()
+    if (cfg.name !== 'ollama') return true
     if (this.reachable === undefined) {
-      const cfg = this.instructConfig()
       const baseUrl = cfg.apiUrl ?? 'http://localhost:11434'
       this.reachable = await this.deps.probe(baseUrl, this.config.timeoutMs ?? 5_000)
     }

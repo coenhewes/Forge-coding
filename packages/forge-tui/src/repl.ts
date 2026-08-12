@@ -537,7 +537,7 @@ export class Repl {
         },
         features: this.config.features,
         git: this.config.git,
-        localModel: this.config.localModel,
+        localModel: this.config.cheapModel ?? this.config.localModel,
         stateStoreMode: process.env.FORGE_DATABASE_URL ? 'postgres' : 'file',
       })
 
@@ -1291,7 +1291,7 @@ export class Repl {
         },
         features: this.config.features,
         git: this.config.git,
-        localModel: this.config.localModel,
+        localModel: this.config.cheapModel ?? this.config.localModel,
         stateStoreMode: process.env.FORGE_DATABASE_URL ? 'postgres' : 'file',
         onEvent,
       })

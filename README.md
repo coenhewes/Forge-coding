@@ -97,8 +97,30 @@ The `forge` script is also wired at the repo root: `pnpm forge run "<task>"`.
 ```
 
 API keys are read from the environment (never committed): `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MINIMAX_API_KEY`. Supported providers:
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MINIMAX_API_KEY`, `NOUS_API_KEY`. Supported providers:
 `anthropic`, `openai`, `openrouter`, `ollama`, `ollama-cloud`, `minimax`, `nous`.
+
+#### Cheap-model accelerator (`cheapModel`)
+
+Forge offloads bounded sub-tasks (summarize, classify, extract, rerank, embed)
+to a **cheap model** so the frontier model isn't re-sent large payloads every
+turn. This route is fully configurable — it can be a **local** model, a **free
+API** model, or a **cheap remote** model. Default is local Ollama.
+
+```json
+{
+  "cheapModel": {
+    "enabled": "auto",
+    "instruct": { "name": "nous", "model": "upstage/solar-pro4:free", "apiKey": "***", "maxTokens": 512, "temperature": 0.1 },
+    "embed":   { "name": "ollama", "model": "nomic-embed-text" }
+  }
+}
+```
+
+When `enabled` is `auto`, local Ollama is reachability-probed, but a remote/free
+provider (like `nous` above) is treated as available without a probe and simply
+falls back deterministically if a call fails. The legacy `localModel` key is
+still accepted for backward compatibility.
 
 `git.pr` is `"file"` (write the PR body to `.forge/tasks/<id>/PR.md`), `"gh"`
 (open a real PR via the `gh` CLI), or `"off"`.

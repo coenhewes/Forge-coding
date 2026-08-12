@@ -49,7 +49,7 @@ import type { TraceEventInput } from '@forge/state-store'
 import { createContextServer, type ForgeContextServer } from '@forge/context-server'
 
 import { LocalModelService, CompactionPolicy } from '@forge/local-model'
-import type { LocalModelConfig } from '@forge/types'
+import type { LocalModelConfig, CheapModelConfig } from '@forge/types'
 import { indexRepo, searchSemantic, type IndexDeps } from './semantic-index.js'
 
 import { PRGenerator, renderPRSummaryMarkdown, GitClient, ghAvailable, createGhPr } from '@forge/pr'
@@ -132,12 +132,15 @@ export interface AgentConfig {
     maxIterations?: number
   }
   /**
-   * Optional local-model layer config. When present (and not dryRun), the loop
-   * delegates context compaction of large tool outputs to a cheap local model,
-   * cutting frontier context pressure. The layer is non-authoritative and
+   * Optional cheap-model layer config. When present (and not dryRun), the loop
+   * delegates context compaction of large tool outputs to a cheap model
+   * (local, free API, or cheap remote), cutting frontier context pressure.
+   * The layer is non-authoritative and
    * falls back to deterministic truncation when unavailable.
    */
   localModel?: LocalModelConfig
+  /** @deprecated Use `cheapModel`. Kept for backward-compatible configs. */
+  cheapModel?: CheapModelConfig
 }
 
 export interface AgentResult {
@@ -516,11 +519,12 @@ export class AgentLoop {
     this.traceRecorder = new TraceRecorder({ stateDir })
     this.evidenceMemory = new EvidenceMemory({ stateDir })
 
+    const cheapModel = config.cheapModel ?? config.localModel
     // Local-model layer (opt-in). Exact inputs/outputs are persisted through
     // EvidenceMemory (stable refs) and every call is traced. Non-authoritative
     // by construction: results never touch belief/verification directly.
-    if (config.localModel && !config.dryRun) {
-      this.localModel = new LocalModelService(config.localModel, undefined, {
+    if (cheapModel && !config.dryRun) {
+      this.localModel = new LocalModelService(cheapModel, undefined, {
         artifacts: this.evidenceMemory,
         trace: {
           record: (taskId, description, payload) =>
@@ -528,8 +532,8 @@ export class AgentLoop {
         },
       })
       this.compactionPolicy = new CompactionPolicy(this.localModel, {
-        thresholdChars: config.localModel.compactionThresholdChars,
-        targetTokens: config.localModel.summaryTargetTokens,
+        thresholdChars: cheapModel.compactionThresholdChars,
+        targetTokens: cheapModel.summaryTargetTokens,
       })
     }
 
@@ -807,7 +811,7 @@ export class AgentLoop {
       this.config.onEvent?.({ type: 'status', message, status: 'index', iteration: 0 } as AgentEvent)
     if (this.localModel && this.stateStore && (await this.localModel.available().catch(() => false))) {
       try {
-        const embedModel = this.config.localModel?.embed?.model ?? 'nomic-embed-text'
+        const embedModel = (this.config.cheapModel ?? this.config.localModel)?.embed?.model ?? 'nomic-embed-text'
         const deps: IndexDeps = {
           workDir: this.config.workDir,
           repoId,

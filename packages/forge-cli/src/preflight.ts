@@ -146,7 +146,7 @@ function booleanFlag(parsed: ParsedArgs, key: string): boolean {
 
 async function probeLocalModel(config: ForgeConfig): Promise<{ available: boolean; detail: string }> {
   try {
-    const service = new LocalModelService(config.localModel ?? { enabled: 'auto' })
+    const service = new LocalModelService(config.cheapModel ?? config.localModel ?? { enabled: 'auto' })
     const available = await service.available()
     if (!available) return { available: false, detail: 'provider probe failed' }
     const summarize = await service.summarize({ taskId: 'preflight', content: 'Forge local model preflight.', label: 'preflight' })

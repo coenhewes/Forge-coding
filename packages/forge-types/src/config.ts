@@ -1,5 +1,5 @@
 import type { ProviderConfig, SubagentConfig } from './provider.js'
-import type { LocalModelConfig } from './local-model.js'
+import type { LocalModelConfig, CheapModelConfig } from './local-model.js'
 
 export interface ForgeConfig {
   provider: ProviderConfig
@@ -18,8 +18,12 @@ export interface ForgeConfig {
     trace: boolean
   }
   git: GitConfig
-  /** Optional local-model layer config (non-authoritative accelerator). */
-  localModel?: LocalModelConfig
+  /** Optional cheap-model layer config (non-authoritative accelerator).
+   *  Can be a local model, a free API model (e.g. Nous upstage/solar-pro4:free),
+   *  or a cheap remote model. See `CheapModelConfig`. */
+  cheapModel?: CheapModelConfig
+  /** @deprecated Use `cheapModel`. Kept for backward-compatible configs. */
+  localModel?: CheapModelConfig
 }
 
 /** How Forge integrates with git/GitHub when running a task. */
@@ -48,5 +52,7 @@ export interface ForgeConfigFile {
   logLevel?: ForgeConfig['logLevel']
   features?: Partial<ForgeConfig['features']>
   git?: Partial<GitConfig>
-  localModel?: LocalModelConfig
+  cheapModel?: CheapModelConfig
+  /** @deprecated Use `cheapModel`. Kept for backward-compatible configs. */
+  localModel?: CheapModelConfig
 }
