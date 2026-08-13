@@ -22,6 +22,12 @@ Better engineering outcomes.
 - [Live trial log](./trial-log.md) records the MiniMax/Ollama long-horizon run and findings.
 - [Operating notes](./OPERATING_NOTES.md) has repo-specific commands and ports.
 
+## Business & Monetization
+
+- [Monetization strategy](./MONETIZATION.md) sets the money model and sequencing.
+- [Getting Paid](./GETTING-PAID.md) is the concrete, build-order action list (free CLI → hosted runner → Team/Enterprise).
+- [Build your own domain capability](./MCP-DOMAIN-HOWTO.md) explains the domain/risk fabric the Team/Enterprise layer is built on.
+
 ## What Forge Produces
 
 A successful Forge task should leave behind:
