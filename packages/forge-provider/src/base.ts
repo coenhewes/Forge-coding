@@ -7,6 +7,8 @@ import type {
   CompletionResult,
 } from '@forge/types'
 
+import { appendFileSync } from 'node:fs'
+
 export class ProviderError extends Error {
   constructor(
     message: string,
@@ -39,6 +41,9 @@ export async function fetchStream(
 
     if (!response.ok) {
       const body = await response.text().catch(() => '')
+      if (process.env.FORGE_DEBUG_PROVIDER) {
+        try { appendFileSync('/tmp/forge-provider-resp.log', `HTTP ${response.status}: ${body}\n`) } catch {}
+      }
       throw new ProviderError(
         `HTTP ${response.status}: ${response.statusText}`,
         response.status,
@@ -275,7 +280,10 @@ export function mapTools(tools?: ToolDefinition[]): Record<string, unknown>[] | 
   return tools.map((t) => ({
     type: 'function',
     function: {
-      name: t.name,
+      // OpenAI-compatible tool names must match ^[a-zA-Z0-9_-]+$ (no dots).
+      // Forge capabilities are named like `repo.find_callers`, so we sanitize
+      // '.' -> '_' for the wire and reverse it when parsing tool calls.
+      name: t.name.replace(/\./g, '_'),
       description: t.description,
       parameters: t.inputSchema,
     },
@@ -344,9 +352,13 @@ export function parseToolCallsFromChunk(data: Record<string, unknown>): ToolCall
 
   return toolCalls.map((tc) => {
     const func = tc.function as Record<string, unknown> | undefined
+    // Reverse the '.' -> '_' wire sanitization done in mapTools so the agent
+    // sees the original capability name (e.g. repo_find_callers -> repo.find_callers).
+    const wireName = (func?.name as string) ?? ''
+    const name = wireName.replace(/_/g, '.')
     return {
       id: tc.id as string,
-      name: func?.name as string ?? '',
+      name,
       input: safeParseToolInput(func?.arguments as string | undefined) ?? {},
     }
   })

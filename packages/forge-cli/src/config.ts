@@ -124,10 +124,10 @@ function mergeCheapModel(
   cheap?: CheapModelConfig,
   legacy?: CheapModelConfig,
 ): CheapModelConfig {
-  const base = { ...DEFAULT_CONFIG.cheapModel }
+  const base: CheapModelConfig = { ...(DEFAULT_CONFIG.cheapModel!) }
   if (cheap) Object.assign(base, cheap)
   if (legacy) Object.assign(base, legacy)
-  return base
+  return base as CheapModelConfig
 }
 
 export async function initConfig(overrides?: Partial<ForgeConfigFile>): Promise<ForgeConfig> {

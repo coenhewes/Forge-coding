@@ -67,6 +67,10 @@ export class OpenAIProvider implements ModelProvider {
 
       const chunk: CompletionChunk = {}
       if (delta?.content) chunk.content = delta.content as string
+      // Reasoning models (e.g. Tencent Hunyuan, DeepSeek) stream their answer
+      // in `reasoning` and may leave `content` empty. Surface reasoning as the
+      // text the agent sees so the loop still receives a result.
+      else if (delta?.reasoning) chunk.content = delta.reasoning as string
       if (finishReason) chunk.finishReason = finishReason as CompletionChunk['finishReason']
 
       // Accumulate tool call deltas from streaming chunks

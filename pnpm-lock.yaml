@@ -68,6 +68,9 @@ importers:
       '@forge/vscode':
         specifier: workspace:*
         version: link:packages/forge-vscode
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
       dotenv:
         specifier: ^16.4.5
         version: 16.6.1

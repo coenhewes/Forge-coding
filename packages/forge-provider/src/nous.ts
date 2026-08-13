@@ -7,6 +7,8 @@ import type {
   ToolCall,
 } from '@forge/types'
 
+import { appendFileSync } from 'node:fs'
+
 import {
   buildApiUrl,
   fetchStream,
@@ -54,6 +56,10 @@ export class NousProvider implements ModelProvider {
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
 
+    if (process.env.FORGE_DEBUG_PROVIDER) {
+      try { appendFileSync('/tmp/forge-provider-req.jsonl', JSON.stringify({ url, hasKey: !!this.apiKey, keyPrefix: this.apiKey.slice(0, 10), body }) + '\n') } catch {}
+    }
+
     const response = await fetchStream(url, {
       method: 'POST',
       headers: {
@@ -73,6 +79,9 @@ export class NousProvider implements ModelProvider {
 
       const chunk: CompletionChunk = {}
       if (delta?.content) chunk.content = delta.content as string
+      // Reasoning models stream their answer in `reasoning` and may leave
+      // `content` empty. Surface reasoning as the text the agent sees.
+      else if (delta?.reasoning) chunk.content = delta.reasoning as string
       if (finishReason) chunk.finishReason = finishReason as CompletionChunk['finishReason']
 
       const toolCallDeltas = delta?.tool_calls as Record<string, unknown>[] | undefined
