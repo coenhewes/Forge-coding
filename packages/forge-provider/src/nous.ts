@@ -7,6 +7,8 @@ import type {
   ToolCall,
 } from '@forge/types'
 
+import { appendFileSync } from 'node:fs'
+
 import {
   buildApiUrl,
   fetchStream,
@@ -17,19 +19,25 @@ import {
   mergeChunks,
 } from './base.js'
 
-const DEFAULT_BASE_URL = 'https://api.openai.com/v1'
+// Nous Research Inference API is an OpenAI-compatible surface
+// (https://inference-api.nousresearch.com/v1). The transport is identical to
+// OpenAI: same /chat/completions contract, Bearer auth, tool-call shape.
+const DEFAULT_BASE_URL = 'https://inference-api.nousresearch.com/v1'
 
-export class OpenAIProvider implements ModelProvider {
+export class NousProvider implements ModelProvider {
   private baseUrl: string
   private apiKey: string
 
-  private pendingToolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map()
+  private pendingToolCalls: Map<
+    number,
+    { id: string; name: string; arguments: string }
+  > = new Map()
 
   constructor(private config: ProviderConfig) {
     this.baseUrl = config.apiUrl ?? DEFAULT_BASE_URL
     this.apiKey = config.apiKey ?? ''
     if (!this.apiKey) {
-      throw new Error('OpenAI provider requires an API key')
+      throw new Error('Nous provider requires an API key (NOUS_API_KEY)')
     }
   }
 
@@ -47,6 +55,10 @@ export class OpenAIProvider implements ModelProvider {
     if (request.toolChoice) body.tool_choice = request.toolChoice
     if (request.maxTokens) body.max_tokens = request.maxTokens
     if (request.temperature) body.temperature = request.temperature
+
+    if (process.env.FORGE_DEBUG_PROVIDER) {
+      try { appendFileSync('/tmp/forge-provider-req.jsonl', JSON.stringify({ url, hasKey: !!this.apiKey, keyPrefix: this.apiKey.slice(0, 10), body }) + '\n') } catch {}
+    }
 
     const response = await fetchStream(url, {
       method: 'POST',
@@ -67,13 +79,11 @@ export class OpenAIProvider implements ModelProvider {
 
       const chunk: CompletionChunk = {}
       if (delta?.content) chunk.content = delta.content as string
-      // Reasoning models (e.g. Tencent Hunyuan, DeepSeek) stream their answer
-      // in `reasoning` and may leave `content` empty. Surface reasoning as the
-      // text the agent sees so the loop still receives a result.
+      // Reasoning models stream their answer in `reasoning` and may leave
+      // `content` empty. Surface reasoning as the text the agent sees.
       else if (delta?.reasoning) chunk.content = delta.reasoning as string
       if (finishReason) chunk.finishReason = finishReason as CompletionChunk['finishReason']
 
-      // Accumulate tool call deltas from streaming chunks
       const toolCallDeltas = delta?.tool_calls as Record<string, unknown>[] | undefined
       if (toolCallDeltas) {
         for (const tcd of toolCallDeltas) {
@@ -95,7 +105,6 @@ export class OpenAIProvider implements ModelProvider {
         }
       }
 
-      // Emit complete tool calls when finish reason is tool_calls
       if (finishReason === 'tool_calls' && this.pendingToolCalls.size > 0) {
         const toolCalls: ToolCall[] = []
         for (const [, pc] of this.pendingToolCalls) {

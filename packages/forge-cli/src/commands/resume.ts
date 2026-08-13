@@ -53,7 +53,7 @@ export async function runResume(parsed: ParsedArgs): Promise<CommandResult<Agent
     budget,
     features: config.features,
     git: config.git,
-    localModel: config.localModel,
+    localModel: config.cheapModel ?? config.localModel,
     stateStore: preflight.stateStore,
     stateStoreMode: preflight.stateMode,
     onEvent: createRunRenderer(!parsed.json),

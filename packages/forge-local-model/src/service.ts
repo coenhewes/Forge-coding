@@ -372,7 +372,9 @@ export class LocalModelService {
       }
       return { authoritative: false, vectors: result.vectors, dim, provenance }
     } catch (e) {
-      if (process.env.FORGE_DEBUG_EMBED) process.stderr.write(`[embed-fail] ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`)
+      if ((globalThis as { process?: { env?: Record<string, string | undefined>; stderr?: { write(s: string): void } } }).process?.env?.FORGE_DEBUG_EMBED) {
+        (globalThis as { process?: { stderr?: { write(s: string): void } } }).process?.stderr?.write(`[embed-fail] ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`)
+      }
       return this.finalizeFallback(empty())
     }
   }

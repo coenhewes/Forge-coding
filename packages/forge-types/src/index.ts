@@ -176,6 +176,7 @@ export { isLocalArtifact, isRemoteArtifact } from './artifact.js'
 export type {
   LocalTaskKind,
   LocalModelEnablement,
+  CheapModelConfig,
   LocalModelConfig,
   LocalModelUsage,
   LocalCompressionStrategy,

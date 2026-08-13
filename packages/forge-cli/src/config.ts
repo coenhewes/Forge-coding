@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { existsSync } from 'node:fs'
-import type { ForgeConfigFile, ForgeConfig } from '@forge/types'
+import type { ForgeConfigFile, ForgeConfig, CheapModelConfig } from '@forge/types'
 
 export const DEFAULT_STATE_DIR = '.forge'
 
@@ -41,8 +41,10 @@ export const DEFAULT_CONFIG: ForgeConfig = {
     pr: 'file',
     branchPrefix: 'forge/',
   },
-  localModel: {
-    // Opt-in: enabled only when a local provider is reachable (probed once).
+  cheapModel: {
+    // Opt-in: enabled only when a cheap provider is reachable (probed once).
+    // Defaults to local Ollama; override `instruct`/`embed` with any provider
+    // (local, free API like Nous upstage/solar-pro4:free, or cheap remote).
     enabled: 'auto',
     instruct: {
       name: 'ollama',
@@ -110,10 +112,22 @@ export function resolveConfig(fileConfig: ForgeConfigFile): ForgeConfig {
       ...DEFAULT_CONFIG.git,
       ...fileConfig.git,
     },
-    localModel: fileConfig.localModel
-      ? { ...DEFAULT_CONFIG.localModel, ...fileConfig.localModel }
-      : DEFAULT_CONFIG.localModel,
+    // cheapModel is the canonical key; legacy localModel is merged on top only
+    // if present, so old configs keep working.
+    cheapModel: mergeCheapModel(fileConfig.cheapModel, fileConfig.localModel),
   }
+}
+
+/** Resolve the cheap-model config, honoring both the new `cheapModel` key and
+ *  the deprecated `localModel` key (deprecated wins if both are set). */
+function mergeCheapModel(
+  cheap?: CheapModelConfig,
+  legacy?: CheapModelConfig,
+): CheapModelConfig {
+  const base: CheapModelConfig = { ...(DEFAULT_CONFIG.cheapModel!) }
+  if (cheap) Object.assign(base, cheap)
+  if (legacy) Object.assign(base, legacy)
+  return base as CheapModelConfig
 }
 
 export async function initConfig(overrides?: Partial<ForgeConfigFile>): Promise<ForgeConfig> {

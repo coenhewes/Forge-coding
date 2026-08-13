@@ -1,10 +1,16 @@
 /**
- * Local-model layer — types.
+ * Cheap-model layer — types.
  *
- * The local-model layer is a **best-effort, non-authoritative accelerator**
+ * The cheap-model layer is a **best-effort, non-authoritative accelerator**
  * that runs bounded, structured sub-tasks (summarize / classify / extract /
- * rerank / embed) on cheap local models (default: Ollama, cost tier 0) so the
- * frontier model is not re-sent large raw payloads on every turn.
+ * rerank / embed) on a cheap model so the frontier model is not re-sent large
+ * raw payloads on every turn.
+ *
+ * The cheap model can be **any** provider you configure:
+ *   - a local model (default: Ollama, cost tier 0),
+ *   - a free API model (e.g. Nous `upstage/solar-pro4:free`),
+ *   - or a cheap remote model (e.g. a low-cost OpenRouter entry).
+ * Set it via `ForgeConfig.cheapModel.instruct` / `cheapModel.embed`.
  *
  * Design invariants encoded directly in these types:
  *
@@ -37,10 +43,12 @@ export type LocalTaskKind = 'summarize' | 'classify' | 'extract' | 'rerank' | 'e
  */
 export type LocalModelEnablement = 'auto' | 'on' | 'off'
 
-/** Configuration for the local-model layer (lives under ForgeConfig.localModel). */
-export interface LocalModelConfig {
+/** Configuration for the cheap-model layer (lives under ForgeConfig.cheapModel). */
+export interface CheapModelConfig {
   enabled: LocalModelEnablement
-  /** Provider used for summarize/classify/extract/rerank. Defaults to local Ollama. */
+  /** Provider used for summarize/classify/extract/rerank. Defaults to local Ollama.
+   *  Set to any provider, e.g. `{ name: 'nous', model: 'upstage/solar-pro4:free' }`
+   *  or a cheap OpenRouter model. */
   instruct?: ProviderConfig
   /** Provider used for embeddings. Defaults to local Ollama embedding model. */
   embed?: ProviderConfig
@@ -53,6 +61,9 @@ export interface LocalModelConfig {
   /** Content larger than this (chars) is worth compacting. */
   compactionThresholdChars?: number
 }
+
+/** @deprecated Use {@link CheapModelConfig}. Kept for backward-compatible configs. */
+export type LocalModelConfig = CheapModelConfig
 
 export interface LocalModelUsage {
   inputTokens?: number

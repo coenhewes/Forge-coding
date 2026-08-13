@@ -2,7 +2,7 @@
  * Provider catalog tests.
  *
  * Coverage:
- *   - catalog shape (6 providers, all required fields populated)
+ *   - catalog shape (7 providers, all required fields populated)
  *   - lookup helpers (getProviderEntry, requireProviderEntry, listProviderNames)
  *   - selectProvider (capability filters, cost-tier ceiling, preferred override)
  *   - defaultProviderConfig (fills catalog defaults, preserves overrides)
@@ -23,8 +23,8 @@ import {
 } from '@forge/provider'
 
 describe('PROVIDER_CATALOG — shape', () => {
-  it('contains exactly six providers', () => {
-    expect(PROVIDER_CATALOG).toHaveLength(6)
+  it('contains exactly seven providers', () => {
+    expect(PROVIDER_CATALOG).toHaveLength(7)
   })
 
   it('lists every provider name as a unique value', () => {
@@ -32,7 +32,7 @@ describe('PROVIDER_CATALOG — shape', () => {
     expect(new Set(names).size).toBe(names.length)
     // Sanity: the names we expect to ship today.
     expect(new Set(names)).toEqual(
-      new Set(['anthropic', 'openai', 'openrouter', 'minimax', 'ollama-cloud', 'ollama']),
+      new Set(['anthropic', 'openai', 'openrouter', 'minimax', 'nous', 'ollama-cloud', 'ollama']),
     )
   })
 
