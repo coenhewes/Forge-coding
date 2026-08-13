@@ -81,10 +81,16 @@ Phase 3  Team/Enterprise (gates, audit,     ← higher ACV
           Slack/Linear, SSO)
 ```
 
-**Build first:** the Phase 0 "try it on your repo" hook and the hosted-runner runtime
-(state / secrets / compute) with Stripe reuse. Those two unlock the first dollar. Team/Enterprise is
-mostly wiring existing primitives (risk model, ledgers, domains) to a billing seat — do it last, once one
-user is paying.
+**Build first — the two things that unlock the first dollar:**
+
+1. **Phase 0 "try it on your repo" hook** — one command a stranger runs in < 10 min. Distribution is the
+   real blocker; ship this before anything else (MONETIZATION.md, Phase 0).
+2. **Hosted-runner runtime** — own state (Postgres durable store), secrets (GitHub / model / Stripe keys,
+   scoped per run), and compute (agent loop + verification) on your infra, with **Stripe reused from
+   Forgeflow** for billing.
+
+Everything in Team/Enterprise is mostly wiring primitives Forge already has (risk model, ledgers, domains)
+to a billing seat — do it last, once one user is paying.
 
 ## Later (optional)
 
